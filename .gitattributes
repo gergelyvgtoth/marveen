@@ -1,0 +1,5 @@
+# Merge strategies for fork-specific files
+# These files are managed locally and should not be overwritten during upstream merges
+
+scripts/watchdog.sh merge=ours
+agents/*/agent-config.json merge=ours
