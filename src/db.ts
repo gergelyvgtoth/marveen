@@ -455,6 +455,20 @@ export function initDatabase(): void {
   try { db.exec('ALTER TABLE workflow_recordings ADD COLUMN embedding TEXT') } catch { }
   try { db.exec("ALTER TABLE workflow_recordings ADD COLUMN branch_stats_json TEXT NOT NULL DEFAULT '{}'") } catch { }
 
+  // --- Session Contexts (Persistent Context Engine) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_contexts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      top_memories_json TEXT NOT NULL DEFAULT '[]',
+      kanban_snapshot_json TEXT NOT NULL DEFAULT '[]',
+      open_decisions_json TEXT NOT NULL DEFAULT '[]',
+      summary TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_session_ctx_agent ON session_contexts(agent_id, created_at)`)
+
   // --- Tool Call Log (auto-recorder) ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS tool_call_log (
@@ -1777,4 +1791,41 @@ export async function backfillWorkflowEmbeddings(): Promise<number> {
     await new Promise(r => setTimeout(r, 100))
   }
   return count
+}
+
+// --- Session Contexts ---
+
+export interface SessionContextRow {
+  id: number
+  agent_id: string
+  top_memories_json: string
+  kanban_snapshot_json: string
+  open_decisions_json: string
+  summary: string | null
+  created_at: number
+}
+
+export function saveSessionContext(agentId: string, data: {
+  topMemories: unknown[]
+  kanbanSnapshot: unknown[]
+  openDecisions: unknown[]
+  summary?: string
+}): number {
+  const now = Math.floor(Date.now() / 1000)
+  const result = db.prepare(
+    `INSERT INTO session_contexts (agent_id, top_memories_json, kanban_snapshot_json, open_decisions_json, summary, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(agentId, JSON.stringify(data.topMemories), JSON.stringify(data.kanbanSnapshot), JSON.stringify(data.openDecisions), data.summary ?? null, now)
+  return result.lastInsertRowid as number
+}
+
+export function getLatestSessionContext(agentId: string, limit = 3): SessionContextRow[] {
+  return db.prepare('SELECT * FROM session_contexts WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?').all(agentId, limit) as SessionContextRow[]
+}
+
+export function pruneSessionContexts(agentId: string, keepCount = 10): void {
+  const rows = db.prepare('SELECT id FROM session_contexts WHERE agent_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?').all(agentId, keepCount) as { id: number }[]
+  if (rows.length > 0) {
+    db.prepare(`DELETE FROM session_contexts WHERE id IN (${rows.map(() => '?').join(',')})`).run(...rows.map(r => r.id))
+  }
 }
