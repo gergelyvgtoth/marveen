@@ -5,6 +5,7 @@ import {
   hybridSearch,
   getDb,
 } from '../../db.js'
+import { filterOutbound } from '../../data-gate.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
@@ -37,11 +38,15 @@ export async function tryHandleSessionContext(ctx: RouteContext): Promise<boolea
     const query = data.query || 'aktuális feladatok döntések folyamatban'
     const memLimit = data.memory_limit || 8
 
-    // Top memories via hybrid search
+    // Top memories via hybrid search -- filtered through outbound gate
     let topMemories: unknown[] = []
     try {
-      const mems = await hybridSearch(agentId, query, memLimit)
-      topMemories = mems.map(m => ({
+      const mems = await hybridSearch(agentId, query, memLimit * 2)
+      const filtered = filterOutbound(
+        mems.map(m => ({ ...m, id: m.id })),
+        'session-context-snapshot'
+      )
+      topMemories = filtered.slice(0, memLimit).map(m => ({
         id: m.id,
         content: m.content.slice(0, 300),
         category: m.category,

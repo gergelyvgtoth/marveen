@@ -266,6 +266,20 @@ export function initDatabase(): void {
     // column already exists
   }
 
+  // Migration: data sovereignty columns (sensitivity, scope, ttl_days)
+  try {
+    db.exec("ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'technical' CHECK(sensitivity IN ('pii','sensitive','technical','public'))")
+  } catch { /* column already exists */ }
+  try {
+    db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'local_only' CHECK(scope IN ('local_only','claude_code_ok','none'))")
+  } catch { /* column already exists */ }
+  try {
+    db.exec('ALTER TABLE memories ADD COLUMN ttl_days INTEGER')
+  } catch { /* column already exists */ }
+  try {
+    db.exec('ALTER TABLE memories ADD COLUMN expires_at INTEGER')
+  } catch { /* column already exists */ }
+
   // Daily logs table
   db.exec(`
     CREATE TABLE IF NOT EXISTS daily_logs (

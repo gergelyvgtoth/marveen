@@ -8,6 +8,7 @@ import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL } from '../../config.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import { maskPII } from '../../pii-filter.js'
+import { inferSensitivity, applyPolicyRules } from '../../data-gate.js'
 import type { RouteContext } from './types.js'
 
 async function broadcastSharedMemory(fromAgent: string, content: string, keywords?: string): Promise<void> {
@@ -73,6 +74,15 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
     }
     const agentId = data.agent_id || MAIN_AGENT_ID
     const safeContent = maskPII(data.content.trim())
+
+    // Infer sensitivity and apply policy rules for scope/ttl
+    const sensitivity = (data as { sensitivity?: string }).sensitivity as import('../../data-gate.js').Sensitivity | undefined
+      ?? inferSensitivity(safeContent, category)
+    const policyResult = applyPolicyRules(sensitivity)
+    const expiresAt = policyResult.ttl_days
+      ? Math.floor(Date.now() / 1000) + policyResult.ttl_days * 86400
+      : null
+
     const result = saveAgentMemory(
       agentId,
       safeContent,
@@ -80,7 +90,14 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
       data.keywords || undefined,
       true
     )
-    json(res, { ok: true, id: result.id })
+
+    // Apply scope + ttl to the saved memory
+    const db = getDb()
+    db.prepare(
+      'UPDATE memories SET sensitivity = ?, scope = ?, ttl_days = ?, expires_at = ? WHERE id = ?'
+    ).run(sensitivity, policyResult.scope, policyResult.ttl_days, expiresAt, result.id)
+
+    json(res, { ok: true, id: result.id, sensitivity, scope: policyResult.scope })
 
     // Cross-agent broadcast for shared-tier memories
     if (category === 'shared' && safeContent.length > 20) {
@@ -290,6 +307,55 @@ Respond ONLY with JSON, nothing else:
 
   if (path === '/api/memories/stats' && method === 'GET') {
     json(res, getMemoryStats())
+    return true
+  }
+
+  // POST /api/memories/forget -- delete by sensitivity/scope/age (marveen forget)
+  if (path === '/api/memories/forget' && method === 'POST') {
+    const body = await readBody(req)
+    const params = JSON.parse(body.toString()) as {
+      sensitivity?: string
+      scope?: string
+      older_than_days?: number
+      agent_id?: string
+    }
+    const db = getDb()
+    const conditions: string[] = []
+    const args: unknown[] = []
+    if (params.sensitivity) { conditions.push('sensitivity = ?'); args.push(params.sensitivity) }
+    if (params.scope) { conditions.push('scope = ?'); args.push(params.scope) }
+    if (params.older_than_days) {
+      const cutoff = Math.floor(Date.now() / 1000) - params.older_than_days * 86400
+      conditions.push('created_at < ?'); args.push(cutoff)
+    }
+    if (params.agent_id) { conditions.push('agent_id = ?'); args.push(params.agent_id) }
+    if (conditions.length === 0) { json(res, { error: 'At least one filter required' }, 400); return true }
+    const count = db.prepare(`DELETE FROM memories WHERE ${conditions.join(' AND ')}`).run(...args).changes
+    json(res, { ok: true, deleted: count })
+    return true
+  }
+
+  // POST /api/memories/ttl-sweep -- delete expired memories (called by heartbeat)
+  if (path === '/api/memories/ttl-sweep' && method === 'POST') {
+    const db = getDb()
+    const now = Math.floor(Date.now() / 1000)
+    const count = db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?').run(now).changes
+    json(res, { ok: true, deleted: count })
+    return true
+  }
+
+  // GET /api/data-policy -- read current policy
+  if (path === '/api/data-policy' && method === 'GET') {
+    const { loadDataPolicy } = await import('../../data-gate.js')
+    json(res, loadDataPolicy())
+    return true
+  }
+
+  // POST /api/data-policy/reload -- reload policy from disk
+  if (path === '/api/data-policy/reload' && method === 'POST') {
+    const { reloadDataPolicy } = await import('../../data-gate.js')
+    reloadDataPolicy()
+    json(res, { ok: true })
     return true
   }
 
