@@ -43,6 +43,9 @@ import { tryHandleIdeas } from './web/routes/ideas.js'
 import { tryHandleWorkflowRecordings } from './web/routes/workflow-recordings.js'
 import { tryHandleToolLog } from './web/routes/tool-log.js'
 import { tryHandleSessionContext } from './web/routes/session-context.js'
+import { tryHandleSalesQA } from './web/routes/sales-qa.js'
+import { tryHandleAgentHealth } from './web/routes/agent-health.js'
+import { tryHandleSkillUsage } from './web/routes/skill-usage.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import type { RouteContext } from './web/routes/types.js'
 
@@ -144,6 +147,9 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleWorkflowRecordings(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSessionContext(routeCtx)) return
+      if (await tryHandleSalesQA(routeCtx)) return
+      if (await tryHandleAgentHealth(routeCtx)) return
+      if (await tryHandleSkillUsage(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)

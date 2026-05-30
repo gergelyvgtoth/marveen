@@ -89,6 +89,10 @@ function switchPage(pageId) {
   if (pageId === 'tokenUsage') loadTokenUsage()
   if (pageId === 'ideas') loadIdeasPage()
   if (pageId === 'workflows') loadWorkflowsPage()
+  if (pageId === 'sessionContext') loadSessionContextPage()
+  if (pageId === 'salesQA') loadSalesQAPage()
+  if (pageId === 'agentHealth') { loadAgentHealthPage(); startAgentHealthAutoRefresh() }
+  else stopAgentHealthAutoRefresh()
 }
 
 navLinks.forEach((link) => {
@@ -3846,16 +3850,33 @@ function worldToScreen(wx, wy) {
 }
 
 async function loadMemoryGraph() {
-  const agent = document.getElementById('memAgentFilter').value
-  const params = new URLSearchParams()
-  if (agent) params.set('agent', agent)
-  params.set('limit', '200')
+  const agent = document.getElementById('memAgentFilter').value || 'marveen'
+  const emptyEl = document.getElementById('graphEmpty')
 
+  try {
+    // Try vector similarity graph first
+    const simRes = await fetch(`/api/memories/similarity-graph?agent=${encodeURIComponent(agent)}&threshold=0.35`)
+    const simData = await simRes.json()
+
+    if (simData.nodes && simData.nodes.length > 0) {
+      emptyEl.hidden = true
+      document.getElementById('memGraphCanvas').hidden = false
+      graphZoom = 1; graphPanX = 0; graphPanY = 0; graphSelectedNode = null
+      hideGraphPanel()
+      buildGraphFromSimilarity(simData.nodes, simData.edges)
+      startGraphSimulation()
+      return
+    }
+  } catch (err) {
+    console.warn('Similarity graph failed, falling back to keyword graph:', err)
+  }
+
+  // Fallback: keyword-based graph
+  const params = new URLSearchParams({ limit: '200' })
+  if (agent) params.set('agent', agent)
   try {
     const res = await fetch(`/api/memories?${params}`)
     const memories = await res.json()
-
-    const emptyEl = document.getElementById('graphEmpty')
     if (!memories || memories.length === 0) {
       emptyEl.hidden = false
       document.getElementById('memGraphCanvas').hidden = true
@@ -3863,18 +3884,66 @@ async function loadMemoryGraph() {
     }
     emptyEl.hidden = true
     document.getElementById('memGraphCanvas').hidden = false
-
-    // Reset zoom/pan on new data load
-    graphZoom = 1
-    graphPanX = 0
-    graphPanY = 0
-    graphSelectedNode = null
+    graphZoom = 1; graphPanX = 0; graphPanY = 0; graphSelectedNode = null
     hideGraphPanel()
-
     buildGraph(memories)
     startGraphSimulation()
   } catch (err) {
     console.error('Gráf betöltés hiba:', err)
+  }
+}
+
+function buildGraphFromSimilarity(nodes, edges) {
+  graphNodes = []
+  graphEdges = []
+  const canvas = document.getElementById('memGraphCanvas')
+  const rect = canvas.parentElement.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  canvas.width = rect.width * dpr
+  canvas.height = rect.height * dpr
+  canvas.style.width = rect.width + 'px'
+  canvas.style.height = rect.height + 'px'
+  graphCanvas = canvas
+  graphCtx = canvas.getContext('2d')
+  graphCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  const w = rect.width, h = rect.height
+
+  for (const n of nodes) {
+    graphNodes.push({
+      id: n.id,
+      x: w / 2 + (Math.random() - 0.5) * w * 0.6,
+      y: h / 2 + (Math.random() - 0.5) * h * 0.6,
+      vx: 0, vy: 0,
+      radius: 6, connectionCount: 0,
+      label: n.label,
+      tier: n.category, agent: n.agent_id,
+      keywords: (n.keywords || '').split(',').map(k => k.trim()).filter(Boolean),
+      mem: n, searchMatch: true,
+    })
+  }
+
+  for (const e of edges) {
+    graphEdges.push({ source: e.source, target: e.target, strength: e.similarity * 3 })
+    graphNodes[e.source].connectionCount += e.similarity
+    graphNodes[e.target].connectionCount += e.similarity
+  }
+
+  for (const node of graphNodes) {
+    node.radius = 5 + Math.min(Math.sqrt(node.connectionCount) * 2.5, 14)
+  }
+
+  const graphView = document.getElementById('memGraphView')
+  if (!graphView.querySelector('.graph-controls-hint')) {
+    const hint = document.createElement('div')
+    hint.className = 'graph-controls-hint'
+    hint.innerHTML = 'Scroll: zoom | Drag: move | Click: részletek<br>🧠 Vektoros szemantikus hasonlóság'
+    graphView.appendChild(hint)
+  }
+  if (!graphView.querySelector('.graph-zoom-indicator')) {
+    const zi = document.createElement('div')
+    zi.className = 'graph-zoom-indicator'
+    zi.id = 'graphZoomIndicator'
+    graphView.appendChild(zi)
   }
 }
 
@@ -8754,6 +8823,326 @@ document.getElementById('workflowModalClose')?.addEventListener('click', () => {
 document.getElementById('workflowModalCancel')?.addEventListener('click', () => { document.getElementById('workflowModalOverlay').hidden = true })
 document.getElementById('workflowModalSave')?.addEventListener('click', saveWorkflow)
 document.getElementById('workflowSearchInput')?.addEventListener('input', () => loadWorkflowsPage())
+
+// ============================================================
+// === Session Context Page ===
+// ============================================================
+
+async function loadSessionContextPage() {
+  const agent = document.getElementById('scAgentFilter')?.value || 'marveen'
+  const listEl = document.getElementById('scList')
+  const statsEl = document.getElementById('scStats')
+  if (!listEl) return
+
+  listEl.innerHTML = '<div style="color:var(--text-muted);padding:16px">Betöltés...</div>'
+
+  try {
+    const rows = await fetch(`/api/session-context/latest?agent=${agent}&limit=20`).then(r => r.json())
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-muted);padding:16px">Nincs snapshot. Kattints a "+ Snapshot" gombra az első generálásához.</div>'
+      statsEl.innerHTML = ''
+      return
+    }
+
+    // Stats bar
+    const latest = rows[0]
+    statsEl.innerHTML = `
+      <div class="stat-card"><div class="stat-value">${rows.length}</div><div class="stat-label">Snapshot</div></div>
+      <div class="stat-card"><div class="stat-value">${(latest.top_memories || []).length}</div><div class="stat-label">Top memória (legújabb)</div></div>
+      <div class="stat-card"><div class="stat-value">${(latest.kanban_snapshot || []).length}</div><div class="stat-label">Aktív kanban (legújabb)</div></div>
+      <div class="stat-card"><div class="stat-value">${(latest.open_decisions || []).length}</div><div class="stat-label">Nyitott döntés (legújabb)</div></div>
+    `
+
+    listEl.innerHTML = rows.map((r, idx) => {
+      const ts = new Date(r.created_at * 1000).toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' })
+      const mems = r.top_memories || []
+      const kanban = r.kanban_snapshot || []
+      const decisions = r.open_decisions || []
+      const isLatest = idx === 0
+
+      const memHtml = mems.length ? mems.map(m =>
+        `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
+          <span class="badge badge-${m.category || 'warm'}" style="margin-right:6px">${m.category || 'warm'}</span>
+          ${escapeHtml(m.content.slice(0, 120))}${m.content.length > 120 ? '...' : ''}
+        </div>`
+      ).join('') : '<div style="font-size:12px;color:var(--text-muted)">–</div>'
+
+      const kanbanHtml = kanban.length ? kanban.map(k =>
+        `<div style="padding:4px 0;font-size:12px;display:flex;gap:8px;align-items:center">
+          <span class="badge badge-${k.status === 'in_progress' ? 'warm' : 'cold'}">${k.status}</span>
+          <span>${escapeHtml(k.title)}</span>
+          ${k.assignee ? `<span style="color:var(--text-muted)">(${escapeHtml(k.assignee)})</span>` : ''}
+        </div>`
+      ).join('') : '<div style="font-size:12px;color:var(--text-muted)">–</div>'
+
+      const decisionsHtml = decisions.length ? decisions.map(d =>
+        `<div style="padding:4px 0;font-size:12px;border-bottom:1px solid var(--border)">
+          ${escapeHtml((d.content || '').slice(0, 100))}${(d.content || '').length > 100 ? '...' : ''}
+        </div>`
+      ).join('') : '<div style="font-size:12px;color:var(--text-muted)">–</div>'
+
+      return `
+        <div class="card" style="${isLatest ? 'border-left:3px solid var(--accent)' : ''}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="display:flex;gap:8px;align-items:center">
+              ${isLatest ? '<span class="badge badge-hot" style="font-size:11px">legújabb</span>' : ''}
+              <span style="font-weight:600;font-size:13px">${ts}</span>
+              <span style="color:var(--text-muted);font-size:12px">${agent}</span>
+            </div>
+            <div style="display:flex;gap:16px;font-size:12px;color:var(--text-muted)">
+              <span>&#129504; ${mems.length}</span>
+              <span>&#128203; ${kanban.length}</span>
+              <span>&#10067; ${decisions.length}</span>
+            </div>
+          </div>
+          <details>
+            <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none">Részletek</summary>
+            <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">
+              <div>
+                <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px">Top memóriák</div>
+                ${memHtml}
+              </div>
+              <div>
+                <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px">Kanban (aktív)</div>
+                ${kanbanHtml}
+              </div>
+              <div>
+                <div style="font-size:11px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px">Nyitott döntések (hot)</div>
+                ${decisionsHtml}
+              </div>
+            </div>
+          </details>
+        </div>
+      `
+    }).join('')
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:var(--error);padding:16px">Hiba: ${e.message}</div>`
+  }
+}
+
+async function generateSessionSnapshot() {
+  const agent = document.getElementById('scAgentFilter')?.value || 'marveen'
+  const btn = document.getElementById('scSnapshotBtn')
+  if (btn) { btn.disabled = true; btn.textContent = 'Generálás...' }
+  try {
+    const r = await fetch('/api/session-context/snapshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agent }),
+    }).then(r => r.json())
+    showToast(`Snapshot kész: ${r.memory_count} memória, ${r.kanban_count} kanban, ${r.decisions_count} döntés`, 'success')
+    loadSessionContextPage()
+  } catch (e) {
+    showToast('Snapshot hiba: ' + e.message, 'error')
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '+ Snapshot' }
+  }
+}
+
+document.getElementById('scSnapshotBtn')?.addEventListener('click', generateSessionSnapshot)
+document.getElementById('scRefreshBtn')?.addEventListener('click', loadSessionContextPage)
+document.getElementById('scAgentFilter')?.addEventListener('change', loadSessionContextPage)
+
+// ============================================================
+// === Sales Q&A Page ===
+// ============================================================
+
+let sqaEditId = null
+
+async function loadSalesQAPage() {
+  const q = document.getElementById('sqaSearchInput')?.value?.trim() || ''
+  const listEl = document.getElementById('sqaList')
+  const statsEl = document.getElementById('sqaStats')
+  if (!listEl) return
+
+  listEl.innerHTML = '<div style="color:var(--text-muted);padding:16px">Betöltés...</div>'
+
+  try {
+    const params = new URLSearchParams({ limit: '100' })
+    if (q) params.set('q', q)
+    const rows = await fetch(`/api/sales-qa?${params}`).then(r => r.json())
+
+    if (statsEl) {
+      statsEl.innerHTML = `<div class="stat-card"><div class="stat-value">${rows.length}</div><div class="stat-label">Bejegyzés</div></div>`
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-muted);padding:16px">Nincs bejegyzés. Kattints a "+ Új bejegyzés" gombra az első hozzáadásához.</div>'
+      return
+    }
+
+    listEl.innerHTML = rows.map(r => {
+      const tags = r.tags ? r.tags.split(',').filter(Boolean).map(t =>
+        `<span class="badge badge-cold" style="font-size:11px">${escapeHtml(t.trim())}</span>`
+      ).join(' ') : ''
+      const ts = new Date(r.updated_at * 1000).toLocaleDateString('hu-HU')
+      return `
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">${escapeHtml(r.question)}</div>
+              <div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px;white-space:pre-wrap">${escapeHtml(r.answer)}</div>
+              ${r.context ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">Kontextus: ${escapeHtml(r.context)}</div>` : ''}
+              <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                ${tags}
+                <span style="font-size:11px;color:var(--text-muted);margin-left:4px">${ts} · ${r.usage_count}x használva</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+              <button class="btn-secondary btn-compact" onclick="sqaCopy('${r.id}', this)" title="Másolás">&#128203;</button>
+              <button class="btn-secondary btn-compact" onclick="sqaEdit('${r.id}')" title="Szerkesztés">&#9998;</button>
+              <button class="btn-secondary btn-compact" onclick="sqaDelete('${r.id}')" title="Törlés" style="color:var(--error)">&#128465;</button>
+            </div>
+          </div>
+        </div>
+      `
+    }).join('')
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:var(--error);padding:16px">Hiba: ${e.message}</div>`
+  }
+}
+
+async function sqaCopy(id, btn) {
+  await fetch(`/api/sales-qa/${id}/use`, { method: 'POST' })
+  const row = await fetch(`/api/sales-qa?limit=1`).then(r => r.json()).then(rows => rows.find(r => r.id === id))
+  if (row) {
+    await navigator.clipboard.writeText(`${row.question}\n\n${row.answer}`)
+    showToast('Vágólapra másolva', 'success')
+  }
+}
+
+function sqaOpenModal(title) {
+  document.getElementById('sqaModalTitle').textContent = title
+  document.getElementById('sqaModalOverlay').hidden = false
+}
+
+function sqaCloseModal() {
+  document.getElementById('sqaModalOverlay').hidden = true
+  sqaEditId = null
+  document.getElementById('sqaQuestionInput').value = ''
+  document.getElementById('sqaAnswerInput').value = ''
+  document.getElementById('sqaContextInput').value = ''
+  document.getElementById('sqaTagsInput').value = ''
+}
+
+async function sqaEdit(id) {
+  const rows = await fetch('/api/sales-qa?limit=200').then(r => r.json())
+  const row = rows.find(r => r.id === id)
+  if (!row) return
+  sqaEditId = id
+  document.getElementById('sqaQuestionInput').value = row.question
+  document.getElementById('sqaAnswerInput').value = row.answer
+  document.getElementById('sqaContextInput').value = row.context || ''
+  document.getElementById('sqaTagsInput').value = row.tags || ''
+  sqaOpenModal('Szerkesztés')
+}
+
+async function sqaDelete(id) {
+  if (!confirm('Biztosan törlöd?')) return
+  await fetch(`/api/sales-qa/${id}`, { method: 'DELETE' })
+  loadSalesQAPage()
+}
+
+async function saveSalesQA() {
+  const question = document.getElementById('sqaQuestionInput').value.trim()
+  const answer = document.getElementById('sqaAnswerInput').value.trim()
+  if (!question || !answer) { showToast('Kérdés és válasz kötelező', 'error'); return }
+  const body = {
+    question,
+    answer,
+    context: document.getElementById('sqaContextInput').value.trim() || undefined,
+    tags: document.getElementById('sqaTagsInput').value.trim() || undefined,
+  }
+  if (sqaEditId) {
+    await fetch(`/api/sales-qa/${sqaEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  } else {
+    await fetch('/api/sales-qa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  }
+  sqaCloseModal()
+  loadSalesQAPage()
+}
+
+document.getElementById('sqaNewBtn')?.addEventListener('click', () => sqaOpenModal('Új bejegyzés'))
+document.getElementById('sqaModalClose')?.addEventListener('click', sqaCloseModal)
+document.getElementById('sqaModalCancel')?.addEventListener('click', sqaCloseModal)
+document.getElementById('sqaModalSave')?.addEventListener('click', saveSalesQA)
+document.getElementById('sqaSearchInput')?.addEventListener('input', () => loadSalesQAPage())
+
+// ============================================================
+// === Agent Health Page ===
+// ============================================================
+
+let ahAutoRefreshTimer = null
+let ahAutoRefreshActive = false
+
+function stopAgentHealthAutoRefresh() {
+  if (ahAutoRefreshTimer) { clearInterval(ahAutoRefreshTimer); ahAutoRefreshTimer = null }
+  ahAutoRefreshActive = false
+  const btn = document.getElementById('ahAutoRefreshBtn')
+  if (btn) btn.textContent = '▶ Auto (10s)'
+}
+
+function startAgentHealthAutoRefresh() {
+  if (ahAutoRefreshActive) return
+  ahAutoRefreshActive = true
+  const btn = document.getElementById('ahAutoRefreshBtn')
+  if (btn) btn.textContent = '⏸ Auto (10s)'
+  ahAutoRefreshTimer = setInterval(() => loadAgentHealthPage(), 10000)
+}
+
+async function loadAgentHealthPage() {
+  const gridEl = document.getElementById('ahGrid')
+  const lastEl = document.getElementById('ahLastUpdate')
+  if (!gridEl) return
+
+  try {
+    const data = await fetch('/api/agent-health').then(r => r.json())
+    if (lastEl) lastEl.textContent = 'Frissítve: ' + new Date().toLocaleTimeString('hu-HU')
+
+    const agents = data.agents || []
+    if (!agents.length) { gridEl.innerHTML = '<div style="color:var(--text-muted)">Nincs agent.</div>'; return }
+
+    gridEl.innerHTML = agents.map(a => {
+      const statusColor = a.status === 'active' ? 'var(--success, #22c55e)' : a.status === 'idle' ? 'var(--warning, #f59e0b)' : 'var(--error, #ef4444)'
+      const statusLabel = a.status === 'active' ? '● Aktív' : a.status === 'idle' ? '◑ Tétlen' : '○ Leállva'
+      const uptime = a.uptimeSec ? formatDuration(a.uptimeSec) : '–'
+      const idle = a.idleSec !== null ? formatDuration(a.idleSec) : '–'
+      const cpu = a.cpu !== null ? a.cpu.toFixed(1) + '%' : '–'
+      const mem = a.mem !== null ? a.mem.toFixed(1) + '%' : '–'
+
+      return `
+        <div class="card" style="border-left:3px solid ${statusColor}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <span style="font-weight:600;font-size:14px">${escapeHtml(a.name)}</span>
+            <span style="font-size:12px;color:${statusColor};font-weight:500">${statusLabel}</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+            <div><span style="color:var(--text-muted)">Uptime:</span> ${uptime}</div>
+            <div><span style="color:var(--text-muted)">Tétlen:</span> ${idle}</div>
+            <div><span style="color:var(--text-muted)">CPU:</span> ${cpu}</div>
+            <div><span style="color:var(--text-muted)">Mem:</span> ${mem}</div>
+            ${a.pid ? `<div style="grid-column:span 2"><span style="color:var(--text-muted)">PID:</span> ${a.pid}</div>` : ''}
+          </div>
+        </div>
+      `
+    }).join('')
+  } catch (e) {
+    gridEl.innerHTML = `<div style="color:var(--error)">Hiba: ${e.message}</div>`
+  }
+}
+
+function formatDuration(sec) {
+  if (sec < 60) return sec + 's'
+  if (sec < 3600) return Math.floor(sec / 60) + 'm'
+  return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm'
+}
+
+document.getElementById('ahRefreshBtn')?.addEventListener('click', loadAgentHealthPage)
+document.getElementById('ahAutoRefreshBtn')?.addEventListener('click', () => {
+  if (ahAutoRefreshActive) stopAgentHealthAutoRefresh()
+  else startAgentHealthAutoRefresh()
+})
 
 ;(() => {
   const p = new URLSearchParams(window.location.search).get('page')

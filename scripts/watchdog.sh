@@ -87,19 +87,67 @@ if [ -z "$DASHBOARD_PID" ]; then
   echo "$(timestamp) [watchdog] Dashboard restarted (PID: ${NEW_PID:-?})" >> "$LOG"
 fi
 
+# ── Restart rate limiter (max 3/hour per agent) ───────────────────────────
+RESTART_STATE="$INSTALL_DIR/store/watchdog-restart-state.json"
+[ -f "$RESTART_STATE" ] || echo '{}' > "$RESTART_STATE"
+
+can_restart() {
+  local AGENT="$1"
+  local NOW HOUR_AGO COUNT
+  NOW=$(date +%s)
+  HOUR_AGO=$(( NOW - 3600 ))
+  COUNT=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$RESTART_STATE'))
+    times = d.get('$AGENT', [])
+    recent = [t for t in times if t > $HOUR_AGO]
+    print(len(recent))
+except: print(0)
+" 2>/dev/null || echo 0)
+  [ "$COUNT" -lt 3 ]
+}
+
+record_restart() {
+  local AGENT="$1"
+  python3 -c "
+import json, time
+try:
+    with open('$RESTART_STATE') as f: d = json.load(f)
+except: d = {}
+now = int(time.time())
+times = [t for t in d.get('$AGENT', []) if t > now - 3600]
+times.append(now)
+d['$AGENT'] = times
+with open('$RESTART_STATE', 'w') as f: json.dump(d, f)
+" 2>/dev/null
+}
+
+inject_context_load() {
+  local SESSION="$1"
+  sleep 20
+  tmux send-keys -t "$SESSION" "[Session context betöltés]: Töltsd be az előző session kontextusát a CLAUDE.md Session context betöltés szekció szerint, majd folytasd a munkát." Enter 2>/dev/null
+}
+
 # ── Main agent session ─────────────────────────────────────────────────────
 MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
 MAIN_AGENT_ID="${MAIN_AGENT_ID:-marveen}"
 MAIN_SESSION="${MAIN_AGENT_ID}-channels"
 
 if ! tmux has-session -t "$MAIN_SESSION" 2>/dev/null; then
-  echo "$(timestamp) [watchdog] $MAIN_SESSION missing, restarting..." >> "$LOG"
-  nohup "$INSTALL_DIR/scripts/channels.sh" >> "$INSTALL_DIR/logs/marveen-channels.log" 2>&1 &
-  sleep 5
-  if tmux has-session -t "$MAIN_SESSION" 2>/dev/null; then
-    echo "$(timestamp) [watchdog] $MAIN_SESSION restarted OK" >> "$LOG"
+  if can_restart "$MAIN_AGENT_ID"; then
+    echo "$(timestamp) [watchdog] $MAIN_SESSION missing, restarting..." >> "$LOG"
+    nohup "$INSTALL_DIR/scripts/channels.sh" >> "$INSTALL_DIR/logs/marveen-channels.log" 2>&1 &
+    sleep 5
+    if tmux has-session -t "$MAIN_SESSION" 2>/dev/null; then
+      echo "$(timestamp) [watchdog] $MAIN_SESSION restarted OK" >> "$LOG"
+      record_restart "$MAIN_AGENT_ID"
+      inject_context_load "$MAIN_SESSION" &
+    else
+      echo "$(timestamp) [watchdog] $MAIN_SESSION restart FAILED" >> "$LOG"
+    fi
   else
-    echo "$(timestamp) [watchdog] $MAIN_SESSION restart FAILED" >> "$LOG"
+    echo "$(timestamp) [watchdog] $MAIN_SESSION: restart rate limit reached (3/h), skipping" >> "$LOG"
   fi
 fi
 
@@ -115,6 +163,11 @@ for AGENT_DIR in "$INSTALL_DIR/agents"/*/; do
   SESSION_NAME="agent-${AGENT_ID}"
 
   if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    continue
+  fi
+
+  if ! can_restart "$AGENT_ID"; then
+    echo "$(timestamp) [watchdog] $AGENT_ID: restart rate limit reached (3/h), skipping" >> "$LOG"
     continue
   fi
 
@@ -136,6 +189,7 @@ for AGENT_DIR in "$INSTALL_DIR/agents"/*/; do
 
   if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     echo "$(timestamp) [watchdog] $AGENT_ID restarted OK" >> "$LOG"
+    record_restart "$AGENT_ID"
     REPLAY_OUT=$(replay_unfinished_messages "$AGENT_ID" "$SESSION_NAME" 2>&1)
     [ -n "$REPLAY_OUT" ] && echo "$(timestamp) $REPLAY_OUT" >> "$LOG"
   else

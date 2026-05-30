@@ -64,6 +64,10 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         <span class="sb-label">Státusz</span>
       </a>
+      <a href="#" class="sb-link" data-page="agentHealth">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span class="sb-label">Agent Health</span>
+      </a>
       <a href="#" class="sb-link" data-page="autonomy">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span class="sb-label">Autonómia</span>
@@ -87,6 +91,14 @@
       <a href="#" class="sb-link" data-page="workflows">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         <span class="sb-label">Workflow-k</span>
+      </a>
+      <a href="#" class="sb-link" data-page="sessionContext">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 0 1 10 10"/><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="10" stroke-dasharray="4 2"/></svg>
+        <span class="sb-label">Session Context</span>
+      </a>
+      <a href="#" class="sb-link" data-page="salesQA">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="sb-label">Sales Q&amp;A</span>
       </a>
       <a href="#" class="sb-link" data-page="updates" id="updatesNavLink">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
@@ -876,6 +888,82 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- === Session Context Page === -->
+    <div class="page" id="sessionContextPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>Session Context</h1>
+            <p class="subtitle">Persistent Context Engine -- session snapshot história</p>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="scAgentFilter" class="input" style="width:160px;font-size:13px">
+              <option value="marveen">marveen</option>
+            </select>
+            <button class="btn-secondary btn-compact" id="scRefreshBtn">&#8635; Frissítés</button>
+            <button class="btn-primary btn-compact" id="scSnapshotBtn">+ Snapshot</button>
+          </div>
+        </div>
+      </div>
+      <div id="scStats" style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap"></div>
+      <div id="scList" style="display:flex;flex-direction:column;gap:12px"></div>
+    </div>
+
+    <!-- === Sales Q&A Page === -->
+    <div class="page" id="salesQAPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>Sales Q&amp;A</h1>
+            <p class="subtitle">Agrolánc tárgyalási tudásbázis -- korábbi kérdések és válaszok</p>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="sqaSearchInput" class="input" placeholder="Keresés..." style="width:220px;font-size:13px">
+            <button class="btn-primary btn-compact" id="sqaNewBtn">+ Új bejegyzés</button>
+          </div>
+        </div>
+      </div>
+      <div id="sqaStats" style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap"></div>
+      <div id="sqaList" style="display:flex;flex-direction:column;gap:8px"></div>
+      <!-- Modal: Új/szerkesztés -->
+      <div class="modal-overlay" id="sqaModalOverlay" hidden>
+        <div class="modal" style="max-width:580px">
+          <div class="modal-header">
+            <h2 id="sqaModalTitle">Új bejegyzés</h2>
+            <button class="modal-close" id="sqaModalClose">&times;</button>
+          </div>
+          <div class="modal-body" style="display:flex;flex-direction:column;gap:12px">
+            <div class="form-group"><label class="form-label">Kérdés / Témakör *</label><input type="text" id="sqaQuestionInput" class="input" placeholder="Pl. Miért érdemes CLAAS kombájnt választani John Deere helyett?"></div>
+            <div class="form-group"><label class="form-label">Válasz / Tudás *</label><textarea id="sqaAnswerInput" class="input" rows="5" placeholder="A korábbi tárgyalásból levont tudás, érvelési pont..."></textarea></div>
+            <div class="form-group"><label class="form-label">Kontextus</label><input type="text" id="sqaContextInput" class="input" placeholder="Pl. nagygazda ügyfél, gabonatermelés, 500+ ha"></div>
+            <div class="form-group"><label class="form-label">Tagek (vesszővel)</label><input type="text" id="sqaTagsInput" class="input" placeholder="kombájn, CLAAS, összehasonlítás"></div>
+          </div>
+          <div class="modal-footer" style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn-secondary" id="sqaModalCancel">Mégse</button>
+            <button class="btn-primary btn-compact" id="sqaModalSave">Mentés</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- === Agent Health Page === -->
+    <div class="page" id="agentHealthPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>Agent Health</h1>
+            <p class="subtitle">Valós idejű agent státusz, CPU/memória, aktivitás</p>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span id="ahLastUpdate" style="font-size:12px;color:var(--text-muted)"></span>
+            <button class="btn-secondary btn-compact" id="ahRefreshBtn">&#8635; Frissítés</button>
+            <button class="btn-secondary btn-compact" id="ahAutoRefreshBtn">&#9654; Auto (10s)</button>
+          </div>
+        </div>
+      </div>
+      <div id="ahGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px"></div>
     </div>
 
     <!-- === Vault Page === -->

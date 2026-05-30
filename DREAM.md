@@ -1,35 +1,35 @@
-# 💭 Dream Engine — 2026-05-29 02:07
+# 💭 Dream Engine — 2026-05-30 02:07
 
 ## 💡 Skill-javaslatok
 
-- **Agrolánc lead quick-entry** -- Az agrolanc agent ma 7 lead-et rögzített azonos struktúrában (ügyfél, gép, státusz, döntéshozó, piros zászlók), de nincs egységes skill ami ezt enforcolja és validálja. Javasolt: `agrolanc-lead-entry` skill. Agent: `agrolanc`.
-- **Repo navigator** -- Gergely 3-szor kért GitHub repo/branch infót eltérő megfogalmazásban (melyik branch, megosztott repok, CRM repo). Érdemes egy `github-repo-navigator` skill-t csinálni ami tudja a projekt-struktúrát és gyorsan válaszol. Flotta-szintű.
+- **persistent-context-engine automatikus session-start betöltés** -- A mai implementáció (API kész, `/api/session-context/snapshot` + `/api/session-context/latest`) manuálisan hívható, de nincs automatikus trigger session induláskor. Javasolt: CLAUDE.md-be belekerül egy instrukció a context betöltésre, vagy egy `PreSessionStart` hook. Flotta-szintű.
+- **upstream-pr workflow** -- Az upstream PR létrehozása (clean branch + cherry-pick + push + scope egyeztetés) ismétlődő pattern lett. A mai session során 2x kellett módosítani a scope-ot (workflow recorder utólag kerül bele). Érdemes skill-be önteni a teljes flow-t konkrét eldöntési logikával. Agent: marveen.
 
 ## 🧹 Memória-egészség
 
-44 / 44 memória, ebből 0 vektorizált (embedding nulla -- az embedding-job feladata, nem blokkoló).
-6 hot-tier memória, egyik sem öregebb 7 napnál -- cold-mozgatás nem szükséges.
-Duplikátum: 1 potenciális (Szigliget vs Szikliget önkormányzat -- agrolanc agent külön leadként kezeli, OK).
-skip-skill hot memória (id: 44) -- idea-generator routine, törölhető ha zavaró.
+45 / 45 memória, ebből 0 vektorizált (embedding-job feladata, nem blokkoló).
+7 hot-tier memória, mind friss (7 napon belül) -- cold-mozgatás nem szükséges.
+Duplikátum: 0.
+Kategória-bontás: 7 hot, 33 warm, 4 cold, 1 shared.
 
 ## 🎯 Top-3 holnapi javaslat
 
-1. gergely/marveen: NotebookLM API döntés (waiting, f6149ce8) — blokkolja a coder Tanító Tóni notebook feladatot; Gergely döntése kell, 5 perc munka.
-2. mutacsi: Strukturált gép-adatbázis (f31476a0) — az agrolanc lead memóriákban 6+ különböző géptípus jelenik meg (traktor, árdaráló, fűnyíró, Robo Compact) struktúrálatlanul; az adatbázis ezt oldaná meg.
-3. agrolanc: Sales-handoff formátum (c746de13) — Csaba, József, Szikliget leadek mind aktívak, de nincs egységes handoff struktúra Gergely napi pipeline összefoglalójához.
+1. **marveen: Persistent Context Engine automatikus CLAUDE.md integráció** -- A mai implementáció manuálisan hívható; a teljes értékét akkor adja, ha session indításkor automatikusan betöltődik. Gergely már jóváhagyta (msg 529), csak a CLAUDE.md instrukció hiányzik.
+2. **notebooklm-integration: NotebookLM API döntés** (f6149ce8) -- waiting, Gergely döntése kell. 5 perc munka, de blokkolja a Tanító Tóni coder feladatot (9309c489).
+3. **upstream-pr: PR megnyitása Szotasz/marveen felé** -- az upstream-pr branch kész, 10 commit várakozik. Csak `gh pr create` parancs kell Gergelytől (URL már elküldve).
 
 ## 🌐 External opportunity
 
-- **github.com/alirezarezvani/claude-skills** (329 skill, v2.9.0, aktív fejlesztés 2026) — átfogó Claude Code skill-könyvtár 16 domain-nel (engineering, marketing, security, productivity); érdemes átnézni van-e sales/CRM-specifikus skill amit be lehetne emelni az agrolanc flottába.
+- **github.com/BuilderIO/micro-agent** -- Micro-task alapú AI agent framework, amely kis lépésekben végrehajt és validál feladatokat (TDD-alapú). Releváns: a Marveen agent fleet jelenleg monolitikus task-okat futtat; micro-agent mintával a hibás lépések hamarabb derülnek ki és könnyebben recovery-zhetők. Stars: 3.2k, aktív fejlesztés 2026.
 
 ## 🛠 Skill-flotta health
 
-18 skill indexelve, egyik sem jelölt `pinned: true`-val (nincs use-log rendszer, pontos last-used dátum nem elérhető).
-Potenciálisan ritkán triggerelt skillek (kontextus alapján):
-- `channel-plugin-duplicate-socket` -- nagyon specifikus Socket Mode buktató, nem látszott trigger ebben a sessionben
-- `github-repo-security-audit` -- privát repó audit, utoljára nem látszott futni
+24 skill indexelve. Új (mai session): `persistent-context-engine`, `github-repo-watch`, `workflow-management`.
+Potenciálisan ritkán triggerelt:
+- `channel-plugin-duplicate-socket` -- Socket Mode-specifikus buktató, ritkán releváns
+- `notebooklm` -- csak NotebookLM integráció esetén, jelenleg waiting
 
-Törlés NEM javasolt -- trigger-feltételük egyértelmű, csak ritkán jön elő.
+Törlés NEM javasolt -- trigger-feltételük egyértelmű, ritkán jön elő.
 
 ---
 

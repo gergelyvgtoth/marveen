@@ -469,6 +469,40 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_session_ctx_agent ON session_contexts(agent_id, created_at)`)
 
+  // --- Sales Q&A (Agrolánc tudásbázis) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sales_qa (
+      id TEXT PRIMARY KEY,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      context TEXT,
+      tags TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'manual',
+      usage_count INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sales_qa_tags ON sales_qa(tags)`)
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS sales_qa_fts USING fts5(
+      question, answer, context, tags,
+      content='sales_qa',
+      content_rowid='rowid'
+    )
+  `)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS sales_qa_ai AFTER INSERT ON sales_qa BEGIN
+    INSERT INTO sales_qa_fts(rowid, question, answer, context, tags) VALUES (new.rowid, new.question, new.answer, COALESCE(new.context,''), new.tags);
+  END`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS sales_qa_ad AFTER DELETE ON sales_qa BEGIN
+    INSERT INTO sales_qa_fts(sales_qa_fts, rowid, question, answer, context, tags) VALUES('delete', old.rowid, old.question, old.answer, COALESCE(old.context,''), old.tags);
+  END`)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS sales_qa_au AFTER UPDATE ON sales_qa BEGIN
+    INSERT INTO sales_qa_fts(sales_qa_fts, rowid, question, answer, context, tags) VALUES('delete', old.rowid, old.question, old.answer, COALESCE(old.context,''), old.tags);
+    INSERT INTO sales_qa_fts(rowid, question, answer, context, tags) VALUES (new.rowid, new.question, new.answer, COALESCE(new.context,''), new.tags);
+  END`)
+
   // --- Tool Call Log (auto-recorder) ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS tool_call_log (
@@ -482,6 +516,20 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_call_log(session_id, created_at)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tool_log_ts ON tool_call_log(created_at)`)
+
+  // --- Skill Usage Log ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_usage_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      skill_name TEXT NOT NULL,
+      trigger_text TEXT,
+      agent_id TEXT NOT NULL DEFAULT 'marveen',
+      outcome TEXT CHECK(outcome IN ('positive','negative','neutral')) DEFAULT 'neutral',
+      feedback_note TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_usage_skill ON skill_usage_log(skill_name, created_at)`)
 
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
@@ -1828,4 +1876,118 @@ export function pruneSessionContexts(agentId: string, keepCount = 10): void {
   if (rows.length > 0) {
     db.prepare(`DELETE FROM session_contexts WHERE id IN (${rows.map(() => '?').join(',')})`).run(...rows.map(r => r.id))
   }
+}
+
+// ============================================================
+// === Sales Q&A (Agrolánc tudásbázis) ===
+// ============================================================
+
+export interface SalesQARow {
+  id: string
+  question: string
+  answer: string
+  context: string | null
+  tags: string
+  source: string
+  usage_count: number
+  last_used_at: number | null
+  created_at: number
+  updated_at: number
+}
+
+export function listSalesQA(opts?: { q?: string; tag?: string; limit?: number }): SalesQARow[] {
+  const limit = opts?.limit ?? 50
+  if (opts?.q && opts.q.trim()) {
+    const term = opts.q.trim().replace(/['"*]/g, '') + '*'
+    return db.prepare(`
+      SELECT s.* FROM sales_qa s
+      JOIN sales_qa_fts ON sales_qa_fts.rowid = s.rowid
+      WHERE sales_qa_fts MATCH ?
+      ORDER BY usage_count DESC
+      LIMIT ?
+    `).all(term, limit) as SalesQARow[]
+  }
+  if (opts?.tag) {
+    return db.prepare(`SELECT * FROM sales_qa WHERE tags LIKE ? ORDER BY usage_count DESC LIMIT ?`)
+      .all(`%${opts.tag}%`, limit) as SalesQARow[]
+  }
+  return db.prepare('SELECT * FROM sales_qa ORDER BY usage_count DESC, updated_at DESC LIMIT ?').all(limit) as SalesQARow[]
+}
+
+export function createSalesQA(entry: Omit<SalesQARow, 'usage_count' | 'last_used_at' | 'created_at' | 'updated_at'>): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(`
+    INSERT INTO sales_qa (id, question, answer, context, tags, source, usage_count, last_used_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+  `).run(entry.id, entry.question, entry.answer, entry.context ?? null, entry.tags, entry.source, now, now)
+}
+
+export function updateSalesQA(id: string, patch: Partial<Pick<SalesQARow, 'question' | 'answer' | 'context' | 'tags'>>): boolean {
+  const sets: string[] = []
+  const params: unknown[] = []
+  if (patch.question !== undefined) { sets.push('question = ?'); params.push(patch.question) }
+  if (patch.answer !== undefined) { sets.push('answer = ?'); params.push(patch.answer) }
+  if (patch.context !== undefined) { sets.push('context = ?'); params.push(patch.context) }
+  if (patch.tags !== undefined) { sets.push('tags = ?'); params.push(patch.tags) }
+  if (sets.length === 0) return false
+  sets.push('updated_at = ?'); params.push(Math.floor(Date.now() / 1000))
+  params.push(id)
+  return db.prepare(`UPDATE sales_qa SET ${sets.join(', ')} WHERE id = ?`).run(...params).changes > 0
+}
+
+export function deleteSalesQA(id: string): boolean {
+  return db.prepare('DELETE FROM sales_qa WHERE id = ?').run(id).changes > 0
+}
+
+export function recordSalesQAUsage(id: string): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare('UPDATE sales_qa SET usage_count = usage_count + 1, last_used_at = ? WHERE id = ?').run(now, id)
+}
+
+// ============================================================
+// === Skill Usage Log ===
+// ============================================================
+
+export interface SkillUsageRow {
+  id: number
+  skill_name: string
+  trigger_text: string | null
+  agent_id: string
+  outcome: 'positive' | 'negative' | 'neutral'
+  feedback_note: string | null
+  created_at: number
+}
+
+export function logSkillUsage(skillName: string, agentId: string, triggerText?: string): number {
+  const now = Math.floor(Date.now() / 1000)
+  return Number(db.prepare(
+    `INSERT INTO skill_usage_log (skill_name, trigger_text, agent_id, outcome, created_at)
+     VALUES (?, ?, ?, 'neutral', ?)`
+  ).run(skillName, triggerText ?? null, agentId, now).lastInsertRowid)
+}
+
+export function updateSkillUsageOutcome(id: number, outcome: 'positive' | 'negative', note?: string): boolean {
+  return db.prepare(
+    'UPDATE skill_usage_log SET outcome = ?, feedback_note = ? WHERE id = ?'
+  ).run(outcome, note ?? null, id).changes > 0
+}
+
+export function getSkillUsageStats(since?: number): { skill_name: string; total: number; positive: number; negative: number; neutral: number }[] {
+  const cutoff = since ?? 0
+  return db.prepare(`
+    SELECT skill_name,
+      COUNT(*) as total,
+      SUM(CASE WHEN outcome='positive' THEN 1 ELSE 0 END) as positive,
+      SUM(CASE WHEN outcome='negative' THEN 1 ELSE 0 END) as negative,
+      SUM(CASE WHEN outcome='neutral' THEN 1 ELSE 0 END) as neutral
+    FROM skill_usage_log WHERE created_at >= ?
+    GROUP BY skill_name ORDER BY total DESC
+  `).all(cutoff) as { skill_name: string; total: number; positive: number; negative: number; neutral: number }[]
+}
+
+export function getNegativeSkillFeedback(skillName: string, limit = 10): SkillUsageRow[] {
+  return db.prepare(
+    `SELECT * FROM skill_usage_log WHERE skill_name = ? AND outcome = 'negative'
+     ORDER BY created_at DESC LIMIT ?`
+  ).all(skillName, limit) as SkillUsageRow[]
 }

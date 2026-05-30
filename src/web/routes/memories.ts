@@ -9,6 +9,26 @@ import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
+async function broadcastSharedMemory(fromAgent: string, content: string, keywords?: string): Promise<void> {
+  try {
+    const { listAgentNames } = await import('../agent-config.js')
+    const { isAgentRunning } = await import('../agent-process.js')
+    const db = getDb()
+    const allAgents = listAgentNames().filter(n => n !== fromAgent && isAgentRunning(n))
+    if (!allAgents.length) return
+    const msg = `[Shared memória @${fromAgent}]: ${content}${keywords ? ` (kulcsszavak: ${keywords})` : ''}`
+    for (const agentName of allAgents) {
+      db.prepare(
+        `INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at)
+         VALUES (?, ?, ?, 'pending', unixepoch())`
+      ).run(fromAgent, agentName, msg)
+    }
+    logger.info({ from: fromAgent, targets: allAgents }, 'Shared memory broadcast sent')
+  } catch (err) {
+    logger.warn({ err }, 'broadcastSharedMemory failed (non-fatal)')
+  }
+}
+
 // Canonical memory categories. Kept in sync with the DB CHECK constraint in
 // src/db.ts so the API rejects bad values before they even reach SQLite.
 const MEMORY_CATEGORIES = new Set(['hot', 'warm', 'cold', 'shared'])
@@ -50,14 +70,21 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
       json(res, { error: `Invalid category "${category}". Allowed: ${[...MEMORY_CATEGORIES].join(', ')}` }, 400)
       return true
     }
+    const agentId = data.agent_id || MAIN_AGENT_ID
     const result = saveAgentMemory(
-      data.agent_id || MAIN_AGENT_ID,
+      agentId,
       data.content.trim(),
       category,
       data.keywords || undefined,
       true
     )
     json(res, { ok: true, id: result.id })
+
+    // Cross-agent broadcast for shared-tier memories
+    if (category === 'shared' && data.content.trim().length > 20) {
+      broadcastSharedMemory(agentId, data.content.trim(), data.keywords).catch(() => {})
+    }
+
     return true
   }
 
@@ -211,6 +238,51 @@ Respond ONLY with JSON, nothing else:
       logger.error({ err }, 'Backfill failed')
       json(res, { error: 'Backfill failed' }, 500)
     }
+    return true
+  }
+
+  // GET /api/memories/similarity-graph?agent=marveen&threshold=0.35
+  if (path === '/api/memories/similarity-graph' && method === 'GET') {
+    const agentId = url.searchParams.get('agent') || MAIN_AGENT_ID
+    const threshold = parseFloat(url.searchParams.get('threshold') || '0.35')
+    const db = getDb()
+    const rows = db.prepare(
+      `SELECT id, content, category, keywords, agent_id, embedding FROM memories
+       WHERE agent_id = ? AND embedding IS NOT NULL ORDER BY created_at DESC LIMIT 100`
+    ).all(agentId) as { id: number; content: string; category: string; keywords: string; agent_id: string; embedding: string }[]
+
+    const nodes = rows.map(r => ({
+      id: r.id,
+      label: r.content.slice(0, 40).replace(/\n/g, ' ') + (r.content.length > 40 ? '...' : ''),
+      category: r.category,
+      keywords: r.keywords,
+      agent_id: r.agent_id,
+    }))
+
+    // Compute cosine similarity between all pairs
+    const embeddings = rows.map(r => {
+      try { return JSON.parse(r.embedding) as number[] } catch { return null }
+    })
+
+    function cosineSim(a: number[], b: number[]): number {
+      let dot = 0, na = 0, nb = 0
+      for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+      return na === 0 || nb === 0 ? 0 : dot / (Math.sqrt(na) * Math.sqrt(nb))
+    }
+
+    const edges: { source: number; target: number; similarity: number }[] = []
+    for (let i = 0; i < rows.length; i++) {
+      for (let j = i + 1; j < rows.length; j++) {
+        const ea = embeddings[i], eb = embeddings[j]
+        if (!ea || !eb) continue
+        const sim = cosineSim(ea, eb)
+        if (sim >= threshold) {
+          edges.push({ source: i, target: j, similarity: Math.round(sim * 1000) / 1000 })
+        }
+      }
+    }
+
+    json(res, { nodes, edges })
     return true
   }
 
