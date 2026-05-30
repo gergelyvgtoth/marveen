@@ -27,6 +27,7 @@ import {
   writeAgentChannelProvider,
   readAgentAuthMode,
   writeAgentAuthMode,
+  readAgentClaudeConfigDir,
   type AuthMode,
 } from '../agent-config.js'
 import {
@@ -51,6 +52,7 @@ import {
   revokeInvite,
   agentChannelDir,
 } from '../channel-invites.js'
+import { hardRestartMarveenChannels } from '../channel-monitor.js'
 import {
   getProvider,
   channelStateDir,
@@ -69,11 +71,14 @@ import {
   isAgentRunning,
   startAgentProcess,
   stopAgentProcess,
+  restartAgentProcess,
+  getAgentRunningSince,
   getAgentProcessInfo,
   agentSessionName,
   sendPromptToSession,
   capturePane,
 } from '../agent-process.js'
+import { readActiveModelFromProjectDir } from '../active-model.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
 import { getChannelHealth } from '../channel-health-monitor.js'
 import {
@@ -86,6 +91,19 @@ import { readBody, json, serveFile } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
 const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord'])
+
+// Discord channel ids are snowflakes — base-10 numeric ids, 17 to 20 digits
+// long in practice (current Discord scheme is 64-bit, with the leading bit
+// always 0). Rejects empty, whitespace-only, non-numeric, or wrong-length
+// values before any state write so a typo in the dashboard cannot bounce the
+// live Marveen session through hardRestartMarveenChannels().
+export function validateDiscordChannelId(cid: string | undefined): { ok: boolean; error?: string } {
+  const trimmed = cid?.trim()
+  if (!trimmed || !/^[0-9]{17,20}$/.test(trimmed)) {
+    return { ok: false, error: 'Discord channelId is required and must be a numeric snowflake (17-20 digits).' }
+  }
+  return { ok: true }
+}
 
 function parseChannelProvider(raw: string): ChannelProviderType | null {
   if (VALID_PROVIDERS.has(raw as ChannelProviderType)) return raw as ChannelProviderType
@@ -234,6 +252,8 @@ interface AgentSummary {
   displayName: string
   description: string
   model: string
+  activeModel: string | null
+  runningSince: number | null
   authMode: AuthMode
   securityProfile: string
   team: TeamConfig
@@ -266,12 +286,15 @@ function getAgentSummary(name: string): AgentSummary {
   const hasSoulMd = soulMd.trim().length > 0
 
   const proc = getAgentProcessInfo(name)
+  const runningSince = proc.running ? getAgentRunningSince(name) : null
 
   return {
     name,
     displayName: readAgentDisplayName(name),
     description: extractDescriptionFromClaudeMd(claudeMd),
     model: readAgentModel(name),
+    activeModel: proc.running ? readActiveModelFromProjectDir(dir, runningSince ?? undefined, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    runningSince,
     authMode: readAgentAuthMode(name),
     securityProfile: readAgentSecurityProfile(name),
     team: readAgentTeam(name),
@@ -334,7 +357,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
     json(res, {
       claude: [
-        { id: 'claude-opus-4-8', label: 'Opus 4.8 (legújabb)' },
+        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus)' },
         { id: 'claude-opus-4-7', label: 'Opus 4.7' },
         { id: 'claude-opus-4-6', label: 'Opus 4.6' },
         { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (alapértelmezett)' },
@@ -394,7 +417,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     } catch (err) {
       rmSync(agentDir(name), { recursive: true, force: true })
       logger.error({ err, name }, 'Failed to generate agent files')
-      json(res, { error: 'Failed to generate agent files' }, 500)
+      // Propagate the underlying message so the dashboard surfaces the actual
+      // cause (auth not configured, Claude Code CLI missing, etc.) instead of
+      // the previous opaque "Failed to generate agent files" — Issue #179.
+      const detail = err instanceof Error ? err.message : 'Unknown error'
+      json(res, { error: 'Failed to generate agent files', detail }, 500)
       return true
     }
 
@@ -538,11 +565,24 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const setupMatch = matchChannelRoute(path, '')
   if (setupMatch && method === 'POST') {
     const [name, provider] = setupMatch
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const isMain = name === MAIN_AGENT_ID
+    // Marveen lives at PROJECT_ROOT, not under agents/marveen/ -- skip the
+    // dir check for the main agent and route writes to ~/.claude/channels/.
+    if (!isMain && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
 
     const body = await readBody(req)
-    const { botToken, appToken } = JSON.parse(body.toString()) as { botToken: string; appToken?: string }
+    const { botToken, appToken, channelId } = JSON.parse(body.toString()) as { botToken: string; appToken?: string; channelId?: string }
     if (!botToken?.trim()) { json(res, { error: 'botToken is required' }, 400); return true }
+
+    // Discord-specific channelId guard: the dashboard ships the channel where
+    // the bot will post by default; without it the plugin spins up but cannot
+    // resolve a default channel, and on the main Marveen agent the missing
+    // value would still trigger hardRestartMarveenChannels and bounce the
+    // live session for no useful reason. Reject before any state write.
+    if (provider === 'discord') {
+      const cidCheck = validateDiscordChannelId(channelId)
+      if (!cidCheck.ok) { json(res, { error: cidCheck.error }, 400); return true }
+    }
 
     const channelProvider = getProvider(provider)
     const validation = await channelProvider.validateToken(botToken.trim())
@@ -565,12 +605,19 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return true
     }
 
-    const stateDir = channelStateDir(provider, agentDir(name))
+    // Main agent's channel state lives under ~/.claude/channels/<provider>,
+    // sub-agents under agents/<name>/.claude/channels/<provider>.
+    const stateDir = isMain ? channelStateDir(provider) : channelStateDir(provider, agentDir(name))
     mkdirSync(stateDir, { recursive: true })
-    const tokenKey = provider === 'slack' ? 'SLACK_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN'
+    const tokenKey = provider === 'slack' ? 'SLACK_BOT_TOKEN'
+      : provider === 'discord' ? 'DISCORD_BOT_TOKEN'
+      : 'TELEGRAM_BOT_TOKEN'
     let envContent = `${tokenKey}=${botToken.trim()}\n`
     if (provider === 'slack' && appToken?.trim()) {
       envContent += `SLACK_APP_TOKEN=${appToken.trim()}\n`
+    }
+    if (provider === 'discord' && channelId?.trim()) {
+      envContent += `DISCORD_CHANNEL_ID=${channelId.trim()}\n`
     }
     atomicWriteFileSync(join(stateDir, '.env'), envContent, { mode: 0o600 })
     atomicWriteFileSync(join(stateDir, 'access.json'), JSON.stringify({
@@ -580,19 +627,28 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       pending: {},
     }, null, 2))
 
-    writeAgentChannelProvider(name, provider)
-    setAgentEnabledPlugins(name, provider)
-
-    if (provider === 'telegram') sendWelcomeMessage(name, botToken.trim()).catch(() => {})
-
-    const wasRunning = isAgentRunning(name)
+    // Main agent doesn't have an agent-config.json or enabled-plugins entry
+    // (the channels session reuses the system claude install), so skip the
+    // sub-agent-specific bookkeeping. Restart goes through the dedicated
+    // marveen-channels helper instead of the agent process lifecycle.
     let restarted = false
-    if (wasRunning) {
-      const stopRes = stopAgentProcess(name)
-      if (stopRes.ok) {
-        try { execSync('sleep 2', { timeout: 4000 }) } catch {}
-        const startRes = startAgentProcess(name)
-        restarted = startRes.ok
+    let wasRunning = false
+    if (isMain) {
+      const r = hardRestartMarveenChannels()
+      restarted = r.ok
+      wasRunning = true
+    } else {
+      writeAgentChannelProvider(name, provider)
+      setAgentEnabledPlugins(name, provider)
+      if (provider === 'telegram') sendWelcomeMessage(name, botToken.trim()).catch(() => {})
+      wasRunning = isAgentRunning(name)
+      if (wasRunning) {
+        const stopRes = stopAgentProcess(name)
+        if (stopRes.ok) {
+          try { execSync('sleep 2', { timeout: 4000 }) } catch {}
+          const startRes = startAgentProcess(name)
+          restarted = startRes.ok
+        }
       }
     }
 
@@ -868,10 +924,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         ? readMarveenTelegramConfig().botUsername
         : readAgentTelegramConfig(name).botUsername
     }
+    const cleanBotName = botName?.replace(/^@/, '')
     const items = listInvites(accessPath).map((inv) => ({
       ...inv,
-      deepLink: provider === 'telegram' && botName
-        ? `https://t.me/${botName}?start=invite-${inv.token}`
+      deepLink: provider === 'telegram' && cleanBotName
+        ? `https://t.me/${cleanBotName}?start=invite-${inv.token}`
         : undefined,
     }))
     json(res, items)
@@ -941,7 +998,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const chReqListMatch = path.match(/^\/api\/agents\/([^/]+)\/channel-requests$/)
   if (chReqListMatch && method === 'GET') {
     const name = decodeURIComponent(chReqListMatch[1])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     json(res, listPendingChannelRequests(name))
     return true
   }
@@ -950,7 +1007,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (chReqApproveMatch && method === 'POST') {
     const name = decodeURIComponent(chReqApproveMatch[1])
     const reqId = Number(chReqApproveMatch[2])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
 
     const body = await readBody(req)
     let opts: { requireMention?: boolean; allowFromAll?: boolean } = {}
@@ -999,7 +1056,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (chReqDenyMatch && method === 'POST') {
     const name = decodeURIComponent(chReqDenyMatch[1])
     const reqId = Number(chReqDenyMatch[2])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     if (updateChannelRequestStatus(reqId, 'denied')) {
       json(res, { ok: true })
     } else {
@@ -1058,6 +1115,16 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (stopMatch && method === 'POST') {
     const name = decodeURIComponent(stopMatch[1])
     const result = stopAgentProcess(name)
+    if (result.ok) { json(res, { ok: true }); return true }
+    json(res, { error: result.error }, 400)
+    return true
+  }
+
+  const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/)
+  if (restartMatch && method === 'POST') {
+    const name = decodeURIComponent(restartMatch[1])
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const result = restartAgentProcess(name)
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true

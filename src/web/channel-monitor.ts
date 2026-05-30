@@ -3,9 +3,10 @@ import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER } from '../config.js'
+import { MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
 import {
+  agentHasChannel,
   agentSessionName,
   capturePane,
   isAgentRunning,
@@ -18,9 +19,22 @@ import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
 import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
+import { shouldAutoRestartDownAgent, parseEtimeToSeconds } from './agent-restart-policy.js'
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
+
+// How long the agent's claude process has been running. Returns -1 when it
+// cannot be determined, which the restart policy treats as "do not restart".
+function getProcessAgeMs(pid: number): number {
+  try {
+    const out = execFileSync('/bin/ps', ['-o', 'etime=', '-p', String(pid)], { timeout: 3000, encoding: 'utf-8' })
+    const secs = parseEtimeToSeconds(out)
+    return secs < 0 ? -1 : secs * 1000
+  } catch {
+    return -1
+  }
+}
 
 function resolveAgentProvider(name: string): ChannelProviderType {
   const perAgent = readAgentChannelProvider(name)
@@ -151,6 +165,11 @@ function hasChannelPluginAlive(claudePid: number, providerType: ChannelProviderT
 const agentDownSince: Map<string, number> = new Map()
 const agentLastRestart: Map<string, number> = new Map()
 const AGENT_RESTART_GRACE_MS = 90_000
+// A freshly started agent can take well over the first-probe window to bring
+// its channel plugin up (a large-context model launched with --continue spawns
+// the plugin only after a slow session load). Never restart a process younger
+// than this on a "plugin down" reading, or the watchdog crash-loops it.
+const AGENT_STARTUP_GRACE_MS = 180_000
 const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
 
 // Per-session tracking for the wedged thinking-block error (a Claude
@@ -208,12 +227,32 @@ function triggerMarveenMemorySave(): void {
   }
 }
 
+// Read the main agent's configured model from .claude/settings.json so a
+// soft resume passes --model explicitly, mirroring scripts/channels.sh. Without
+// it the respawned session falls back to claude-code's built-in default and
+// silently drifts off the model the user picked. Returns '' when unset.
+function readConfiguredMainModel(): string {
+  try {
+    const settingsPath = join(PROJECT_ROOT, '.claude', 'settings.json')
+    if (!existsSync(settingsPath)) return ''
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'))
+    const model = parsed?.model
+    return typeof model === 'string' ? model.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
 function resumeMarveenSession(): boolean {
   const provider = getProvider(getMainAgentProvider())
   try {
+    const model = readConfiguredMainModel()
     const claudeCmd = [
       'export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"',
       '&&', CLAUDE, '--continue', '--dangerously-skip-permissions',
+      // Single-quote the model id so a value like `claude-opus-4-8[1m]` is not
+      // glob-expanded by the shell that tmux respawn-pane spawns the command in.
+      ...(model ? ['--model', `'${model}'`] : []),
       // NOTE: inbound from `--channels` goes through a separate
       // allowlist at /etc/claude-code/managed-settings.json
       // (allowedChannelPlugins). If the plugin isn't listed there,
@@ -315,7 +354,10 @@ function handleMarveenDown(): void {
     const serviceCmd = process.platform === 'linux'
       ? `\`systemctl --user status ${MAIN_AGENT_ID}-channels\``
       : `\`launchctl list | grep ${MAIN_AGENT_ID}\``
-    sendAlert(`🚨 Hard restart SEM segitett. Kezzel kell megnezni: \`tmux attach -t ${MAIN_CHANNELS_SESSION}\` es ${serviceCmd}.`)
+    // Issue #189: a plain `tmux attach -t ...` may itself fail with "Permission
+    // denied" when the operator is running it from another tmux session. Prefix
+    // with `unset TMUX` so the hint works in both nested and non-nested cases.
+    sendAlert(`🚨 Hard restart SEM segitett. Kezzel kell megnezni: \`unset TMUX && tmux attach -t ${MAIN_CHANNELS_SESSION}\` es ${serviceCmd}.`)
     return
   }
   if (now - marveenDownState.lastAlertAt > PLUGIN_ALERT_DEDUP_MS) {
@@ -354,7 +396,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout {
     type Target = { session: string; isMarveen: boolean; agentName?: string; provider: ChannelProviderType }
     const targets: Target[] = [{ session: MAIN_CHANNELS_SESSION, isMarveen: true, provider: mainProvider }]
     for (const a of listAgentNames()) {
-      if (isAgentRunning(a)) {
+      if (isAgentRunning(a) && agentHasChannel(a)) {
         targets.push({
           session: agentSessionName(a),
           isMarveen: false,
@@ -411,14 +453,21 @@ export function startChannelPluginMonitor(): NodeJS.Timeout {
         }
         continue
       }
-      if (!t.isMarveen && t.agentName) {
-        const lastRestart = agentLastRestart.get(t.agentName)
-        if (lastRestart && Date.now() - lastRestart < AGENT_RESTART_GRACE_MS) continue
-      }
       if (t.isMarveen) {
         if (shouldEscalateMarveenDown()) handleMarveenDown()
       } else {
         if (!agentDownSince.has(t.session)) agentDownSince.set(t.session, Date.now())
+        const lastRestart = agentLastRestart.get(t.agentName!)
+        const restart = shouldAutoRestartDownAgent({
+          processAgeMs: getProcessAgeMs(claudePid),
+          msSinceLastRestart: lastRestart != null ? Date.now() - lastRestart : null,
+          startupGraceMs: AGENT_STARTUP_GRACE_MS,
+          restartGraceMs: AGENT_RESTART_GRACE_MS,
+        })
+        if (!restart) {
+          logger.debug({ agent: t.agentName, provider: t.provider }, 'Channel plugin probe reports down but agent is within startup/restart grace -- deferring')
+          continue
+        }
         const agentProvider = resolveAgentProvider(t.agentName!)
         const stateDir = channelStateDir(agentProvider, agentDir(t.agentName!))
         const agentToken = readChannelToken(agentProvider, join(stateDir, '.env'))
