@@ -7,6 +7,7 @@ import {
 import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL } from '../../config.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
+import { maskPII } from '../../pii-filter.js'
 import type { RouteContext } from './types.js'
 
 async function broadcastSharedMemory(fromAgent: string, content: string, keywords?: string): Promise<void> {
@@ -71,9 +72,10 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
       return true
     }
     const agentId = data.agent_id || MAIN_AGENT_ID
+    const safeContent = maskPII(data.content.trim())
     const result = saveAgentMemory(
       agentId,
-      data.content.trim(),
+      safeContent,
       category,
       data.keywords || undefined,
       true
@@ -81,8 +83,8 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
     json(res, { ok: true, id: result.id })
 
     // Cross-agent broadcast for shared-tier memories
-    if (category === 'shared' && data.content.trim().length > 20) {
-      broadcastSharedMemory(agentId, data.content.trim(), data.keywords).catch(() => {})
+    if (category === 'shared' && safeContent.length > 20) {
+      broadcastSharedMemory(agentId, safeContent, data.keywords).catch(() => {})
     }
 
     return true

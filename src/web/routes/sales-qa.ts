@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { listSalesQA, createSalesQA, updateSalesQA, deleteSalesQA, recordSalesQAUsage } from '../../db.js'
 import { readBody, json } from '../http-helpers.js'
+import { maskPII } from '../../pii-filter.js'
 import type { RouteContext } from './types.js'
 
 export async function tryHandleSalesQA(ctx: RouteContext): Promise<boolean> {
@@ -30,9 +31,9 @@ export async function tryHandleSalesQA(ctx: RouteContext): Promise<boolean> {
     const id = randomUUID().slice(0, 8)
     createSalesQA({
       id,
-      question: data.question.trim(),
-      answer: data.answer.trim(),
-      context: data.context?.trim() ?? null,
+      question: maskPII(data.question.trim()),
+      answer: maskPII(data.answer.trim()),
+      context: data.context ? maskPII(data.context.trim()) : null,
       tags: data.tags?.trim() ?? '',
       source: data.source ?? 'manual',
     })
