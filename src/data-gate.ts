@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { STORE_DIR } from './config.js'
 import { maskPII } from './pii-filter.js'
 import { logger } from './logger.js'
+import { recordOutboundAudit, type OutboundAuditEntry } from './db.js'
 
 export type Sensitivity = 'pii' | 'sensitive' | 'technical' | 'public'
 export type Scope = 'local_only' | 'claude_code_ok' | 'none'
@@ -70,6 +71,10 @@ export interface GateResult {
   allowed: boolean
   reason: string
   content: string
+  // Effective values the gate decided on (after defaults applied), so the
+  // audit log records what was actually evaluated, not the raw item.
+  sensitivity: Sensitivity
+  scope: Scope
 }
 
 /**
@@ -86,17 +91,17 @@ export function applyGate(item: GateableItem): GateResult {
 
   // BLOCK: local_only items never leave
   if (scope === 'local_only') {
-    return { allowed: false, reason: 'scope:local_only', content: '' }
+    return { allowed: false, reason: 'scope:local_only', content: '', sensitivity, scope }
   }
 
   // BLOCK: none items never leave
   if (scope === 'none') {
-    return { allowed: false, reason: 'scope:none', content: '' }
+    return { allowed: false, reason: 'scope:none', content: '', sensitivity, scope }
   }
 
   // BLOCK: uncertain items if policy says so
   if (!item.scope && gate.block_on_uncertain) {
-    return { allowed: false, reason: 'scope:uncertain+block_on_uncertain', content: '' }
+    return { allowed: false, reason: 'scope:uncertain+block_on_uncertain', content: '', sensitivity, scope }
   }
 
   // scope == claude_code_ok from here
@@ -106,17 +111,17 @@ export function applyGate(item: GateableItem): GateResult {
   if (sensitivity === 'pii') {
     if (gate.pseudonymize_pii) {
       content = maskPII(content)
-      return { allowed: true, reason: 'pii:pseudonymized', content }
+      return { allowed: true, reason: 'pii:pseudonymized', content, sensitivity, scope }
     }
-    return { allowed: false, reason: 'pii:blocked', content: '' }
+    return { allowed: false, reason: 'pii:blocked', content: '', sensitivity, scope }
   }
 
   // sensitive: only if explicitly claude_code_ok
   if (sensitivity === 'sensitive' && scope !== 'claude_code_ok') {
-    return { allowed: false, reason: 'sensitive:no_explicit_permission', content: '' }
+    return { allowed: false, reason: 'sensitive:no_explicit_permission', content: '', sensitivity, scope }
   }
 
-  return { allowed: true, reason: `ok:${sensitivity}`, content }
+  return { allowed: true, reason: `ok:${sensitivity}`, content, sensitivity, scope }
 }
 
 /**
@@ -131,6 +136,7 @@ export function filterOutbound<T extends GateableItem>(
   const policy = loadDataPolicy()
   const gate = policy.outbound_gate
   const allowed: (T & { content: string })[] = []
+  const auditEntries: OutboundAuditEntry[] = []
   let blocked = 0
 
   for (const item of items) {
@@ -145,6 +151,26 @@ export function filterOutbound<T extends GateableItem>(
       if (gate.log_outbound) {
         logger.debug({ id: item.id, reason: result.reason, purpose }, 'DataGate: outbound blocked')
       }
+    }
+    if (gate.log_outbound) {
+      auditEntries.push({
+        memory_id: item.id,
+        purpose,
+        sensitivity: result.sensitivity,
+        scope: result.scope,
+        allowed: result.allowed,
+        reason: result.reason,
+      })
+    }
+  }
+
+  // Persist the audit trail. Never let an audit-write failure break the
+  // outbound path -- the gate decision already stands.
+  if (auditEntries.length) {
+    try {
+      recordOutboundAudit(auditEntries)
+    } catch (err) {
+      logger.warn({ err, purpose }, 'DataGate: outbound audit write failed (non-fatal)')
     }
   }
 

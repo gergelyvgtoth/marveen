@@ -2,6 +2,7 @@ import {
   saveAgentMemory, getAgentMemories, searchAgentMemories, getMemoryStats, updateMemory,
   hybridSearch, backfillEmbeddings,
   searchMemories, getMemoriesForChat, getDb,
+  getOutboundAudit, getOutboundAuditStats,
   type Memory,
 } from '../../db.js'
 import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL } from '../../config.js'
@@ -305,6 +306,22 @@ Respond ONLY with JSON, nothing else:
     return true
   }
 
+  // GET /api/memories/knowledge-graph?agent=marveen&focus=Agrolánc
+  // Entity-relation graph extracted from memory text (not similarity-based).
+  if (path === '/api/memories/knowledge-graph' && method === 'GET') {
+    const agentId = url.searchParams.get('agent') || MAIN_AGENT_ID
+    const focus = url.searchParams.get('focus') || undefined
+    const db = getDb()
+    const rows = db.prepare(
+      `SELECT id, content, keywords FROM memories
+       WHERE (agent_id = ? OR category = 'shared') ORDER BY created_at DESC LIMIT 500`
+    ).all(agentId) as { id: number; content: string; keywords: string | null }[]
+    const { buildKnowledgeGraph } = await import('../../knowledge-graph.js')
+    const graph = buildKnowledgeGraph(rows, focus)
+    json(res, graph)
+    return true
+  }
+
   if (path === '/api/memories/stats' && method === 'GET') {
     json(res, getMemoryStats())
     return true
@@ -356,6 +373,24 @@ Respond ONLY with JSON, nothing else:
     const { reloadDataPolicy } = await import('../../data-gate.js')
     reloadDataPolicy()
     json(res, { ok: true })
+    return true
+  }
+
+  // GET /api/data-policy/audit -- outbound audit log (what left, when, why)
+  // Query params: limit (1-1000, default 100), allowed (true|false),
+  //   purpose (exact match), since (unix seconds)
+  if (path === '/api/data-policy/audit' && method === 'GET') {
+    const limitParamRaw = url.searchParams.get('limit')
+    const allowedParam = url.searchParams.get('allowed')
+    const purposeParam = url.searchParams.get('purpose')
+    const sinceParam = url.searchParams.get('since')
+    const rows = getOutboundAudit({
+      limit: limitParamRaw ? parseInt(limitParamRaw, 10) : undefined,
+      allowed: allowedParam == null ? undefined : allowedParam === 'true',
+      purpose: purposeParam || undefined,
+      since: sinceParam ? parseInt(sinceParam, 10) : undefined,
+    })
+    json(res, { stats: getOutboundAuditStats(), entries: rows })
     return true
   }
 

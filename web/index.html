@@ -100,6 +100,18 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         <span class="sb-label">Sales Q&amp;A</span>
       </a>
+      <a href="#" class="sb-link" data-page="inbox">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+        <span class="sb-label">Triage Inbox</span>
+      </a>
+      <a href="#" class="sb-link" data-page="experiments">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 2v7.31"/><path d="M14 9.3V2"/><path d="M8.5 2h7"/><path d="M14 9.3a6.5 6.5 0 1 1-4 0"/><path d="M5.58 16.5h12.85"/></svg>
+        <span class="sb-label">A/B Skill</span>
+      </a>
+      <a href="#" class="sb-link" data-page="recordings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+        <span class="sb-label">Session Replay</span>
+      </a>
       <a href="#" class="sb-link" data-page="updates" id="updatesNavLink">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         <span class="sb-label">Frissítések</span>
@@ -393,6 +405,16 @@
 
       <!-- Graph view -->
       <div class="mem-graph-view" id="memGraphView" hidden>
+        <div class="graph-mode-bar" id="graphModeBar">
+          <div class="graph-mode-toggle">
+            <button class="graph-mode-btn active" data-gmode="similarity" id="gmodeSim">🧠 Hasonlóság</button>
+            <button class="graph-mode-btn" data-gmode="knowledge" id="gmodeKnow">🕸️ Kapcsolatok</button>
+          </div>
+          <div class="graph-focus-wrap" id="graphFocusWrap" hidden>
+            <input type="text" id="kgFocusInput" class="graph-focus-input" placeholder="Entitás fókusz (pl. Agrolánc)..." />
+            <button class="btn-icon" id="kgFocusClear" title="Fókusz törlése">&times;</button>
+          </div>
+        </div>
         <canvas id="memGraphCanvas"></canvas>
         <div class="graph-empty" id="graphEmpty" hidden>
           <p>Nincs elég emlék a gráf megjelenítéshez</p>
@@ -1223,6 +1245,48 @@
       <p style="margin-top: 10px; font-size: 11px; opacity: 0.6;">
         <span id="consoleStatus">Betöltés...</span> • Frissítés: <span id="refreshInterval">2</span>s
       </p>
+    </div>
+
+    <!-- Triage Inbox (#5) -->
+    <div class="page" id="inboxPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>Triage Inbox</h1>
+            <p class="subtitle">Egységes prioritált sor minden csatornáról</p>
+          </div>
+          <div id="inboxStats" class="subtitle"></div>
+        </div>
+      </div>
+      <div id="inboxList" class="card-list"></div>
+    </div>
+
+    <!-- A/B Skill kísérletek (#4) -->
+    <div class="page" id="experimentsPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>A/B Skill kísérletek</h1>
+            <p class="subtitle">Skill variánsok mérése és nyertes előléptetése</p>
+          </div>
+        </div>
+      </div>
+      <div id="experimentsList" class="card-list"></div>
+    </div>
+
+    <!-- Session Replay / regresszió (#1) -->
+    <div class="page" id="recordingsPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1>Session Replay</h1>
+            <p class="subtitle">Felvételek és regressziós diff szcenáriónként</p>
+          </div>
+        </div>
+      </div>
+      <div id="recordingsCompareBar" style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;"></div>
+      <div id="recordingsDiff"></div>
+      <div id="recordingsList" class="card-list"></div>
     </div>
 
   </main>

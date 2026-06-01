@@ -483,6 +483,27 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_session_ctx_agent ON session_contexts(agent_id, created_at)`)
 
+  // --- Outbound Audit Log (data sovereignty) ---
+  // Persistent, queryable record of every item the outbound DataGate
+  // evaluated -- "what left the local environment, when, and why".
+  // The gate previously only wrote to the app logger (ephemeral, not
+  // queryable), so there was no after-the-fact answer to "did this PII
+  // memory ever reach Claude?". One row per evaluated item.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS outbound_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      memory_id TEXT,
+      purpose TEXT NOT NULL,
+      sensitivity TEXT,
+      scope TEXT,
+      allowed INTEGER NOT NULL,
+      reason TEXT NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbound_audit_ts ON outbound_audit(ts)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbound_audit_allowed ON outbound_audit(allowed, ts)`)
+
   // --- Sales Q&A (Agrolánc tudásbázis) ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS sales_qa (
@@ -544,6 +565,64 @@ export function initDatabase(): void {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_usage_skill ON skill_usage_log(skill_name, created_at)`)
+  // Migration: which A/B variant produced this usage (null = not in an experiment)
+  try { db.exec('ALTER TABLE skill_usage_log ADD COLUMN variant TEXT') } catch { /* exists */ }
+
+  // --- A/B Skill Experiments ---
+  // Run two variants of a skill in controlled alternation, measure outcomes
+  // from skill_usage_log, promote the winner. Variant assignment is
+  // deterministic (parity of recorded usages) so it is testable and even.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_experiments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      skill_name TEXT NOT NULL,
+      hypothesis TEXT,
+      variant_a TEXT NOT NULL,
+      variant_b TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','done')),
+      winner TEXT CHECK(winner IN ('A','B') OR winner IS NULL),
+      created_at INTEGER NOT NULL,
+      decided_at INTEGER
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_skill_exp_skill ON skill_experiments(skill_name, status)`)
+
+  // --- Session Recordings (replay + regression harness) ---
+  // Immutable fixtures: an ordered event list (inbound/tool/reply) captured
+  // from a session, used to regression-diff future runs of the same scenario.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_recordings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      scenario TEXT NOT NULL,
+      events_json TEXT NOT NULL DEFAULT '[]',
+      is_baseline INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_session_rec_scenario ON session_recordings(scenario, created_at)`)
+
+  // --- Unified Triage Inbox ---
+  // One prioritized queue across channels. urgency/intent/score come from the
+  // triage classifier; status tracks whether the item still needs a response.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbox_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source TEXT NOT NULL CHECK(source IN ('telegram','email','whatsapp','other')),
+      external_id TEXT,
+      sender TEXT,
+      subject TEXT,
+      preview TEXT NOT NULL DEFAULT '',
+      urgency TEXT NOT NULL DEFAULT 'normal' CHECK(urgency IN ('urgent','normal','low')),
+      intent TEXT NOT NULL DEFAULT 'fyi' CHECK(intent IN ('question','request','fyi')),
+      score INTEGER NOT NULL DEFAULT 50,
+      status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done')),
+      received_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inbox_status_score ON inbox_items(status, score, received_at)`)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_source_ext ON inbox_items(source, external_id) WHERE external_id IS NOT NULL`)
 
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
@@ -762,6 +841,65 @@ export function getMemoryStats(): { total: number; byAgent: Record<string, numbe
   for (const r of agentRows) byAgent[r.agent_id] = r.c
   for (const r of tierRows) byTier[r.category] = r.c
   return { total, byAgent, byTier, withEmbedding }
+}
+
+// --- Outbound Audit Log ---
+
+export interface OutboundAuditEntry {
+  memory_id: string | number | null
+  purpose: string
+  sensitivity: string | null
+  scope: string | null
+  allowed: boolean
+  reason: string
+}
+
+export interface OutboundAuditRow {
+  id: number
+  ts: number
+  memory_id: string | null
+  purpose: string
+  sensitivity: string | null
+  scope: string | null
+  allowed: number
+  reason: string
+}
+
+// Batch-insert audit rows in a single transaction. Called by the DataGate
+// for every evaluated outbound item when policy.log_outbound is true.
+export function recordOutboundAudit(entries: OutboundAuditEntry[]): void {
+  if (!entries.length) return
+  const now = Math.floor(Date.now() / 1000)
+  const insert = db.prepare(
+    'INSERT INTO outbound_audit (ts, memory_id, purpose, sensitivity, scope, allowed, reason) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  )
+  const tx = db.transaction((rows: OutboundAuditEntry[]) => {
+    for (const e of rows) {
+      insert.run(now, e.memory_id == null ? null : String(e.memory_id), e.purpose, e.sensitivity, e.scope, e.allowed ? 1 : 0, e.reason)
+    }
+  })
+  tx(entries)
+}
+
+export function getOutboundAudit(opts: { limit?: number; allowed?: boolean; purpose?: string; since?: number } = {}): OutboundAuditRow[] {
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000)
+  const where: string[] = []
+  const params: unknown[] = []
+  if (opts.allowed !== undefined) { where.push('allowed = ?'); params.push(opts.allowed ? 1 : 0) }
+  if (opts.purpose) { where.push('purpose = ?'); params.push(opts.purpose) }
+  if (opts.since) { where.push('ts >= ?'); params.push(opts.since) }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  params.push(limit)
+  return db.prepare(`SELECT * FROM outbound_audit ${clause} ORDER BY ts DESC, id DESC LIMIT ?`).all(...params) as OutboundAuditRow[]
+}
+
+export function getOutboundAuditStats(): { total: number; allowed: number; blocked: number; byReason: Record<string, number> } {
+  const total = (db.prepare('SELECT COUNT(*) as c FROM outbound_audit').get() as { c: number }).c
+  const allowed = (db.prepare('SELECT COUNT(*) as c FROM outbound_audit WHERE allowed = 1').get() as { c: number }).c
+  const reasonRows = db.prepare('SELECT reason, COUNT(*) as c FROM outbound_audit GROUP BY reason ORDER BY c DESC').all() as { reason: string; c: number }[]
+  const byReason: Record<string, number> = {}
+  for (const r of reasonRows) byReason[r.reason] = r.c
+  return { total, allowed, blocked: total - allowed, byReason }
 }
 
 export function updateMemory(id: number, content: string, category?: string, agentId?: string, keywords?: string): boolean {
@@ -2004,4 +2142,225 @@ export function getNegativeSkillFeedback(skillName: string, limit = 10): SkillUs
     `SELECT * FROM skill_usage_log WHERE skill_name = ? AND outcome = 'negative'
      ORDER BY created_at DESC LIMIT ?`
   ).all(skillName, limit) as SkillUsageRow[]
+}
+
+// --- A/B Skill Experiments ---
+
+export interface SkillExperiment {
+  id: number
+  skill_name: string
+  hypothesis: string | null
+  variant_a: string
+  variant_b: string
+  status: 'active' | 'done'
+  winner: 'A' | 'B' | null
+  created_at: number
+  decided_at: number | null
+}
+
+export interface VariantStats {
+  variant: 'A' | 'B'
+  total: number
+  positive: number
+  negative: number
+  neutral: number
+  positiveRate: number   // positive / total, 0 if no data
+}
+
+export function createSkillExperiment(skillName: string, variantA: string, variantB: string, hypothesis?: string): { id: number } {
+  // Only one active experiment per skill: close any prior active one as undecided.
+  db.prepare("UPDATE skill_experiments SET status='done', decided_at=unixepoch() WHERE skill_name=? AND status='active'").run(skillName)
+  const now = Math.floor(Date.now() / 1000)
+  const info = db.prepare(
+    'INSERT INTO skill_experiments (skill_name, hypothesis, variant_a, variant_b, status, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(skillName, hypothesis ?? null, variantA, variantB, 'active', now)
+  return { id: Number(info.lastInsertRowid) }
+}
+
+export function getActiveSkillExperiment(skillName: string): SkillExperiment | undefined {
+  return db.prepare("SELECT * FROM skill_experiments WHERE skill_name=? AND status='active' ORDER BY created_at DESC LIMIT 1")
+    .get(skillName) as SkillExperiment | undefined
+}
+
+export function listSkillExperiments(): SkillExperiment[] {
+  return db.prepare('SELECT * FROM skill_experiments ORDER BY created_at DESC').all() as SkillExperiment[]
+}
+
+/**
+ * Deterministic, even A/B assignment: alternate by the parity of how many
+ * variant-tagged usages this skill already has. Returns null if no active
+ * experiment exists for the skill.
+ */
+export function assignSkillVariant(skillName: string): 'A' | 'B' | null {
+  const exp = getActiveSkillExperiment(skillName)
+  if (!exp) return null
+  const n = (db.prepare('SELECT COUNT(*) as c FROM skill_usage_log WHERE skill_name=? AND variant IS NOT NULL').get(skillName) as { c: number }).c
+  return n % 2 === 0 ? 'A' : 'B'
+}
+
+export function recordSkillVariantOutcome(
+  skillName: string,
+  variant: 'A' | 'B',
+  outcome: 'positive' | 'negative' | 'neutral',
+  triggerText?: string,
+  note?: string
+): number {
+  const now = Math.floor(Date.now() / 1000)
+  const info = db.prepare(
+    `INSERT INTO skill_usage_log (skill_name, trigger_text, agent_id, outcome, feedback_note, variant, created_at)
+     VALUES (?, ?, 'marveen', ?, ?, ?, ?)`
+  ).run(skillName, triggerText ?? null, outcome, note ?? null, variant, now)
+  return Number(info.lastInsertRowid)
+}
+
+function variantStats(skillName: string, variant: 'A' | 'B'): VariantStats {
+  const r = db.prepare(`
+    SELECT COUNT(*) as total,
+      SUM(CASE WHEN outcome='positive' THEN 1 ELSE 0 END) as positive,
+      SUM(CASE WHEN outcome='negative' THEN 1 ELSE 0 END) as negative,
+      SUM(CASE WHEN outcome='neutral' THEN 1 ELSE 0 END) as neutral
+    FROM skill_usage_log WHERE skill_name=? AND variant=?
+  `).get(skillName, variant) as { total: number; positive: number | null; negative: number | null; neutral: number | null }
+  const total = r.total || 0
+  const positive = r.positive || 0
+  return {
+    variant, total, positive,
+    negative: r.negative || 0,
+    neutral: r.neutral || 0,
+    positiveRate: total > 0 ? positive / total : 0,
+  }
+}
+
+export interface ExperimentResults {
+  experiment: SkillExperiment
+  a: VariantStats
+  b: VariantStats
+  suggestedWinner: 'A' | 'B' | null   // null if not enough data / tie
+  confident: boolean                   // both variants have >= MIN_SAMPLE
+}
+
+const MIN_SAMPLE = 5
+
+export function getSkillExperimentResults(id: number): ExperimentResults | undefined {
+  const experiment = db.prepare('SELECT * FROM skill_experiments WHERE id=?').get(id) as SkillExperiment | undefined
+  if (!experiment) return undefined
+  const a = variantStats(experiment.skill_name, 'A')
+  const b = variantStats(experiment.skill_name, 'B')
+  const confident = a.total >= MIN_SAMPLE && b.total >= MIN_SAMPLE
+  let suggestedWinner: 'A' | 'B' | null = null
+  if (confident && a.positiveRate !== b.positiveRate) {
+    suggestedWinner = a.positiveRate > b.positiveRate ? 'A' : 'B'
+  }
+  return { experiment, a, b, suggestedWinner, confident }
+}
+
+export function promoteSkillExperiment(id: number, winner: 'A' | 'B'): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare("UPDATE skill_experiments SET status='done', winner=?, decided_at=? WHERE id=?")
+    .run(winner, now, id).changes > 0
+}
+
+// --- Session Recordings ---
+
+export interface SessionRecordingRow {
+  id: number
+  name: string
+  scenario: string
+  events_json: string
+  is_baseline: number
+  created_at: number
+}
+
+export function saveSessionRecording(name: string, scenario: string, events: unknown[], isBaseline = false): { id: number } {
+  const now = Math.floor(Date.now() / 1000)
+  // Only one baseline per scenario: demote previous baselines.
+  if (isBaseline) {
+    db.prepare('UPDATE session_recordings SET is_baseline = 0 WHERE scenario = ?').run(scenario)
+  }
+  const info = db.prepare(
+    'INSERT INTO session_recordings (name, scenario, events_json, is_baseline, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(name, scenario, JSON.stringify(events ?? []), isBaseline ? 1 : 0, now)
+  return { id: Number(info.lastInsertRowid) }
+}
+
+export function listSessionRecordings(scenario?: string): SessionRecordingRow[] {
+  if (scenario) {
+    return db.prepare('SELECT * FROM session_recordings WHERE scenario = ? ORDER BY created_at DESC').all(scenario) as SessionRecordingRow[]
+  }
+  return db.prepare('SELECT * FROM session_recordings ORDER BY created_at DESC LIMIT 200').all() as SessionRecordingRow[]
+}
+
+export function getSessionRecording(id: number): SessionRecordingRow | undefined {
+  return db.prepare('SELECT * FROM session_recordings WHERE id = ?').get(id) as SessionRecordingRow | undefined
+}
+
+export function getBaselineRecording(scenario: string): SessionRecordingRow | undefined {
+  return db.prepare('SELECT * FROM session_recordings WHERE scenario = ? AND is_baseline = 1 ORDER BY created_at DESC LIMIT 1').get(scenario) as SessionRecordingRow | undefined
+}
+
+export function deleteSessionRecording(id: number): boolean {
+  return db.prepare('DELETE FROM session_recordings WHERE id = ?').run(id).changes > 0
+}
+
+// --- Unified Triage Inbox ---
+
+export interface InboxItem {
+  id: number
+  source: 'telegram' | 'email' | 'whatsapp' | 'other'
+  external_id: string | null
+  sender: string | null
+  subject: string | null
+  preview: string
+  urgency: 'urgent' | 'normal' | 'low'
+  intent: 'question' | 'request' | 'fyi'
+  score: number
+  status: 'open' | 'done'
+  received_at: number
+  created_at: number
+}
+
+export function addInboxItem(item: {
+  source: InboxItem['source']
+  external_id?: string | null
+  sender?: string | null
+  subject?: string | null
+  preview: string
+  urgency: InboxItem['urgency']
+  intent: InboxItem['intent']
+  score: number
+  received_at?: number
+}): { id: number; deduped: boolean } {
+  const now = Math.floor(Date.now() / 1000)
+  // Dedup on (source, external_id) when an external id is present.
+  if (item.external_id) {
+    const existing = db.prepare('SELECT id FROM inbox_items WHERE source = ? AND external_id = ?').get(item.source, item.external_id) as { id: number } | undefined
+    if (existing) return { id: existing.id, deduped: true }
+  }
+  const info = db.prepare(
+    `INSERT INTO inbox_items (source, external_id, sender, subject, preview, urgency, intent, score, status, received_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`
+  ).run(item.source, item.external_id ?? null, item.sender ?? null, item.subject ?? null, item.preview,
+    item.urgency, item.intent, item.score, item.received_at ?? now, now)
+  return { id: Number(info.lastInsertRowid), deduped: false }
+}
+
+export function listInbox(status: 'open' | 'done' | 'all' = 'open', limit = 100): InboxItem[] {
+  const lim = Math.min(Math.max(limit, 1), 500)
+  if (status === 'all') {
+    return db.prepare('SELECT * FROM inbox_items ORDER BY status ASC, score DESC, received_at DESC LIMIT ?').all(lim) as InboxItem[]
+  }
+  return db.prepare('SELECT * FROM inbox_items WHERE status = ? ORDER BY score DESC, received_at DESC LIMIT ?').all(status, lim) as InboxItem[]
+}
+
+export function setInboxStatus(id: number, status: 'open' | 'done'): boolean {
+  return db.prepare('UPDATE inbox_items SET status = ? WHERE id = ?').run(status, id).changes > 0
+}
+
+export function getInboxStats(): { open: number; urgent_open: number; bySource: Record<string, number> } {
+  const open = (db.prepare("SELECT COUNT(*) as c FROM inbox_items WHERE status='open'").get() as { c: number }).c
+  const urgentOpen = (db.prepare("SELECT COUNT(*) as c FROM inbox_items WHERE status='open' AND urgency='urgent'").get() as { c: number }).c
+  const rows = db.prepare("SELECT source, COUNT(*) as c FROM inbox_items WHERE status='open' GROUP BY source").all() as { source: string; c: number }[]
+  const bySource: Record<string, number> = {}
+  for (const r of rows) bySource[r.source] = r.c
+  return { open, urgent_open: urgentOpen, bySource }
 }

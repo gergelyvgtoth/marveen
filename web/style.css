@@ -2154,6 +2154,53 @@ main {
 }
 .graph-empty[hidden] { display: none; }
 
+/* === Graph mode bar (similarity / knowledge toggle + focus) === */
+.graph-mode-bar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 5;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.graph-mode-toggle {
+  display: inline-flex;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.graph-mode-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.graph-mode-btn:hover { color: var(--text); }
+.graph-mode-btn.active { background: var(--accent); color: #fff; }
+.graph-focus-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2px 4px 2px 8px;
+}
+.graph-focus-wrap[hidden] { display: none; }
+.graph-focus-input {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  width: 200px;
+}
+
 /* === Graph Detail Panel === */
 .graph-panel {
   position: absolute;

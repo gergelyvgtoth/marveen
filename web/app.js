@@ -91,6 +91,9 @@ function switchPage(pageId) {
   if (pageId === 'workflows') loadWorkflowsPage()
   if (pageId === 'sessionContext') loadSessionContextPage()
   if (pageId === 'salesQA') loadSalesQAPage()
+  if (pageId === 'inbox') loadInboxPage()
+  if (pageId === 'experiments') loadExperimentsPage()
+  if (pageId === 'recordings') loadRecordingsPage()
   if (pageId === 'agentHealth') { loadAgentHealthPage(); startAgentHealthAutoRefresh() }
   else stopAgentHealthAutoRefresh()
 }
@@ -3625,6 +3628,26 @@ document.getElementById('memTabs').addEventListener('click', (e) => {
   }
 })
 
+// Graph mode toggle (similarity <-> knowledge) + entity focus
+document.getElementById('graphModeBar')?.addEventListener('click', (e) => {
+  const btn = e.target.closest('.graph-mode-btn')
+  if (!btn) return
+  memGraphMode = btn.dataset.gmode
+  document.querySelectorAll('.graph-mode-btn').forEach(b => b.classList.toggle('active', b === btn))
+  document.getElementById('graphFocusWrap').hidden = memGraphMode !== 'knowledge'
+  loadMemoryGraph()
+})
+let kgFocusTimer = null
+document.getElementById('kgFocusInput')?.addEventListener('input', (e) => {
+  clearTimeout(kgFocusTimer)
+  kgFocusTimer = setTimeout(() => { kgFocus = e.target.value.trim(); loadMemoryGraph() }, 400)
+})
+document.getElementById('kgFocusClear')?.addEventListener('click', () => {
+  kgFocus = ''
+  document.getElementById('kgFocusInput').value = ''
+  loadMemoryGraph()
+})
+
 // Add memory button
 document.getElementById('memAddBtn').addEventListener('click', () => {
   document.getElementById('memModalTitle').textContent = 'Uj emlek'
@@ -3832,6 +3855,12 @@ const GRAPH_TIER_COLORS = {
   warm: '#d97757',
   cold: '#6a9bcc',
   shared: '#b0a040',
+  // Knowledge-graph entity types
+  company: '#d97757',
+  person: '#5aa469',
+  machine: '#6a9bcc',
+  place: '#b0a040',
+  other: '#888888',
 }
 
 const GRAPH_TIER_BG = {
@@ -3839,7 +3868,16 @@ const GRAPH_TIER_BG = {
   warm: 'rgba(217, 119, 87, 0.06)',
   cold: 'rgba(106, 155, 204, 0.06)',
   shared: 'rgba(176, 160, 64, 0.06)',
+  company: 'rgba(217, 119, 87, 0.06)',
+  person: 'rgba(90, 164, 105, 0.06)',
+  machine: 'rgba(106, 155, 204, 0.06)',
+  place: 'rgba(176, 160, 64, 0.06)',
+  other: 'rgba(136, 136, 136, 0.06)',
 }
+
+// Graph mode: 'similarity' (vector cosine) or 'knowledge' (entity-relation).
+let memGraphMode = 'similarity'
+let kgFocus = ''
 
 function screenToWorld(sx, sy) {
   return { x: (sx - graphPanX) / graphZoom, y: (sy - graphPanY) / graphZoom }
@@ -3850,6 +3888,8 @@ function worldToScreen(wx, wy) {
 }
 
 async function loadMemoryGraph() {
+  if (memGraphMode === 'knowledge') return loadKnowledgeGraph()
+
   const agent = document.getElementById('memAgentFilter').value || 'marveen'
   const emptyEl = document.getElementById('graphEmpty')
 
@@ -3890,6 +3930,90 @@ async function loadMemoryGraph() {
     startGraphSimulation()
   } catch (err) {
     console.error('Gráf betöltés hiba:', err)
+  }
+}
+
+async function loadKnowledgeGraph() {
+  const agent = document.getElementById('memAgentFilter').value || 'marveen'
+  const emptyEl = document.getElementById('graphEmpty')
+  const params = new URLSearchParams({ agent })
+  if (kgFocus) params.set('focus', kgFocus)
+  try {
+    const res = await fetch(`/api/memories/knowledge-graph?${params}`)
+    const data = await res.json()
+    if (!data.nodes || data.nodes.length === 0) {
+      emptyEl.hidden = false
+      emptyEl.querySelector('p') && (emptyEl.querySelector('p').textContent =
+        kgFocus ? `Nincs "${kgFocus}" nevű entitás a gráfban` : 'Nincs kinyerhető entitás a memóriákból')
+      document.getElementById('memGraphCanvas').hidden = true
+      return
+    }
+    emptyEl.hidden = true
+    document.getElementById('memGraphCanvas').hidden = false
+    graphZoom = 1; graphPanX = 0; graphPanY = 0; graphSelectedNode = null
+    hideGraphPanel()
+    buildGraphFromKnowledge(data.nodes, data.edges)
+    startGraphSimulation()
+  } catch (err) {
+    console.error('Knowledge graph betöltés hiba:', err)
+  }
+}
+
+function buildGraphFromKnowledge(nodes, edges) {
+  graphNodes = []
+  graphEdges = []
+  const canvas = document.getElementById('memGraphCanvas')
+  const rect = canvas.parentElement.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  canvas.width = rect.width * dpr
+  canvas.height = rect.height * dpr
+  canvas.style.width = rect.width + 'px'
+  canvas.style.height = rect.height + 'px'
+  graphCanvas = canvas
+  graphCtx = canvas.getContext('2d')
+  graphCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  const w = rect.width, h = rect.height
+
+  for (const n of nodes) {
+    graphNodes.push({
+      id: n.id,
+      x: w / 2 + (Math.random() - 0.5) * w * 0.6,
+      y: h / 2 + (Math.random() - 0.5) * h * 0.6,
+      vx: 0, vy: 0,
+      radius: 6, connectionCount: 0,
+      label: n.label,
+      tier: n.type, agent: n.type,        // reuse tier slot for entity-type colouring
+      keywords: [],
+      mem: { content: `${n.label} (${n.type}) -- ${n.mentions} említés`, category: n.type },
+      entityType: n.type, mentions: n.mentions,
+      searchMatch: true,
+    })
+  }
+
+  for (const e of edges) {
+    graphEdges.push({ source: e.source, target: e.target, strength: Math.min(e.weight, 5), label: e.label })
+    graphNodes[e.source].connectionCount += e.weight
+    graphNodes[e.target].connectionCount += e.weight
+  }
+
+  for (const node of graphNodes) {
+    node.radius = 5 + Math.min(Math.sqrt(node.mentions || 1) * 3, 16)
+  }
+
+  const graphView = document.getElementById('memGraphView')
+  const hint = graphView.querySelector('.graph-controls-hint')
+  if (hint) hint.innerHTML = 'Scroll: zoom | Drag: move | Click: részletek<br>🕸️ Entitás-kapcsolati gráf'
+  else {
+    const h2 = document.createElement('div')
+    h2.className = 'graph-controls-hint'
+    h2.innerHTML = 'Scroll: zoom | Drag: move | Click: részletek<br>🕸️ Entitás-kapcsolati gráf'
+    graphView.appendChild(h2)
+  }
+  if (!graphView.querySelector('.graph-zoom-indicator')) {
+    const zi = document.createElement('div')
+    zi.className = 'graph-zoom-indicator'
+    zi.id = 'graphZoomIndicator'
+    graphView.appendChild(zi)
   }
 }
 
@@ -4248,6 +4372,23 @@ function renderGraph() {
     ctx.moveTo(a.x, a.y)
     ctx.quadraticCurveTo(cpx, cpy, b.x, b.y)
     ctx.stroke()
+
+    // Knowledge-graph: draw the relation label on the active node's edges.
+    if (isActiveEdge && edge.label && memGraphMode === 'knowledge') {
+      const lx = (a.x + 2 * cpx + b.x) / 4   // approx bezier midpoint
+      const ly = (a.y + 2 * cpy + b.y) / 4
+      ctx.save()
+      ctx.globalAlpha = 0.95
+      ctx.font = `${Math.max(8, Math.min(11, 10 / graphZoom))}px -apple-system, sans-serif`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      const tw = ctx.measureText(edge.label).width
+      ctx.fillStyle = 'rgba(20,20,20,0.85)'
+      ctx.fillRect(lx - tw / 2 - 4, ly - 8, tw + 8, 16)
+      ctx.fillStyle = '#eee'
+      ctx.fillText(edge.label, lx, ly)
+      ctx.restore()
+    }
   }
   ctx.globalAlpha = 1
 
@@ -9143,6 +9284,101 @@ document.getElementById('ahAutoRefreshBtn')?.addEventListener('click', () => {
   if (ahAutoRefreshActive) stopAgentHealthAutoRefresh()
   else startAgentHealthAutoRefresh()
 })
+
+// ===== Triage Inbox (#5) =====
+async function loadInboxPage() {
+  const listEl = document.getElementById('inboxList')
+  const statsEl = document.getElementById('inboxStats')
+  listEl.innerHTML = '<p class="subtitle">Betöltés...</p>'
+  try {
+    const res = await fetch('/api/inbox?status=open')
+    const data = await res.json()
+    const s = data.stats || {}
+    statsEl.textContent = `${s.open || 0} nyitott • ${s.urgent_open || 0} sürgős`
+    if (!data.items || !data.items.length) { listEl.innerHTML = '<p class="subtitle">Üres az inbox.</p>'; return }
+    const uColor = { urgent: '#dc3c3c', normal: '#d97757', low: '#6a9bcc' }
+    listEl.innerHTML = data.items.map(it => `
+      <div class="card" style="border-left:3px solid ${uColor[it.urgency] || '#888'}">
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+          <div>
+            <span class="badge">${escapeHtml(it.source)}</span>
+            <span class="badge" style="background:${uColor[it.urgency]}22;color:${uColor[it.urgency]}">${escapeHtml(it.urgency)}</span>
+            <span class="badge">${escapeHtml(it.intent)}</span>
+            ${it.sender ? `<span class="subtitle">${escapeHtml(it.sender)}</span>` : ''}
+          </div>
+          <button class="btn btn-sm" data-inbox-done="${it.id}">Kész</button>
+        </div>
+        <div style="margin-top:6px">${escapeHtml(it.preview)}</div>
+      </div>`).join('')
+    listEl.querySelectorAll('[data-inbox-done]').forEach(b => b.addEventListener('click', async () => {
+      await fetch(`/api/inbox/${b.dataset.inboxDone}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'done' }) })
+      showToast('Inbox elem lezárva'); loadInboxPage()
+    }))
+  } catch (e) { listEl.innerHTML = `<p class="subtitle">Hiba: ${escapeHtml(String(e))}</p>` }
+}
+
+// ===== A/B Skill experiments (#4) =====
+async function loadExperimentsPage() {
+  const listEl = document.getElementById('experimentsList')
+  listEl.innerHTML = '<p class="subtitle">Betöltés...</p>'
+  try {
+    const exps = await (await fetch('/api/skill-experiments')).json()
+    if (!exps.length) { listEl.innerHTML = '<p class="subtitle">Nincs kísérlet. Indíts egyet: POST /api/skill-experiments.</p>'; return }
+    const blocks = await Promise.all(exps.map(async e => {
+      let r = null
+      try { r = await (await fetch(`/api/skill-experiments/${e.id}/results`)).json() } catch {}
+      const stat = (v) => v ? `${v.positive}/${v.total} (${Math.round(v.positiveRate * 100)}%)` : '-'
+      const winner = e.winner ? `Nyertes: ${e.winner}` : (r && r.suggestedWinner ? `Javasolt nyertes: ${r.suggestedWinner}` : (r && r.confident ? 'döntetlen' : 'kevés adat'))
+      const promote = e.status === 'active'
+        ? `<button class="btn btn-sm" data-promote="${e.id}" data-w="A">A nyer</button> <button class="btn btn-sm" data-promote="${e.id}" data-w="B">B nyer</button>`
+        : ''
+      return `<div class="card">
+        <div style="display:flex;justify-content:space-between"><b>${escapeHtml(e.skill_name)}</b><span class="badge">${escapeHtml(e.status)}</span></div>
+        ${e.hypothesis ? `<div class="subtitle">${escapeHtml(e.hypothesis)}</div>` : ''}
+        <div style="margin-top:6px">A: ${escapeHtml(e.variant_a)} &rarr; ${r ? stat(r.a) : '?'}</div>
+        <div>B: ${escapeHtml(e.variant_b)} &rarr; ${r ? stat(r.b) : '?'}</div>
+        <div style="margin-top:6px"><b>${escapeHtml(winner)}</b></div>
+        <div style="margin-top:6px">${promote}</div>
+      </div>`
+    }))
+    listEl.innerHTML = blocks.join('')
+    listEl.querySelectorAll('[data-promote]').forEach(b => b.addEventListener('click', async () => {
+      await fetch(`/api/skill-experiments/${b.dataset.promote}/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ winner: b.dataset.w }) })
+      showToast(`${b.dataset.w} előléptetve`); loadExperimentsPage()
+    }))
+  } catch (e) { listEl.innerHTML = `<p class="subtitle">Hiba: ${escapeHtml(String(e))}</p>` }
+}
+
+// ===== Session Replay / regression (#1) =====
+async function loadRecordingsPage() {
+  const listEl = document.getElementById('recordingsList')
+  const barEl = document.getElementById('recordingsCompareBar')
+  const diffEl = document.getElementById('recordingsDiff')
+  diffEl.innerHTML = ''
+  listEl.innerHTML = '<p class="subtitle">Betöltés...</p>'
+  try {
+    const recs = await (await fetch('/api/session-recordings')).json()
+    if (!recs.length) { barEl.innerHTML = ''; listEl.innerHTML = '<p class="subtitle">Nincs felvétel. Ments egyet: POST /api/session-recordings.</p>'; return }
+    const opt = (r) => `<option value="${r.id}">#${r.id} ${escapeHtml(r.name)} [${escapeHtml(r.scenario)}]${r.is_baseline ? ' *baseline' : ''}</option>`
+    barEl.innerHTML = `
+      <span class="subtitle">Baseline:</span><select id="recBase">${recs.map(opt).join('')}</select>
+      <span class="subtitle">Candidate:</span><select id="recCand">${recs.map(opt).join('')}</select>
+      <button class="btn btn-sm" id="recCompareBtn">Összehasonlít</button>`
+    document.getElementById('recCompareBtn').addEventListener('click', async () => {
+      const baselineId = +document.getElementById('recBase').value
+      const candidateId = +document.getElementById('recCand').value
+      const r = await (await fetch('/api/session-recordings/compare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baselineId, candidateId }) })).json()
+      if (r.error) { diffEl.innerHTML = `<div class="card">${escapeHtml(r.error)}</div>`; return }
+      const d = r.diff
+      diffEl.innerHTML = `<div class="card" style="border-left:3px solid ${d.isRegression ? '#dc3c3c' : (d.identical ? '#5aa469' : '#d97757')}">
+        <b>${d.isRegression ? '⚠️ REGRESSZIÓ' : (d.identical ? 'Azonos' : 'Eltérés')}</b>
+        <div style="margin-top:6px">${escapeHtml(d.summary)}</div>
+        ${d.outcomeFlips && d.outcomeFlips.length ? `<div class="subtitle" style="margin-top:6px">Kimenetel-váltások: ${d.outcomeFlips.map(f => `${escapeHtml(f.tool)} ${f.baseline}&rarr;${f.candidate}`).join(', ')}</div>` : ''}
+      </div>`
+    })
+    listEl.innerHTML = recs.map(r => `<div class="card"><div style="display:flex;justify-content:space-between"><b>#${r.id} ${escapeHtml(r.name)}</b><span class="badge">${escapeHtml(r.scenario)}</span></div><div class="subtitle">${r.event_count} esemény${r.is_baseline ? ' • baseline' : ''}</div></div>`).join('')
+  } catch (e) { listEl.innerHTML = `<p class="subtitle">Hiba: ${escapeHtml(String(e))}</p>` }
+}
 
 ;(() => {
   const p = new URLSearchParams(window.location.search).get('page')
