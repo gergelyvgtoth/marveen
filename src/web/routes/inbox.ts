@@ -1,4 +1,4 @@
-import { addInboxItem, listInbox, setInboxStatus, getInboxStats, getInboxSlaBreaches } from '../../db.js'
+import { addInboxItem, listInbox, setInboxStatus, getInboxStats, getInboxSlaBreaches, getUnansweredInboundTelegram } from '../../db.js'
 import { classifyTriage, type Channel } from '../../triage-inbox.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
@@ -32,6 +32,31 @@ export async function tryHandleInbox(ctx: RouteContext): Promise<boolean> {
       received_at: d.received_at,
     })
     json(res, { ...result, classification: c })
+    return true
+  }
+
+  // POST /api/inbox/sync-telegram { since_days? }
+  // Auto-ingest: pulls UNANSWERED inbound Telegram messages (no outbound reply
+  // after them) from telegram_history into the inbox, classified. Dedup via
+  // external_id = tg-<message_id>. This is what actually feeds the triage queue.
+  if (path === '/api/inbox/sync-telegram' && method === 'POST') {
+    const body = await readBody(req).catch(() => Buffer.from('{}'))
+    let d: { since_days?: number } = {}
+    try { d = JSON.parse(body.toString() || '{}') } catch { /* defaults */ }
+    const sinceDays = d.since_days ?? 3
+    const since = Math.floor(Date.now() / 1000) - sinceDays * 86400
+    const rows = getUnansweredInboundTelegram(since)
+    let added = 0, skipped = 0
+    for (const r of rows) {
+      const c = classifyTriage(r.text)
+      const res = addInboxItem({
+        source: 'telegram', external_id: `tg-${r.message_id}`,
+        sender: r.user_id, preview: r.text.slice(0, 280),
+        urgency: c.urgency, intent: c.intent, score: c.score, received_at: r.ts,
+      })
+      if (res.deduped) skipped++; else added++
+    }
+    json(res, { added, skipped, scanned: rows.length })
     return true
   }
 

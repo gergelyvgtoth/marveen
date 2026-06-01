@@ -483,6 +483,23 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_session_ctx_agent ON session_contexts(agent_id, created_at)`)
 
+  // --- Telegram History ---
+  // (Recreated here: the prod DB had this table but its CREATE had been lost
+  // from the code, so a fresh install would crash on saveTelegramMessage.)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS telegram_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      user_id TEXT,
+      direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+      text TEXT NOT NULL,
+      ts INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tgh_msg ON telegram_history(chat_id, message_id, direction)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tgh_chat_ts ON telegram_history(chat_id, ts)`)
+
   // --- Outbound Audit Log (data sovereignty) ---
   // Persistent, queryable record of every item the outbound DataGate
   // evaluated -- "what left the local environment, when, and why".
@@ -2408,6 +2425,24 @@ export function listInbox(status: 'open' | 'done' | 'all' = 'open', limit = 100)
 
 export function setInboxStatus(id: number, status: 'open' | 'done'): boolean {
   return db.prepare('UPDATE inbox_items SET status = ? WHERE id = ?').run(status, id).changes > 0
+}
+
+// Unanswered inbound Telegram messages (no outbound reply after them) within
+// the window -- the genuinely-pending items the triage inbox should ingest.
+export function getUnansweredInboundTelegram(sinceTs: number): { chat_id: string; message_id: string; user_id: string | null; text: string; ts: number }[] {
+  // Use the autoincrement id (insertion order) rather than ts to decide
+  // "answered": replies in the SAME second as the inbound would be missed by a
+  // ts comparison (seconds granularity), but id is monotonic so o.id > t.id is
+  // exact.
+  return db.prepare(
+    `SELECT chat_id, message_id, user_id, text, ts FROM telegram_history t
+     WHERE direction = 'in' AND ts >= ?
+       AND NOT EXISTS (
+         SELECT 1 FROM telegram_history o
+         WHERE o.chat_id = t.chat_id AND o.direction = 'out' AND o.id > t.id
+       )
+     ORDER BY ts ASC`
+  ).all(sinceTs) as { chat_id: string; message_id: string; user_id: string | null; text: string; ts: number }[]
 }
 
 // SLA: urgent items still open past the threshold and not yet escalated.
