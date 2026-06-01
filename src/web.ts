@@ -50,6 +50,7 @@ import { tryHandleOutbound } from './web/routes/outbound.js'
 import { tryHandleSkillExperiments } from './web/routes/skill-experiments.js'
 import { tryHandleSessionRecordings } from './web/routes/session-recordings.js'
 import { tryHandleInbox } from './web/routes/inbox.js'
+import { tryHandleSalesOpportunities } from './web/routes/sales-opportunities.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import type { RouteContext } from './web/routes/types.js'
 
@@ -158,6 +159,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleSkillExperiments(routeCtx)) return
       if (await tryHandleSessionRecordings(routeCtx)) return
       if (await tryHandleInbox(routeCtx)) return
+      if (await tryHandleSalesOpportunities(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)

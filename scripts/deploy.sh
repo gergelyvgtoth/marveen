@@ -22,6 +22,14 @@ if ! npx tsc 2>&1; then
   exit 1
 fi
 
+# 1b. Regression gate: refuse to promote if a scenario regressed vs baseline.
+# Runs against the still-running (old) backend's API. A non-zero exit blocks.
+say "Regression gate..."
+if ! bash scripts/regression-check.sh; then
+  say "REGRESSION GATE FAILED -- not deploying. Running service untouched."
+  exit 1
+fi
+
 # 2. Snapshot current dist as rollback point.
 if [ -d dist ]; then
   rm -rf dist.prev

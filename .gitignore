@@ -48,3 +48,4 @@ claudeclaw.log
 
 # Local backup archives from scripts/backup.sh
 backups/
+dist.prev/

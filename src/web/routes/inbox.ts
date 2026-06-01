@@ -1,4 +1,4 @@
-import { addInboxItem, listInbox, setInboxStatus, getInboxStats } from '../../db.js'
+import { addInboxItem, listInbox, setInboxStatus, getInboxStats, getInboxSlaBreaches } from '../../db.js'
 import { classifyTriage, type Channel } from '../../triage-inbox.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
@@ -32,6 +32,18 @@ export async function tryHandleInbox(ctx: RouteContext): Promise<boolean> {
       received_at: d.received_at,
     })
     json(res, { ...result, classification: c })
+    return true
+  }
+
+  // GET /api/inbox/sla-breaches?threshold=1800&claim=true
+  // Urgent items open past the threshold. claim=true stamps them so the
+  // heartbeat nudges each only once. Used by the SLA escalation heartbeat.
+  if (path === '/api/inbox/sla-breaches' && method === 'GET') {
+    const threshold = parseInt(url.searchParams.get('threshold') || '1800', 10)
+    const claim = url.searchParams.get('claim') === 'true'
+    const nowTs = Math.floor(Date.now() / 1000)
+    const breaches = getInboxSlaBreaches(nowTs, threshold, claim)
+    json(res, { threshold, count: breaches.length, breaches })
     return true
   }
 

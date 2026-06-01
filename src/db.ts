@@ -602,6 +602,22 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_session_rec_scenario ON session_recordings(scenario, created_at)`)
 
+  // --- Outbound Critic Samples (self-improving critic) ---
+  // Accumulates what the outbound self-critic flagged, so getCriticSuggestions
+  // can surface the most frequent triggers and inform new rule proposals.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS critic_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      channel TEXT NOT NULL,
+      blocked INTEGER NOT NULL DEFAULT 0,
+      rule TEXT,
+      match_text TEXT,
+      text_preview TEXT
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_critic_samples_rule ON critic_samples(rule)`)
+
   // --- Unified Triage Inbox ---
   // One prioritized queue across channels. urgency/intent/score come from the
   // triage classifier; status tracks whether the item still needs a response.
@@ -623,6 +639,8 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_inbox_status_score ON inbox_items(status, score, received_at)`)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_source_ext ON inbox_items(source, external_id) WHERE external_id IS NOT NULL`)
+  // Migration: SLA escalation timestamp (set when an urgent stuck item is nudged)
+  try { db.exec('ALTER TABLE inbox_items ADD COLUMN escalated_at INTEGER') } catch { /* exists */ }
 
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
@@ -2302,6 +2320,42 @@ export function deleteSessionRecording(id: number): boolean {
   return db.prepare('DELETE FROM session_recordings WHERE id = ?').run(id).changes > 0
 }
 
+// --- Outbound Critic Samples (self-improving critic) ---
+
+export interface CriticViolationSample { rule: string; match?: string }
+
+export function recordCriticSample(channel: string, blocked: boolean, violations: CriticViolationSample[], textPreview: string): void {
+  const now = Math.floor(Date.now() / 1000)
+  const ins = db.prepare(
+    'INSERT INTO critic_samples (ts, channel, blocked, rule, match_text, text_preview) VALUES (?, ?, ?, ?, ?, ?)'
+  )
+  if (!violations.length) {
+    ins.run(now, channel, blocked ? 1 : 0, null, null, textPreview.slice(0, 200))
+    return
+  }
+  const tx = db.transaction((vs: CriticViolationSample[]) => {
+    for (const v of vs) ins.run(now, channel, blocked ? 1 : 0, v.rule, v.match ?? null, textPreview.slice(0, 200))
+  })
+  tx(violations)
+}
+
+export interface CriticSuggestions {
+  total: number
+  blocked: number
+  byRule: Record<string, number>
+  topMatches: { match: string; count: number }[]
+}
+
+export function getCriticSuggestions(): CriticSuggestions {
+  const total = (db.prepare('SELECT COUNT(*) as c FROM critic_samples').get() as { c: number }).c
+  const blocked = (db.prepare('SELECT COUNT(*) as c FROM critic_samples WHERE blocked = 1').get() as { c: number }).c
+  const ruleRows = db.prepare("SELECT rule, COUNT(*) as c FROM critic_samples WHERE rule IS NOT NULL GROUP BY rule ORDER BY c DESC").all() as { rule: string; c: number }[]
+  const matchRows = db.prepare("SELECT match_text as m, COUNT(*) as c FROM critic_samples WHERE match_text IS NOT NULL GROUP BY match_text ORDER BY c DESC LIMIT 10").all() as { m: string; c: number }[]
+  const byRule: Record<string, number> = {}
+  for (const r of ruleRows) byRule[r.rule] = r.c
+  return { total, blocked, byRule, topMatches: matchRows.map(r => ({ match: r.m, count: r.c })) }
+}
+
 // --- Unified Triage Inbox ---
 
 export interface InboxItem {
@@ -2354,6 +2408,23 @@ export function listInbox(status: 'open' | 'done' | 'all' = 'open', limit = 100)
 
 export function setInboxStatus(id: number, status: 'open' | 'done'): boolean {
   return db.prepare('UPDATE inbox_items SET status = ? WHERE id = ?').run(status, id).changes > 0
+}
+
+// SLA: urgent items still open past the threshold and not yet escalated.
+// If `claim` is true, stamps escalated_at so a caller (heartbeat) nudges once.
+export function getInboxSlaBreaches(nowTs: number, urgentThresholdSec = 1800, claim = false): InboxItem[] {
+  const cutoff = nowTs - urgentThresholdSec
+  const rows = db.prepare(
+    `SELECT * FROM inbox_items
+     WHERE status = 'open' AND urgency = 'urgent' AND escalated_at IS NULL AND received_at <= ?
+     ORDER BY received_at ASC`
+  ).all(cutoff) as InboxItem[]
+  if (claim && rows.length) {
+    const stamp = db.prepare('UPDATE inbox_items SET escalated_at = ? WHERE id = ?')
+    const tx = db.transaction((items: InboxItem[]) => { for (const it of items) stamp.run(nowTs, it.id) })
+    tx(rows)
+  }
+  return rows
 }
 
 export function getInboxStats(): { open: number; urgent_open: number; bySource: Record<string, number> } {
