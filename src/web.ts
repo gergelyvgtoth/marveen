@@ -37,6 +37,7 @@ import { tryHandleBackgroundTasks, sweepOrphanedBackgroundTasks } from './web/ro
 import { tryHandleOverview } from './web/routes/overview.js'
 import { tryHandleUpdates } from './web/routes/updates.js'
 import { tryHandleStatus } from './web/routes/status.js'
+import { tryHandleHealth } from './web/routes/health.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
 import { tryHandleAgentConsole } from './web/routes/agent-console.js'
@@ -147,6 +148,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleOverview(routeCtx)) return
       if (await tryHandleUpdates(routeCtx)) return
       if (await tryHandleStatus(routeCtx)) return
+      if (await tryHandleHealth(routeCtx)) return
       if (await tryHandleAutonomy(routeCtx)) return
       if (await tryHandleTokenUsage(routeCtx)) return
       if (await tryHandleAgentConsole(routeCtx)) return

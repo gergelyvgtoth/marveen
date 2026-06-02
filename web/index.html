@@ -137,6 +137,18 @@
   <main>
     <!-- === Overview Page (default) === -->
     <div class="page" id="overviewPage">
+      <div class="sys-health" id="sysHealth" title="Backend (npm start) és Telegram csatorna élő állapota">
+        <div class="sys-health-pill" id="sysHealthBackend">
+          <span class="sys-health-dot" id="sysHealthBackendDot"></span>
+          <span class="sys-health-label">Backend</span>
+          <span class="sys-health-val" id="sysHealthBackendVal">—</span>
+        </div>
+        <div class="sys-health-pill" id="sysHealthChannel">
+          <span class="sys-health-dot" id="sysHealthChannelDot"></span>
+          <span class="sys-health-label">Telegram csatorna</span>
+          <span class="sys-health-val" id="sysHealthChannelVal">—</span>
+        </div>
+      </div>
       <div class="overview-stats">
         <div class="overview-stat">
           <div class="overview-stat-label">Aktív ügynökök</div>

@@ -4979,3 +4979,17 @@ main {
   border-radius: 6px; padding: 8px 10px;
 }
 .activity-tail-empty { margin: 0; font-size: 12px; color: var(--text-muted); font-style: italic; }
+
+/* System-health banner (overview): backend npm-start uptime + Telegram channel liveness */
+.sys-health { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.sys-health-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 999px; padding: 7px 14px; font-size: 13px;
+}
+.sys-health-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
+.sys-health-dot.ok { background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+.sys-health-dot.bad { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.sys-health-dot.unknown { background: var(--text-muted); }
+.sys-health-label { color: var(--text-muted); }
+.sys-health-val { color: var(--text); font-weight: 600; }

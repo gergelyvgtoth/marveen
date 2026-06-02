@@ -72,7 +72,9 @@ function switchPage(pageId) {
   // Activity page runs a live poll; stop it whenever we navigate away.
   if (pageId !== 'activity') stopActivityPoll()
   if (pageId === 'activity') startActivityPoll()
-  if (pageId === 'overview') { loadOverview(); loadAgentActivityWidget() }
+  // System-health banner polls while the overview is open.
+  if (pageId !== 'overview') stopSystemHealthPoll()
+  if (pageId === 'overview') { loadOverview(); loadAgentActivityWidget(); startSystemHealthPoll() }
   if (pageId === 'kanban') loadKanban()
   if (pageId === 'tasks') loadSchedules()
   if (pageId === 'agents') loadAgents()
@@ -7238,7 +7240,57 @@ function formatRelative(ts) {
   return `${day}n`
 }
 
+function fmtUptime(sec) {
+  if (sec == null || !Number.isFinite(sec)) return '—'
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60)
+  if (d > 0) return `${d}n ${h}ó`
+  if (h > 0) return `${h}ó ${m}p`
+  return `${m}p`
+}
+
+// System-health banner: backend (npm start side) uptime + Telegram channel
+// liveness. Polls /api/health so a silent backend restart or a dead channel
+// is visible at a glance on the overview page.
+async function loadSystemHealth() {
+  const bDot = document.getElementById('sysHealthBackendDot')
+  const bVal = document.getElementById('sysHealthBackendVal')
+  const cDot = document.getElementById('sysHealthChannelDot')
+  const cVal = document.getElementById('sysHealthChannelVal')
+  if (!bDot) return
+  try {
+    const res = await fetch('/api/health')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const d = await res.json()
+    bDot.className = 'sys-health-dot ok'
+    bVal.textContent = `fut · ${fmtUptime(d.backend?.uptimeSec)}`
+    const ch = d.channel || {}
+    const chOk = ch.healthy && ch.sessionAlive
+    cDot.className = 'sys-health-dot ' + (chOk ? 'ok' : 'bad')
+    cVal.textContent = !ch.sessionAlive
+      ? 'session áll'
+      : ch.healthy
+        ? 'él'
+        : `reconnect (${ch.reconnectAttempts || 0}x)`
+  } catch (e) {
+    // If /api/health itself is unreachable, the backend is down/unresponsive.
+    bDot.className = 'sys-health-dot bad'
+    bVal.textContent = 'nem elérhető'
+    cDot.className = 'sys-health-dot unknown'
+    cVal.textContent = '—'
+  }
+}
+let sysHealthTimer = null
+function startSystemHealthPoll() {
+  loadSystemHealth()
+  if (sysHealthTimer) return
+  sysHealthTimer = setInterval(loadSystemHealth, 20000)
+}
+function stopSystemHealthPoll() {
+  if (sysHealthTimer) { clearInterval(sysHealthTimer); sysHealthTimer = null }
+}
+
 async function loadOverview() {
+  loadSystemHealth()
   try {
     const res = await fetch('/api/overview')
     if (!res.ok) throw new Error('HTTP ' + res.status)
