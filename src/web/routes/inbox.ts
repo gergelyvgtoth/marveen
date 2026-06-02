@@ -1,5 +1,6 @@
 import { addInboxItem, listInbox, setInboxStatus, getInboxStats, getInboxSlaBreaches, getUnansweredInboundTelegram } from '../../db.js'
 import { classifyTriage, type Channel } from '../../triage-inbox.js'
+import { syncEmailsToInbox, gmailFetcher } from '../../email-connector.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
@@ -57,6 +58,26 @@ export async function tryHandleInbox(ctx: RouteContext): Promise<boolean> {
       if (res.deduped) skipped++; else added++
     }
     json(res, { added, skipped, scanned: rows.length })
+    return true
+  }
+
+  // POST /api/inbox/sync-email { since_days? }
+  // Backend email -> inbox connector: pulls recent emails directly (no agent /
+  // MCP needed), classifies + dedups via external_id = email-<id>, so the
+  // unified queue is genuinely multi-channel. Returns { configured: false }
+  // when no email transport is set up yet (so "no creds" != "no new mail").
+  if (path === '/api/inbox/sync-email' && method === 'POST') {
+    const body = await readBody(req).catch(() => Buffer.from('{}'))
+    let d: { since_days?: number } = {}
+    try { d = JSON.parse(body.toString() || '{}') } catch { /* defaults */ }
+    const sinceDays = d.since_days ?? 1
+    const sinceTs = Math.floor(Date.now() / 1000) - sinceDays * 86400
+    try {
+      const result = await syncEmailsToInbox(gmailFetcher, { sinceTs })
+      json(res, result)
+    } catch (err) {
+      json(res, { configured: gmailFetcher.configured(), added: 0, skipped: 0, scanned: 0, error: String(err) }, 502)
+    }
     return true
   }
 

@@ -9,6 +9,9 @@ import {
 } from './channel-mcp-reconnect.js'
 import { getProvider } from '../channel-provider.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
+import { claimPendingOutbound, countPendingOutbound } from '../db.js'
+import { buildResendPrompt } from './outbound-resend.js'
+import { sendPromptToSession } from './agent-process.js'
 
 // Detect `plugin:X · ✘ failed` (or ✘ error / ✘ disconnected) in the
 // pane output. Claude Code renders this in the MCP status area when a
@@ -35,6 +38,23 @@ function getBackoffMs(attempt: number): number {
 function isPluginFailedInPane(pane: string, pluginPaneId: string): boolean {
   if (!pane.includes(pluginPaneId)) return false
   return PLUGIN_FAILED_RX.test(pane)
+}
+
+// After the channel is healthy again, hand any outbound messages that failed
+// during the outage back to the agent so it can resend them via the reply tool.
+// Best-effort: a tmux injection failure leaves the rows claimed (dispatched_at
+// stamped) but still 'pending', so they surface in the dashboard rather than
+// silently re-firing every tick.
+function resendQueuedOutbound(agentName: string, session: string): void {
+  if (countPendingOutbound(agentName) === 0) return
+  const rows = claimPendingOutbound(agentName)
+  if (rows.length === 0) return
+  try {
+    sendPromptToSession(session, buildResendPrompt(rows))
+    logger.info({ agentName, count: rows.length }, 'channel-health-monitor: re-injected queued outbound for resend')
+  } catch (err) {
+    logger.warn({ err, agentName, count: rows.length }, 'channel-health-monitor: resend injection failed')
+  }
 }
 
 export interface ChannelHealthStatus {
@@ -77,6 +97,9 @@ function checkAgent(agentName: string, session: string): void {
       logger.info({ agentName, provider: providerType }, 'channel-health-monitor: plugin recovered')
       reconnectState.delete(agentName)
     }
+    // Channel is healthy: flush any outbound lost during an outage. No-ops when
+    // the queue is empty; claimed rows are stamped so this never re-fires them.
+    resendQueuedOutbound(agentName, session)
     return
   }
 

@@ -499,6 +499,34 @@ export function initDatabase(): void {
   `)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tgh_msg ON telegram_history(chat_id, message_id, direction)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tgh_chat_ts ON telegram_history(chat_id, ts)`)
+  // Thread reconstruction: the inbound Telegram channel block does not surface
+  // reply_to, so a terse follow-up ("részletezd ki") can attach to the wrong
+  // thread. We persist reply_to when known (mostly on outbound threaded replies)
+  // and reconstruct context by substance otherwise. See reconstructThreadContext.
+  try { db.exec('ALTER TABLE telegram_history ADD COLUMN reply_to_message_id TEXT') } catch { /* exists */ }
+
+  // --- Outbound Resend Queue ---
+  // When the Telegram MCP stdio-pipe dies mid-conversation, outbound replies
+  // fail silently and are lost. The agent enqueues a failed send here; the
+  // channel-health-monitor claims pending rows after a successful reconnect
+  // and re-injects them so the agent resends via the reply tool. dispatched_at
+  // guards against re-injecting the same row on every monitor tick.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS outbound_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      reply_to_message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      dispatched_at INTEGER,
+      sent_at INTEGER
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outq_pending ON outbound_queue(agent_id, status, dispatched_at)`)
 
   // --- Outbound Audit Log (data sovereignty) ---
   // Persistent, queryable record of every item the outbound DataGate
@@ -1693,12 +1721,13 @@ export function saveTelegramMessage(
   text: string,
   userId?: string,
   ts?: number,
+  replyToMessageId?: string,
 ): void {
   const now = ts ?? Math.floor(Date.now() / 1000)
   db.prepare(
-    `INSERT OR IGNORE INTO telegram_history (chat_id, message_id, user_id, direction, text, ts)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(chatId, messageId, userId ?? null, direction, text, now)
+    `INSERT OR IGNORE INTO telegram_history (chat_id, message_id, user_id, direction, text, ts, reply_to_message_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(chatId, messageId, userId ?? null, direction, text, now, replyToMessageId ?? null)
 }
 
 export interface TelegramHistoryRow {
@@ -1709,12 +1738,141 @@ export interface TelegramHistoryRow {
   direction: 'in' | 'out'
   text: string
   ts: number
+  reply_to_message_id: string | null
 }
 
 export function getTelegramHistory(chatId: string, limit: number = 50): TelegramHistoryRow[] {
   return db.prepare(
     'SELECT * FROM telegram_history WHERE chat_id = ? ORDER BY ts DESC LIMIT ?'
   ).all(chatId, limit) as TelegramHistoryRow[]
+}
+
+export interface ThreadContext {
+  // The most recent substantive message a terse follow-up most likely refers to.
+  anchor: TelegramHistoryRow | null
+  // Recent messages (chronological) that give the processing agent context.
+  thread: TelegramHistoryRow[]
+  // How the anchor was determined: an explicit reply_to link, or recency+substance.
+  via: 'reply_to' | 'recency' | 'none'
+}
+
+// Reconstruct the most recent meaningful content-thread for a chat so a terse
+// inbound follow-up gets anchored to real content instead of guessing.
+//   - If reply_to is known (passed in, or stored on the latest inbound row),
+//     the anchor is that target message (via='reply_to').
+//   - Otherwise the anchor is the most recent message whose text is substantive
+//     (length >= minMeaningfulLen), skipping trivial acks (via='recency').
+// `thread` is the last `limit` messages in chronological order.
+export function reconstructThreadContext(
+  chatId: string,
+  opts: { limit?: number; minMeaningfulLen?: number; replyToMessageId?: string | null } = {},
+): ThreadContext {
+  const limit = opts.limit ?? 10
+  const minLen = opts.minMeaningfulLen ?? 25
+  const recent = db.prepare(
+    'SELECT * FROM telegram_history WHERE chat_id = ? ORDER BY ts DESC, id DESC LIMIT ?'
+  ).all(chatId, limit) as TelegramHistoryRow[]
+  const thread = recent.slice().reverse() // chronological
+  if (thread.length === 0) return { anchor: null, thread: [], via: 'none' }
+
+  // Prefer an explicit reply_to link: the caller's, else the latest inbound row's.
+  const latestInbound = [...thread].reverse().find(r => r.direction === 'in')
+  const replyTo = opts.replyToMessageId ?? latestInbound?.reply_to_message_id ?? null
+  if (replyTo) {
+    const target = db.prepare(
+      'SELECT * FROM telegram_history WHERE chat_id = ? AND message_id = ? LIMIT 1'
+    ).get(chatId, replyTo) as TelegramHistoryRow | undefined
+    if (target) return { anchor: target, thread, via: 'reply_to' }
+  }
+
+  // Recency + substance: the most recent message long enough to be a real topic,
+  // skipping the just-arrived terse follow-up and trivial acks.
+  const substantive = [...thread].reverse().find(r => r.text.trim().length >= minLen)
+  if (substantive) return { anchor: substantive, thread, via: 'recency' }
+  return { anchor: thread[thread.length - 1], thread, via: 'recency' }
+}
+
+// --- Outbound Resend Queue ---
+
+export interface OutboundQueueRow {
+  id: number
+  agent_id: string
+  chat_id: string
+  text: string
+  reply_to_message_id: string | null
+  status: 'pending' | 'sent' | 'failed'
+  attempts: number
+  last_error: string | null
+  created_at: number
+  dispatched_at: number | null
+  sent_at: number | null
+}
+
+export function enqueueOutbound(item: {
+  agentId: string
+  chatId: string
+  text: string
+  replyToMessageId?: string | null
+  error?: string | null
+}): number {
+  const now = Math.floor(Date.now() / 1000)
+  const res = db.prepare(
+    `INSERT INTO outbound_queue (agent_id, chat_id, text, reply_to_message_id, status, attempts, last_error, created_at)
+     VALUES (?, ?, ?, ?, 'pending', 1, ?, ?)`
+  ).run(item.agentId, item.chatId, item.text, item.replyToMessageId ?? null, item.error ?? null, now)
+  return res.lastInsertRowid as number
+}
+
+export function countPendingOutbound(agentId?: string): number {
+  const row = agentId
+    ? db.prepare("SELECT COUNT(*) c FROM outbound_queue WHERE status = 'pending' AND agent_id = ?").get(agentId)
+    : db.prepare("SELECT COUNT(*) c FROM outbound_queue WHERE status = 'pending'").get()
+  return (row as { c: number }).c
+}
+
+export function listOutbound(status?: 'pending' | 'sent' | 'failed', limit: number = 100): OutboundQueueRow[] {
+  if (status) {
+    return db.prepare('SELECT * FROM outbound_queue WHERE status = ? ORDER BY id DESC LIMIT ?').all(status, limit) as OutboundQueueRow[]
+  }
+  return db.prepare('SELECT * FROM outbound_queue ORDER BY id DESC LIMIT ?').all(limit) as OutboundQueueRow[]
+}
+
+// Atomically claim undispatched pending rows for an agent: stamp dispatched_at
+// in the same statement that selects them so concurrent monitor ticks cannot
+// re-dispatch the same message. Returns the rows that were just claimed.
+export function claimPendingOutbound(agentId: string): OutboundQueueRow[] {
+  const now = Math.floor(Date.now() / 1000)
+  const claim = db.transaction((): OutboundQueueRow[] => {
+    const rows = db.prepare(
+      "SELECT * FROM outbound_queue WHERE agent_id = ? AND status = 'pending' AND dispatched_at IS NULL ORDER BY id ASC"
+    ).all(agentId) as OutboundQueueRow[]
+    if (rows.length) {
+      const stamp = db.prepare('UPDATE outbound_queue SET dispatched_at = ? WHERE id = ?')
+      for (const r of rows) stamp.run(now, r.id)
+    }
+    return rows
+  })
+  return claim()
+}
+
+export function markOutboundSent(id: number): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  const res = db.prepare("UPDATE outbound_queue SET status = 'sent', sent_at = ? WHERE id = ?").run(now, id)
+  return res.changes > 0
+}
+
+export function markOutboundFailed(id: number, error?: string): boolean {
+  const res = db.prepare(
+    "UPDATE outbound_queue SET status = 'failed', last_error = ?, attempts = attempts + 1 WHERE id = ?"
+  ).run(error ?? null, id)
+  return res.changes > 0
+}
+
+export function getOutboundQueueStats(): { pending: number; sent: number; failed: number } {
+  const rows = db.prepare("SELECT status, COUNT(*) c FROM outbound_queue GROUP BY status").all() as { status: string; c: number }[]
+  const stats = { pending: 0, sent: 0, failed: 0 }
+  for (const r of rows) if (r.status in stats) (stats as Record<string, number>)[r.status] = r.c
+  return stats
 }
 
 // --- Kanban Dispatcher ---

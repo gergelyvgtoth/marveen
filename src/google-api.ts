@@ -170,4 +170,79 @@ export async function getCalendarEvents(
   return parsed.items ?? []
 }
 
+// --- Gmail (read-only) ---
+// Reuses the same OAuth token flow as Calendar. Inert unless a token exists at
+// TOKENS_PATH whose scope grants Gmail read access; getRecentGmailMessages
+// throws a clear error when the token is missing so callers can report
+// "email not configured" instead of crashing.
+
+export interface EmailMessage {
+  id: string
+  from: string
+  subject: string
+  text: string
+  receivedAt: number // unix seconds
+}
+
+export function gmailConfigured(): boolean {
+  try {
+    const t = loadTokens()
+    return Boolean(t.refresh_token)
+  } catch {
+    return false
+  }
+}
+
+interface GmailListResponse { messages?: Array<{ id: string }> }
+interface GmailHeader { name: string; value: string }
+interface GmailMessageResponse {
+  id: string
+  internalDate?: string
+  snippet?: string
+  payload?: { headers?: GmailHeader[] }
+}
+
+async function gmailGet(pathAndQuery: string, token: string): Promise<{ status: number; data: string }> {
+  return httpsRequest(`https://gmail.googleapis.com/gmail/v1/users/me/${pathAndQuery}`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+// Fetch recent inbox messages received since `sinceTs` (unix seconds). Returns
+// lightweight metadata (from/subject/snippet) suitable for triage classification.
+export async function getRecentGmailMessages(sinceTs: number, max: number = 25): Promise<EmailMessage[]> {
+  if (!gmailConfigured()) throw new Error('Gmail not configured (no Google token with Gmail scope)')
+  let token = await getValidAccessToken()
+  // Gmail's `after:` query takes seconds since epoch.
+  const q = encodeURIComponent(`in:inbox after:${sinceTs}`)
+  let list = await gmailGet(`messages?q=${q}&maxResults=${max}`, token)
+  if (list.status === 401) {
+    token = await refreshAccessToken()
+    list = await gmailGet(`messages?q=${q}&maxResults=${max}`, token)
+  }
+  if (list.status !== 200) {
+    logger.error({ status: list.status, body: list.data }, 'Gmail list error')
+    return []
+  }
+  const ids = (JSON.parse(list.data) as GmailListResponse).messages ?? []
+  const out: EmailMessage[] = []
+  for (const { id } of ids) {
+    const r = await gmailGet(`messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`, token)
+    if (r.status !== 200) continue
+    const m = JSON.parse(r.data) as GmailMessageResponse
+    const headers = m.payload?.headers ?? []
+    const from = headers.find(h => h.name.toLowerCase() === 'from')?.value ?? ''
+    const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value ?? ''
+    out.push({
+      id: m.id,
+      from,
+      subject,
+      text: m.snippet ?? '',
+      receivedAt: m.internalDate ? Math.floor(Number(m.internalDate) / 1000) : sinceTs,
+    })
+  }
+  return out
+}
+
 export type { CalendarEvent }
