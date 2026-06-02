@@ -13,7 +13,10 @@ import { startUpdateChecker } from './web/update-checker.js'
 import { startMcpListChecker } from './web/mcp-list.js'
 import { startScheduleRunner } from './web/schedule-runner.js'
 import { startChannelPluginMonitor } from './web/channel-monitor.js'
+import { startInboundProber } from './web/inbound-probe.js'
 import { startChannelHealthMonitor } from './web/channel-health-monitor.js'
+import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
+import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
@@ -248,8 +251,23 @@ export function startWebServer(port = 3420): http.Server {
   const pluginMonitorInterval = startChannelPluginMonitor()
   logger.info('Channel plugin health monitor started (60s poll)')
 
+  // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
+  // the prober session file + allowlist are configured. Wrapped so a failure
+  // never crashes server startup.
+  try {
+    startInboundProber()
+  } catch (err) {
+    logger.warn({ err }, 'Inbound prober failed to start')
+  }
+
   const channelHealthInterval = startChannelHealthMonitor()
   logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
+
+  const stuckInputInterval = startStuckInputWatcher()
+  logger.info('Stuck-input watcher started (15s poll, 20s offset)')
+
+  const stuckToolCallInterval = startStuckToolCallWatcher()
+  logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
 
   const updateCheckerInterval = startUpdateChecker()
   logger.info('Update checker started (15min poll)')
@@ -297,6 +315,8 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(scheduleInterval)
     clearInterval(pluginMonitorInterval)
     clearInterval(channelHealthInterval)
+    clearInterval(stuckInputInterval)
+    clearInterval(stuckToolCallInterval)
     clearInterval(updateCheckerInterval)
     return origClose(cb)
   }

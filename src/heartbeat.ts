@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs'
+import { statSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   HEARTBEAT_START_HOUR,
@@ -6,6 +6,7 @@ import {
   HEARTBEAT_CALENDAR_ID,
   STORE_DIR,
   DB_FILENAME,
+  PROJECT_ROOT,
 } from './config.js'
 import { getHeartbeatKanbanSummary, getActiveScheduledTaskCount } from './db.js'
 import { getCalendarEvents, type CalendarEvent } from './google-api.js'
@@ -13,6 +14,93 @@ import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
 import { wrapUntrusted, UNTRUSTED_PREAMBLE } from './prompt-safety.js'
+
+// Isolation cwd for the heartbeat sub-agent. Keep this OUT of PROJECT_ROOT
+// so the @anthropic-ai/claude-agent-sdk-spawned headless claude does NOT
+// load Marveen's project + user plugin config -- in particular the
+// claude-plugins-official Telegram channel plugin, which would spawn its
+// own `bun` poller against the same bot token Marveen is already polling
+// (409 Conflict crashes the live Marveen poller). 2026-06-01: ~65 % of
+// daily Marveen restarts clustered in the 0-10 min window after each
+// hourly heartbeat fire BECAUSE of this collision; 20:00 fire window
+// directly observed taking the bun-poller down within 2 min.
+//
+// agents/ is gitignored (per-install state), so this directory is built
+// at runtime by ensureHeartbeatWorkerCwd() on every executeHeartbeat()
+// call -- safe to delete by hand, will be recreated next tick.
+const HEARTBEAT_AGENT_CWD = join(PROJECT_ROOT, 'agents', 'heartbeat-worker')
+
+// Plugins that MUST be disabled at the project-scope settings.json for the
+// heartbeat sub-agent. The user-scope ~/.claude/settings.json keeps these
+// enabled for Marveen / sub-agents that legitimately need them; the
+// project-scope override is just for this isolated cwd. 2026-06-02 09:00
+// incident: the original #237 fix only emptied `.mcp.json` (project-scope
+// MCPs), but the user-scope `enabledPlugins` is GLOBAL and was still
+// loading the Telegram plugin in the sub-agent. The sub-agent then spawned
+// its own bun poller against the same bot token -> 409 Conflict -> Marveen
+// channel down by 09:02:45. Project-scope `enabledPlugins: false` overrides
+// the user-scope `true` per Claude Code settings precedence.
+const HEARTBEAT_DISABLED_PLUGINS = [
+  'telegram@claude-plugins-official',
+  'slack-channel@marveen-marketplace',
+  'discord@claude-plugins-official',
+] as const
+
+interface ClaudeSettings {
+  enabledPlugins?: Record<string, boolean>
+  hooks?: unknown
+  [key: string]: unknown
+}
+
+function ensureHeartbeatWorkerCwd(): void {
+  try {
+    if (!existsSync(HEARTBEAT_AGENT_CWD)) {
+      mkdirSync(HEARTBEAT_AGENT_CWD, { recursive: true })
+    }
+    // Project-scope empty MCP list (defense in depth -- the load-bearing
+    // gate is the enabledPlugins override below).
+    const mcpPath = join(HEARTBEAT_AGENT_CWD, '.mcp.json')
+    if (!existsSync(mcpPath)) {
+      writeFileSync(mcpPath, '{"mcpServers":{}}\n')
+    }
+
+    // Project-scope settings.json with enabledPlugins override. MERGE with
+    // anything Claude Code (or a prior tick) may have written -- a stale
+    // hooks: section or other field must survive. We only force-write the
+    // enabledPlugins map.
+    const settingsDir = join(HEARTBEAT_AGENT_CWD, '.claude')
+    const settingsPath = join(settingsDir, 'settings.json')
+    if (!existsSync(settingsDir)) {
+      mkdirSync(settingsDir, { recursive: true })
+    }
+    let current: ClaudeSettings = {}
+    if (existsSync(settingsPath)) {
+      try {
+        const raw = readFileSync(settingsPath, 'utf-8')
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          current = parsed as ClaudeSettings
+        }
+      } catch (err) {
+        logger.warn({ err, path: settingsPath }, 'Heartbeat: failed to parse worker settings.json, rewriting')
+      }
+    }
+    const enabledPlugins: Record<string, boolean> = { ...(current.enabledPlugins ?? {}) }
+    let dirty = false
+    for (const plugin of HEARTBEAT_DISABLED_PLUGINS) {
+      if (enabledPlugins[plugin] !== false) {
+        enabledPlugins[plugin] = false
+        dirty = true
+      }
+    }
+    if (dirty || current.enabledPlugins == null) {
+      const next: ClaudeSettings = { ...current, enabledPlugins }
+      writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n')
+    }
+  } catch (err) {
+    logger.warn({ err, cwd: HEARTBEAT_AGENT_CWD }, 'Heartbeat: failed to ensure isolated worker cwd, falling back to PROJECT_ROOT')
+  }
+}
 
 // --- Data types ---
 
@@ -214,9 +302,22 @@ async function executeHeartbeat(): Promise<void> {
 
   logger.info('Heartbeat: van tennivalo, agent indul...')
   const prompt = buildAgentPrompt(data)
+  ensureHeartbeatWorkerCwd()
 
   try {
-    const { text } = await runAgent(prompt)
+    // CRITICAL: run the sub-agent in an isolated cwd that does NOT load
+    // the Marveen project's plugin config. The default cwd=PROJECT_ROOT
+    // makes the SDK-spawned headless claude load claude-plugins-official
+    // (the Telegram channel plugin), which spawns its own `bun` poller
+    // against the same bot token Marveen is already polling. Telegram's
+    // getUpdates allows only ONE concurrent long-poll per bot, so the
+    // second poll triggers a 409 Conflict and the live Marveen bun
+    // child dies -- which is why ~65 % of all Marveen restarts on
+    // 2026-06-01 clustered in the 0-10 min window after every hourly
+    // heartbeat fire. The agents/heartbeat-worker dir has an empty
+    // .mcp.json and no agent-config, so claude finds no channel plugin
+    // to activate.
+    const { text } = await runAgent(prompt, undefined, undefined, false, HEARTBEAT_AGENT_CWD)
     if (text) {
       await notifyTelegram(text)
       logger.info('Heartbeat ertesites elkuldve')
@@ -225,6 +326,7 @@ async function executeHeartbeat(): Promise<void> {
     logger.error({ err }, 'Heartbeat agent hiba')
   }
 }
+
 
 // --- Public API ---
 

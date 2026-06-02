@@ -1,6 +1,8 @@
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { execSync, execFileSync } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
+import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
 import {
   PROJECT_ROOT,
@@ -16,7 +18,7 @@ import {
   markPendingTaskRetryAlert,
   clearPendingTaskRetryAlert,
 } from '../db.js'
-import { toPendingRetryView, type PendingRetryView } from '../pending-retries.js'
+import { toPendingRetryView, classifyTelegramSendError, type PendingRetryView } from '../pending-retries.js'
 import {
   UNTRUSTED_PREAMBLE,
   wrapUntrusted,
@@ -55,6 +57,12 @@ const TMUX = resolveFromPath('tmux')
 // giving exactly-one stamp per attempt and at-least-once delivery until
 // success. See sendPendingRetryAlert below.
 
+// When a task fires we record its time here so the catch-up window (30 min on
+// the first tick after a restart) does not re-run it. This map is in-memory, so
+// a dashboard restart that lands inside a task's catch-up window used to re-fire
+// an already-run task (observed: a restart re-sent a second vmd-report). Persist
+// it to disk and reload on startup so the skip-check survives restarts.
+const SCHEDULE_LAST_RUN_PATH = join(PROJECT_ROOT, 'store', 'schedule-last-run.json')
 const scheduleLastRun: Map<string, number> = new Map()
 
 // Rate limit guard: session -> unix ms when the limit expires.
@@ -80,6 +88,25 @@ function parseRateLimitReset(pane: string): number | null {
     return Date.now() + 5 * 60_000
   }
   return null
+}
+
+function loadScheduleLastRun(): void {
+  try {
+    const raw = JSON.parse(readFileSync(SCHEDULE_LAST_RUN_PATH, 'utf-8'))
+    if (raw && typeof raw === 'object') {
+      for (const [name, ts] of Object.entries(raw)) {
+        if (typeof ts === 'number' && Number.isFinite(ts)) scheduleLastRun.set(name, ts)
+      }
+    }
+  } catch { /* no file yet / unreadable -- start empty */ }
+}
+
+function persistScheduleLastRun(): void {
+  try {
+    atomicWriteFileSync(SCHEDULE_LAST_RUN_PATH, JSON.stringify(Object.fromEntries(scheduleLastRun), null, 2))
+  } catch (err) {
+    logger.warn({ err }, 'schedule-runner: failed to persist last-run map')
+  }
 }
 
 // Try to fire a task at a single target agent. Returns the outcome so the
@@ -155,6 +182,7 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
       wrapUntrusted(`scheduled-task:${task.name}`, task.prompt)
     sendPromptToSession(session, fullPrompt)
     scheduleLastRun.set(task.name, now)
+    persistScheduleLastRun()
     appendTaskRun(task.name, agentName)
     logger.info({ task: task.name, agent: agentName, session }, 'Scheduled task fired')
 
@@ -205,6 +233,28 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   const claimed = markPendingTaskRetryAlert(view.taskName, view.agentName, nowMs)
   if (!claimed) return
 
+  // Validate the delivery config BEFORE building/sending. A missing token
+  // or chat_id is a permanent configuration problem -- it will fail
+  // identically on every 60s tick. Earlier this path (token only) cleared
+  // the stamp on failure, so the alert re-fired every minute forever and
+  // spammed the log; and chat_id was never validated at all, so an empty
+  // ALLOWED_CHAT_ID guaranteed a 400 from Telegram on every attempt. Leave
+  // the stamp in place (it acts as the throttle) and log once so the
+  // operator sees the config gap without the spin. The scheduled task
+  // itself keeps retrying regardless -- only this alert is suppressed.
+  const envPath = join(PROJECT_ROOT, '.env')
+  const envContent = readFileOr(envPath, '')
+  const tokenMatch = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)
+  const token = tokenMatch?.[1]?.trim()
+  if (!token) {
+    logger.warn({ task: view.taskName, agent: view.agentName }, 'Pending-retry alert suppressed: no TELEGRAM_BOT_TOKEN (config error, stamp kept to avoid 60s spin)')
+    return
+  }
+  if (!ALLOWED_CHAT_ID.trim()) {
+    logger.warn({ task: view.taskName, agent: view.agentName }, 'Pending-retry alert suppressed: empty ALLOWED_CHAT_ID (config error, stamp kept to avoid 60s spin)')
+    return
+  }
+
   const ageMinutes = Math.floor(view.ageMs / 60000)
   const firstAttempt = new Date(view.firstAttempt).toLocaleString('hu-HU')
   const text = [
@@ -214,28 +264,29 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   ].join('\n')
   ;(async () => {
     try {
-      const envPath = join(PROJECT_ROOT, '.env')
-      const envContent = readFileOr(envPath, '')
-      const tokenMatch = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)
-      const token = tokenMatch?.[1]?.trim()
-      if (!token) {
-        logger.warn({ task: view.taskName, agent: view.agentName }, 'Pending-retry alert skipped: no TELEGRAM_BOT_TOKEN, clearing stamp for retry')
-        clearPendingTaskRetryAlert(view.taskName, view.agentName)
-        return
-      }
       await sendTelegramMessage(token, ALLOWED_CHAT_ID, text)
       logger.info({ task: view.taskName, agent: view.agentName, ageMinutes }, 'Pending-retry Telegram alert sent')
     } catch (err) {
-      // Real send failure (network error, 4xx from Telegram). Clear the
-      // per-attempt stamp so the next tick can legitimately retry --
-      // otherwise a bad token silently wedges the alerting forever.
-      logger.warn({ err, task: view.taskName, agent: view.agentName }, 'Pending-retry alert delivery failed, clearing stamp for retry')
-      clearPendingTaskRetryAlert(view.taskName, view.agentName)
+      // Distinguish a transient failure (network blip, 429, 5xx) from a
+      // permanent one (4xx: bad chat_id / revoked token). Transient ->
+      // clear the per-attempt stamp so the next tick retries. Permanent
+      // -> KEEP the stamp; retrying every 60s would just repeat the same
+      // rejection and spam the log until the config is fixed.
+      const kind = classifyTelegramSendError(err instanceof Error ? err.message : String(err))
+      if (kind === 'transient') {
+        logger.warn({ err, task: view.taskName, agent: view.agentName }, 'Pending-retry alert delivery failed (transient), clearing stamp for retry')
+        clearPendingTaskRetryAlert(view.taskName, view.agentName)
+      } else {
+        logger.warn({ err, task: view.taskName, agent: view.agentName }, 'Pending-retry alert delivery failed (permanent), stamp kept to avoid 60s spin')
+      }
     }
   })()
 }
 
 export function startScheduleRunner(): NodeJS.Timeout {
+  // Reload the persisted last-run times so a restart inside a task's catch-up
+  // window does not re-fire an already-run task.
+  loadScheduleLastRun()
   let firstRun = true
 
   function runCheck() {

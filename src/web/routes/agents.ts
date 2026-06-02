@@ -53,6 +53,7 @@ import {
   agentChannelDir,
 } from '../channel-invites.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import { isMainChannelsAgent } from '../main-agent.js'
 import {
   getProvider,
   channelStateDir,
@@ -1123,6 +1124,17 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/)
   if (restartMatch && method === 'POST') {
     const name = decodeURIComponent(restartMatch[1])
+    // The main agent runs in the systemd/launchd-managed `<id>-channels` session,
+    // not the `agent-<name>` template. Restart it through the channels helper --
+    // the agent-process path would spawn a rogue duplicate session and fire
+    // `/remote-control` (needs a full-scope login token the agent lacks). Mirror
+    // the precedent in the channels-config handler above. Sub-agents unchanged.
+    if (isMainChannelsAgent(name)) {
+      const r = hardRestartMarveenChannels()
+      if (r.ok) { json(res, { ok: true }); return true }
+      json(res, { error: r.error || 'Restart failed' }, 500)
+      return true
+    }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     const result = restartAgentProcess(name)
     if (result.ok) { json(res, { ok: true }); return true }
