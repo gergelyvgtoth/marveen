@@ -9,6 +9,7 @@ import {
   decidePaneErrorAlert,
   stuckInputSignature,
   decideStuckInputRecovery,
+  parkedChannelInput,
 } from '../pane-state.js'
 
 // Realistic pane fixtures modelled on actual `tmux capture-pane -p`
@@ -1236,5 +1237,160 @@ describe('decideStuckInputRecovery', () => {
     expect(d.next.firstSeenAt).toBe(500_000)
     expect(d.next.lastRecoverAt).toBe(null)
     expect(d.next.attempts).toBe(0)
+  })
+})
+
+describe('parkedChannelInput (stuck channel-block gate + truncation guard)', () => {
+  const SEP = '─'.repeat(80)
+  const wrap = (boxLines: string[]) =>
+    ['', SEP, ...boxLines, SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+
+  it('returns null when the pane is idle (nothing parked)', () => {
+    expect(parkedChannelInput(wrap(['❯ ']))).toBeNull()
+  })
+
+  it('returns null for a HUMAN hand-typed draft (no <channel> marker) -- never touched', () => {
+    expect(parkedChannelInput(wrap(['❯ Valami amit a felhasznalo elkezdett geppelni']))).toBeNull()
+  })
+
+  it('extracts a COMPLETE single-line parked channel block with chat_id', () => {
+    const pane = wrap(['❯ <channel source="plugin:telegram:telegram" chat_id="1268077055" message_id="999" ts="2026-06-05T10:00:00Z">Szia, mi a helyzet?</channel>'])
+    const r = parkedChannelInput(pane)
+    expect(r).not.toBeNull()
+    expect(r!.complete).toBe(true)
+    expect(r!.chatId).toBe('1268077055')
+    expect(r!.block).toContain('</channel>')
+    expect(r!.block).toContain('chat_id="1268077055"')
+  })
+
+  it('reconstructs a wrapped multi-line block when chat_id stays intact', () => {
+    // Terminal wrap splits message_id but NOT chat_id -> still recoverable.
+    const pane = wrap([
+      '❯ <channel source="plugin:telegram:telegram" chat_id="1268077055" mess',
+      'age_id="999" ts="2026-06-05T10:00:00Z">Hosszu uzenet ami tobb sorba',
+      'tordelodott a terminal szelessegen.</channel>',
+    ])
+    const r = parkedChannelInput(pane)
+    expect(r).not.toBeNull()
+    expect(r!.complete).toBe(true)
+    expect(r!.chatId).toBe('1268077055')
+  })
+
+  it('flags complete:false when the closing </channel> scrolled off (truncated)', () => {
+    const pane = wrap(['❯ <channel source="plugin:telegram:telegram" chat_id="1268077055" ts="2026-06-05T10:00:00Z">Az uzenet vege lescrollozott es nincs zaro tag'])
+    const r = parkedChannelInput(pane)
+    expect(r).not.toBeNull()
+    expect(r!.complete).toBe(false)
+    expect(r!.chatId).toBeNull()
+  })
+
+  it('flags complete:false when a wrap corrupts chat_id with embedded whitespace', () => {
+    // Wrap landed INSIDE the chat_id value -> "126 8077055" after collapse.
+    const pane = wrap([
+      '❯ <channel source="plugin:telegram:telegram" chat_id="126',
+      '8077055" message_id="999">Test</channel>',
+    ])
+    const r = parkedChannelInput(pane)
+    expect(r).not.toBeNull()
+    expect(r!.complete).toBe(false) // refuse re-inject; caller stays on Enter
+    expect(r!.chatId).toBeNull()
+  })
+
+  it('returns null for a non-plugin channel marker (defensive)', () => {
+    expect(parkedChannelInput(wrap(['❯ <channel source="other:thing" chat_id="1">x</channel>']))).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Contract tests: esc-to-interrupt live-region scoping (port from kovesdan/marveen)
+//
+// Root cause: a watchdog report or log output that quotes "esc to interrupt"
+// anywhere in the scrollback permanently classified an otherwise-idle session
+// as busy (81-retry starvation incident). The fix scopes the phrase check to
+// the bottom LIVE_FOOTER_REGION_LINES of the pane.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Contract tests: shouldRetrySubmit footer-region scoping
+//
+// shouldRetrySubmit applies the same esc-to-interrupt footer-region scope as
+// detectPaneState (lines 390-392 of pane-state.ts). A pane whose TRANSCRIPT
+// prose quotes "esc to interrupt" in scrollback but whose footer is idle
+// must NOT be treated as busy by shouldRetrySubmit -- if stuck content is
+// present in the input box the function must return true (idle-path).
+//
+// Mental-revert: if the footer-scoped check in shouldRetrySubmit were replaced
+// by a whole-pane scan (e.g. `BUSY_ESC_TO_INTERRUPT_RX.test(pane)` instead of
+// `BUSY_ESC_TO_INTERRUPT_RX.test(retryFooterRegion)`), the busy branch fires
+// and shouldRetrySubmit returns false -- making this test fail.
+// ---------------------------------------------------------------------------
+describe('shouldRetrySubmit: esc-to-interrupt scoped to live footer region', () => {
+  const SEP_R = '─'.repeat(80)
+  const HINT = '[Uzenet @dev2-tol -- trusted team member]: <trusted-peer source="agent:dev2">'
+
+  it('returns true (stuck) when "esc to interrupt" appears only in scrollback and the input box holds the payload', () => {
+    // The transcript prose quotes "esc to interrupt" (e.g. a watchdog log
+    // line) but the footer is plain idle and the live input box contains the
+    // just-sent payload. With whole-pane scanning the busy check would fire
+    // and return false (incorrectly skipping the retry). With footer-region
+    // scoping the busy path is not triggered, so the stuck input is detected
+    // and shouldRetrySubmit returns true.
+    const pane = [
+      '  [watchdog]: waited for esc to interrupt before giving up',
+      '  (some other scrollback)',
+      '',
+      SEP_R,
+      `❯ ${HINT} cycle-077 BACKEND iter-1 close-iter ack`,
+      SEP_R,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(shouldRetrySubmit(pane, HINT)).toBe(true)
+  })
+
+  it('returns false (busy, no retry) when "esc to interrupt" is in the live footer (active turn)', () => {
+    // Confirms that a real active-turn footer with "esc to interrupt" appended
+    // still prevents a spurious retry -- the region-scoped check fires on the
+    // footer itself, so shouldRetrySubmit correctly returns false.
+    const pane = [
+      '',
+      SEP_R,
+      `❯ ${HINT} cycle-077`,
+      SEP_R,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n')
+    expect(shouldRetrySubmit(pane, HINT)).toBe(false)
+  })
+})
+
+describe('detectPaneState: esc-to-interrupt scoped to live footer region', () => {
+  const SEP_R = '─'.repeat(80)
+
+  it('classifies as idle when "esc to interrupt" appears only in scrollback prose', () => {
+    // A watchdog report or tool-call output that QUOTES the phrase somewhere
+    // above the live input box. With whole-pane scanning this would pin the
+    // session as busy forever; scoped to the footer region it is correctly idle.
+    const pane = [
+      '  [watchdog report]: session was busy, waiting for esc to interrupt signal',
+      '  (scrollback content continues)',
+      '',
+      SEP_R,
+      '❯ ',
+      SEP_R,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(detectPaneState(pane)).toBe('idle')
+  })
+
+  it('classifies as busy when "esc to interrupt" appears in the footer line (live turn)', () => {
+    // The real busy signal: Claude Code appends "· esc to interrupt" to the
+    // bypass-mode footer during an active turn. Must still be caught.
+    const pane = [
+      '',
+      SEP_R,
+      '❯ ',
+      SEP_R,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n')
+    expect(detectPaneState(pane)).toBe('busy')
   })
 })

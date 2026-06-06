@@ -1,13 +1,14 @@
 import { existsSync, unlinkSync, copyFileSync, writeFileSync } from 'node:fs'
 import { join, extname } from 'node:path'
-import { PROJECT_ROOT, OWNER_NAME, BOT_NAME, CHANNEL_PROVIDER } from '../../config.js'
+import { PROJECT_ROOT, OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER } from '../../config.js'
 import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, sendMarveenAvatarChange } from '../telegram.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
 import { readFileOr } from '../agent-config.js'
 import { parseMultipart } from '../multipart.js'
 import { readBody, json, serveFile } from '../http-helpers.js'
 import { MAIN_CHANNELS_SESSION } from '../main-agent.js'
-import { readActiveModelFromProjectDir } from '../active-model.js'
+import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
+import { readAutoRestartConfig } from '../auto-restart-store.js'
 import type { RouteContext } from './types.js'
 
 function getActiveMarveenModel(): string {
@@ -32,10 +33,19 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
     const sl = readMarveenSlackConfig()
     json(res, {
       name: BOT_NAME,
+      // Canonical agent id (MAIN_AGENT_ID, e.g. "gorcsevivan") so the dashboard
+      // can hit /api/agents/<id>/skills for the main agent -- the display name
+      // (BOT_NAME) is not a valid agent-dir id.
+      agentId: MAIN_AGENT_ID,
       description,
       model: getActiveMarveenModel(),
       tmuxSession: MAIN_CHANNELS_SESSION,
       running: true,
+      // Auto-restart applies to the main channels session too; key it by the
+      // orchestrator id (autoRestartId) so the UI PUTs to the right store entry.
+      autoRestart: readAutoRestartConfig(MAIN_AGENT_ID),
+      autoRestartId: MAIN_AGENT_ID,
+      contextTokens: readContextTokensFromProjectDir(PROJECT_ROOT),
       hasTelegram: tg.hasTelegram,
       hasDiscord: dc.hasDiscord,
       hasSlack: sl.hasSlack,
@@ -73,10 +83,10 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
   if (path === '/api/marveen/avatar' && method === 'GET') {
     for (const ext of ['.png', '.jpg', '.jpeg', '.webp']) {
       const p = join(PROJECT_ROOT, 'store', `marveen-avatar${ext}`)
-      if (existsSync(p)) { serveFile(res, p); return true }
+      if (existsSync(p)) { serveFile(req, res, p); return true }
     }
     const fallback = join(webDir, 'avatars', '01_robot.png')
-    if (existsSync(fallback)) { serveFile(res, fallback); return true }
+    if (existsSync(fallback)) { serveFile(req, res, fallback); return true }
     res.writeHead(404); res.end()
     return true
   }

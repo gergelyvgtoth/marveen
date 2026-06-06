@@ -53,7 +53,7 @@ import {
   agentChannelDir,
 } from '../channel-invites.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
-import { isMainChannelsAgent } from '../main-agent.js'
+import { isMainChannelsAgent, MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import {
   getProvider,
   channelStateDir,
@@ -79,7 +79,12 @@ import {
   sendPromptToSession,
   capturePane,
 } from '../agent-process.js'
-import { readActiveModelFromProjectDir } from '../active-model.js'
+import { addDesiredAgent, removeDesiredAgent } from '../agent-desired-state.js'
+import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
+import { detectPaneState } from '../../pane-state.js'
+import { detectReauthNeeded } from '../reauth-detect.js'
+import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
+import type { AutoRestartConfig } from '../../auto-restart.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
 import { getChannelHealth } from '../channel-health-monitor.js'
 import {
@@ -265,6 +270,14 @@ interface AgentSummary {
   running: boolean
   session?: string
   hasAvatar: boolean
+  autoRestart: AutoRestartConfig
+  /** Live context size in tokens (input+cache_read+cache_creation of the last
+   *  turn), or null when not running / no transcript yet. */
+  contextTokens: number | null
+  /** True when the running session's pane shows a login/401 auth failure --
+   *  drives the dashboard "reauth needed" badge + one-click /login button. */
+  needsReauth: boolean
+  reauthReason?: string
 }
 
 interface AgentDetail extends AgentSummary {
@@ -289,6 +302,10 @@ function getAgentSummary(name: string): AgentSummary {
   const proc = getAgentProcessInfo(name)
   const runningSince = proc.running ? getAgentRunningSince(name) : null
 
+  // Reauth badge: only meaningful for a running session (a stopped agent has
+  // no pane to inspect). One capture-pane per running agent on the list poll.
+  const reauth = proc.running ? detectReauthNeeded(capturePane(agentSessionName(name))) : { needsReauth: false }
+
   return {
     name,
     displayName: readAgentDisplayName(name),
@@ -306,6 +323,10 @@ function getAgentSummary(name: string): AgentSummary {
     running: proc.running,
     session: proc.session,
     hasAvatar: findAvatarForAgent(name) !== null,
+    autoRestart: readAutoRestartConfig(name),
+    contextTokens: proc.running ? readContextTokensFromProjectDir(dir, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    needsReauth: reauth.needsReauth,
+    reauthReason: reauth.reason,
   }
 }
 
@@ -377,6 +398,55 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
   if (path === '/api/agents' && method === 'GET') {
     json(res, listAgentSummaries())
+    return true
+  }
+
+  // Live activity panel: per-agent "what is it doing right now". Read-only,
+  // polled by the dashboard every 3s; uses the same pane-state detector as the
+  // scheduler (detectPaneState) and returns the last few output lines as a tail.
+  // Includes the main agent's channels session so the operator sees the whole
+  // fleet, not just sub-agents. Restored after #226 dropped this route while the
+  // frontend kept calling /api/agents/activity (which then 404'd the panel).
+  if (path === '/api/agents/activity' && method === 'GET') {
+    const label = (running: boolean, pane: string | null): string => {
+      if (!running) return 'stopped'
+      if (pane === null) return 'unknown'
+      const s = detectPaneState(pane)
+      if (s === 'busy' || s === 'typing') return 'working'
+      if (s === 'idle') return 'idle'
+      return s // 'unknown' | 'error'
+    }
+    const tailOf = (pane: string | null): string[] =>
+      pane === null
+        ? []
+        : pane
+            .split('\n')
+            .map(l => l.replace(/\s+$/, ''))
+            .filter(l => l.trim().length > 0)
+            .slice(-8)
+
+    const entries: Array<{ name: string; isMain: boolean; running: boolean; state: string; tail: string[] }> = []
+
+    // Main agent runs in the --channels session, not agent-<name>.
+    {
+      const mainPane = capturePane(MAIN_CHANNELS_SESSION)
+      const running = mainPane !== null
+      entries.push({
+        name: MAIN_AGENT_ID,
+        isMain: true,
+        running,
+        state: label(running, mainPane),
+        tail: tailOf(mainPane),
+      })
+    }
+
+    for (const name of listAgentNames()) {
+      const running = isAgentRunning(name)
+      const pane = running ? capturePane(agentSessionName(name)) : null
+      entries.push({ name, isMain: false, running, state: label(running, pane), tail: tailOf(pane) })
+    }
+
+    json(res, entries)
     return true
   }
 
@@ -472,7 +542,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (avatarUploadMatch && method === 'GET') {
     const name = decodeURIComponent(avatarUploadMatch[1])
     const avatarPath = findAvatarForAgent(name)
-    if (avatarPath) { serveFile(res, avatarPath); return true }
+    if (avatarPath) { serveFile(req, res, avatarPath); return true }
     res.writeHead(404); res.end()
     return true
   }
@@ -702,6 +772,22 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     writeAgentSecurityProfile(name, requested)
     writeAgentSettingsFromProfile(name, profile)
     json(res, { ok: true, requiresRestart: isAgentRunning(name) })
+    return true
+  }
+
+  // PUT /api/agents/:name/auto-restart -- set the per-agent auto-restart config.
+  // Accepts the main orchestrator id too (auto-restart applies to it as well).
+  // The body is normalized server-side, so a partial/garbled payload is coerced
+  // to a safe config rather than rejected.
+  const autoRestartMatch = path.match(/^\/api\/agents\/([^/]+)\/auto-restart$/)
+  if (autoRestartMatch && method === 'PUT') {
+    const name = decodeURIComponent(autoRestartMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const body = await readBody(req)
+    let data: unknown
+    try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    const saved = writeAutoRestartConfig(name, data)
+    json(res, { ok: true, autoRestart: saved })
     return true
   }
 
@@ -1107,6 +1193,9 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const name = decodeURIComponent(startMatch[1])
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     const result = startAgentProcess(name)
+    // Record operator intent so the monitor keeps this agent up across shared
+    // tmux-server restarts / reboots (see agent-desired-state.ts).
+    if (result.ok || result.error === 'Agent is already running') addDesiredAgent(name)
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true
@@ -1116,6 +1205,8 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (stopMatch && method === 'POST') {
     const name = decodeURIComponent(stopMatch[1])
     const result = stopAgentProcess(name)
+    // Explicit stop clears intent so the monitor will not resurrect it.
+    removeDesiredAgent(name)
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true

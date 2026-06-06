@@ -10,21 +10,24 @@ import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaff
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
-import { startMcpListChecker } from './web/mcp-list.js'
 import { startScheduleRunner } from './web/schedule-runner.js'
 import { startChannelPluginMonitor } from './web/channel-monitor.js'
 import { startInboundProber } from './web/inbound-probe.js'
 import { startChannelHealthMonitor } from './web/channel-health-monitor.js'
 import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
+import { startReauthHealer } from './web/reauth-healer.js'
+import { startAutoRestartRunner } from './web/auto-restart-runner.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
+import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
+import { sweepOrphanTaskStates } from './web/agent-taskstate.js'
 import { tryHandleDailyLog } from './web/routes/daily-log.js'
 import { tryHandleMemories } from './web/routes/memories.js'
 import { tryHandleMigrate } from './web/routes/migrate.js'
 import { tryHandleKanban } from './web/routes/kanban.js'
-import { tryHandleTasks } from './web/routes/tasks.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
 import { tryHandleConnectorsHu } from './web/routes/connectors-hu.js'
@@ -44,7 +47,6 @@ import { tryHandleAgentConsole } from './web/routes/agent-console.js'
 import { tryHandleTelegramHistory } from './web/routes/telegram-history.js'
 import { tryHandleAgentActivity } from './web/routes/agent-activity.js'
 import { tryHandleIdeas } from './web/routes/ideas.js'
-import { tryHandleWorkflowRecordings } from './web/routes/workflow-recordings.js'
 import { tryHandleToolLog } from './web/routes/tool-log.js'
 import { tryHandleSessionContext } from './web/routes/session-context.js'
 import { tryHandleSalesQA } from './web/routes/sales-qa.js'
@@ -118,8 +120,15 @@ export function startWebServer(port = 3420): http.Server {
       const ok = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       return json(res, { authenticated: ok })
     }
+    // The live pane SSE stream is consumed via EventSource, which cannot set an
+    // Authorization header -- accept the token via ?token= for this one GET
+    // path, validated with the same constant-time check. Everything else stays
+    // header-only.
+    const isSseStream = method === 'GET' && /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path)
     if (path.startsWith('/api/') && !isPublicApi) {
-      if (!checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)) {
+      const headerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
+      const queryOk = isSseStream && checkBearerToken(`Bearer ${url.searchParams.get('token') ?? ''}`, DASHBOARD_TOKEN)
+      if (!headerOk && !queryOk) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized' }))
         return
@@ -135,12 +144,13 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
       if (await tryHandleKanban(routeCtx)) return
-      if (await tryHandleTasks(routeCtx)) return
       if (await tryHandleSchedules(routeCtx)) return
       if (await tryHandleConnectorsHu(routeCtx)) return
       if (await tryHandleConnectors(routeCtx)) return
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
+      if (await tryHandleAgentTerminal(routeCtx)) return
+      if (await tryHandleAgentTaskState(routeCtx)) return
       if (await tryHandleAgents(routeCtx, WEB_DIR)) return
       if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
       if (await tryHandleBackgroundTasks(routeCtx)) return
@@ -155,7 +165,6 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleTelegramHistory(routeCtx)) return
       if (await tryHandleAgentActivity(routeCtx)) return
       if (await tryHandleIdeas(routeCtx)) return
-      if (await tryHandleWorkflowRecordings(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSessionContext(routeCtx)) return
       if (await tryHandleSalesQA(routeCtx)) return
@@ -271,15 +280,30 @@ export function startWebServer(port = 3420): http.Server {
   const stuckToolCallInterval = startStuckToolCallWatcher()
   logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
 
+  const reauthHealerInterval = startReauthHealer()
+  if (reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
+
+  const autoRestartInterval = startAutoRestartRunner()
+  logger.info('Auto-restart runner started (60s poll, 40s offset)')
+
   const updateCheckerInterval = startUpdateChecker()
   logger.info('Update checker started (15min poll)')
 
-  // Warm the MCP list cache so the Connectors page reflects claude.ai OAuth
-  // connectors on first load. 30s delay lets the main-channels session settle
-  // first so the telegram plugin's single-poller token is claimed before
-  // `claude mcp list` spawns it for a health check.
-  startMcpListChecker()
-  logger.info('MCP list cache warmup scheduled (30s delay, manual refresh only)')
+  // NOTE: startMcpListChecker() is intentionally NOT called here.
+  //
+  // Root cause: calling `claude mcp list` at boot time (30s delay) spawns the
+  // Telegram plugin for a health check. The plugin claims the bot-token poller
+  // slot, which 409-kills the live session-bridge process that already holds
+  // the same token. On every deploy this caused the Telegram channel to go
+  // offline within 33s of startup (3/3 observed deploys, 2026-06-04).
+  //
+  // The Connectors page already has a manual "Refresh" button that calls
+  // refreshMcpListCache() on demand. The cache starts empty; users see their
+  // connectors after the first manual refresh.
+  //
+  // Related: PR #269 fixed a DIFFERENT 409 source (runtime poller-flapping /
+  // channel-coordinator 409 cooldown hysteresis). That fix and this one are
+  // complementary -- both 409 vectors must be addressed.
 
   // Warm the Marveen bot username cache so /api/marveen returns @username on
   // the first dashboard load. Re-fetched lazily otherwise.
@@ -311,14 +335,23 @@ export function startWebServer(port = 3420): http.Server {
     logger.warn({ err }, 'Background task sweep skipped')
   }
 
+  try {
+    const swept = sweepOrphanTaskStates(Date.now())
+    if (swept > 0) logger.info({ swept }, 'Orphan agent task-state records swept')
+  } catch (err) {
+    logger.warn({ err }, 'Task-state orphan sweep skipped')
+  }
+
   const origClose = server.close.bind(server)
   server.close = (cb?: (err?: Error) => void) => {
     clearInterval(routerInterval)
     clearInterval(scheduleInterval)
-    clearInterval(pluginMonitorInterval)
+    if (pluginMonitorInterval) clearInterval(pluginMonitorInterval)
     clearInterval(channelHealthInterval)
     clearInterval(stuckInputInterval)
     clearInterval(stuckToolCallInterval)
+    if (reauthHealerInterval) clearInterval(reauthHealerInterval)
+    clearInterval(autoRestartInterval)
     clearInterval(updateCheckerInterval)
     return origClose(cb)
   }

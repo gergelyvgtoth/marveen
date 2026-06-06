@@ -3,6 +3,16 @@
 // On first visit we pluck the token out of the URL, store it in localStorage,
 // strip it from the visible URL, and then inject it into every /api/* fetch
 // as a Bearer header so the server lets us through.
+
+// The main (channels) agent's real id. The backend /api/marveen route returns
+// the configured MAIN_AGENT_ID (NOT the literal "marveen") in window._marveen;
+// use this everywhere an agent id is sent to /api/agents/... or compared to a
+// fleet name, so the dashboard works on non-"marveen" installs. Falls back to
+// "marveen" only before /api/marveen has resolved (or on a legacy backend).
+function mainAgentId() {
+  return window._marveen?.agentId || 'marveen'
+}
+
 (() => {
   const TOKEN_KEY = 'marveen-dashboard-token'
   const urlParams = new URLSearchParams(window.location.search)
@@ -91,9 +101,9 @@ function switchPage(pageId) {
   if (pageId === 'team') loadTeamGraph()
   if (pageId === 'console') loadConsolePage()
   else stopConsolePolling()
+  if (pageId === 'messages') loadMessagesPage()
   if (pageId === 'tokenUsage') loadTokenUsage()
   if (pageId === 'ideas') loadIdeasPage()
-  if (pageId === 'workflows') loadWorkflowsPage()
   if (pageId === 'sessionContext') loadSessionContextPage()
   if (pageId === 'salesQA') loadSalesQAPage()
   if (pageId === 'inbox') loadInboxPage()
@@ -103,10 +113,29 @@ function switchPage(pageId) {
   else stopAgentHealthAutoRefresh()
 }
 
+// Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
+// hamburger/backdrop are display:none there); on narrow screens it slides the
+// sidebar in over a backdrop.
+const sidebarEl = document.querySelector('.sidebar')
+const sidebarBackdrop = document.getElementById('sidebarBackdrop')
+const mobileMenuBtn = document.getElementById('mobileMenuBtn')
+function setSidebarOpen(open) {
+  if (sidebarEl) sidebarEl.classList.toggle('open', open)
+  if (sidebarBackdrop) sidebarBackdrop.classList.toggle('open', open)
+  if (mobileMenuBtn) mobileMenuBtn.setAttribute('aria-expanded', open ? 'true' : 'false')
+}
+if (mobileMenuBtn) mobileMenuBtn.addEventListener('click', () => setSidebarOpen(!sidebarEl.classList.contains('open')))
+if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setSidebarOpen(false))
+
 navLinks.forEach((link) => {
   link.addEventListener('click', (e) => {
     e.preventDefault()
-    switchPage(link.dataset.page)
+    const pageId = link.dataset.page
+    // Same hash won't fire 'hashchange', so re-render manually; otherwise let the
+    // hashchange listener drive switchPage so the URL stays the single source of truth.
+    if (location.hash.slice(1) === pageId) switchPage(pageId)
+    else location.hash = pageId
+    setSidebarOpen(false) // close the drawer after navigating on mobile
   })
 })
 
@@ -118,11 +147,11 @@ navLinks.forEach((link) => {
 let activityTimer = null
 
 const ACTIVITY_STATE_META = {
-  working: { label: 'dolgozik', cls: 'act-working' },
-  idle: { label: 'várakozik', cls: 'act-idle' },
-  unknown: { label: 'ismeretlen', cls: 'act-unknown' },
-  error: { label: 'hiba', cls: 'act-error' },
-  stopped: { label: 'leállt', cls: 'act-stopped' },
+  working: { label: 'dolgozik', cls: 'act-working', tip: 'Élő állapot (a tmux pane tartalmából, 3 másodpercenként): éppen dolgozik / gondolkodik.' },
+  idle: { label: 'várakozik', cls: 'act-idle', tip: 'Élő állapot (3 másodpercenként): fut, de épp nem csinál semmit.' },
+  unknown: { label: 'ismeretlen', cls: 'act-unknown', tip: 'Élő állapot: nem sikerült megállapítani a session pane tartalmából.' },
+  error: { label: 'hiba', cls: 'act-error', tip: 'Élő állapot: hiba látszik az ágens session paneljén.' },
+  stopped: { label: 'leállt', cls: 'act-stopped', tip: 'Élő állapot: az ágens session nem fut.' },
 }
 
 function startActivityPoll() {
@@ -163,11 +192,18 @@ function renderActivity(entries) {
     const meta = ACTIVITY_STATE_META[a.state] || ACTIVITY_STATE_META.unknown
     const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
     const mainBadge = a.isMain ? '<span class="act-main-badge">fő</span>' : ''
+    const canOpen = !!a.running
+    const termIcon = canOpen
+      ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="Terminal megnyitása"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+      : ''
     return (
-      '<div class="activity-card ' + meta.cls + '">' +
+      '<div class="activity-card ' + meta.cls + (canOpen ? ' act-clickable' : '') + '" data-agent="' + escapeHtml(a.name) + '">' +
         '<div class="activity-card-head">' +
           '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
-          '<span class="activity-badge ' + meta.cls + '">' + meta.label + '</span>' +
+          '<span style="display:flex;align-items:center;gap:8px">' +
+            termIcon +
+            '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + meta.label + '</span>' +
+          '</span>' +
         '</div>' +
         (tail
           ? '<pre class="activity-tail">' + tail + '</pre>'
@@ -176,6 +212,17 @@ function renderActivity(entries) {
     )
   }).join('')
 }
+
+// Event delegation: clicking a running activity-card opens the terminal modal
+;(() => {
+  const actList = document.getElementById('activityList')
+  if (actList) {
+    actList.addEventListener('click', (e) => {
+      const card = e.target.closest('.activity-card.act-clickable[data-agent]')
+      if (card) openTerminalModal(card.dataset.agent)
+    })
+  }
+})()
 
 
 // ============================================================
@@ -197,6 +244,9 @@ const cardDetailOverlay = document.getElementById('cardDetailOverlay')
 const breakdownOverlay = document.getElementById('breakdownOverlay')
 let breakdownCardId = null
 let breakdownSubtasks = []
+// Breakdown modal is shared between kanban-card breakdown and idea promote.
+let breakdownMode = 'kanban' // 'kanban' | 'idea'
+let breakdownIdeaId = null
 const columns = document.querySelectorAll('.kanban-col-body')
 
 // Modal wiring
@@ -439,9 +489,13 @@ function createCardEl(card) {
     ? `<span class="kanban-card-project">${escapeHtml(card.project)}</span>`
     : ''
 
+  const seqHtml = card.seq != null
+    ? `<span class="kanban-card-seq" style="font-family:monospace;font-size:11px;color:var(--muted);margin-right:5px">#${card.seq}</span>`
+    : ''
+
   el.innerHTML = `
     ${projectHtml}
-    <div class="kanban-card-title">${escapeHtml(card.title)}</div>
+    <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
     <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
     <div class="kanban-card-actions">
       <button class="card-breakdown-btn" title="AI szétbont" aria-label="AI szétbont">⚡</button>
@@ -605,7 +659,9 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
 
 // === Card detail ===
 async function showCardDetail(card) {
-  document.getElementById('cardDetailTitle').textContent = card.title
+  // Running number (#N) in the title bar, plus the stable hex id in the meta.
+  const seqPrefix = card.seq != null ? `#${card.seq} ` : ''
+  document.getElementById('cardDetailTitle').textContent = `${seqPrefix}${card.title}`
 
   // Case-insensitive match; fall back to the raw stored name so a casing
   // mismatch (or an unregistered assignee) shows the actual name, not "nincs".
@@ -618,7 +674,12 @@ async function showCardDetail(card) {
   const statusLabels = { planned: 'Tervezett', in_progress: 'Folyamatban', waiting: 'Várakozik', done: 'Kész' }
 
   const meta = document.getElementById('cardDetailMeta')
+  const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
   meta.innerHTML = `
+    <div class="meta-item">
+      <span class="meta-label">Azonosító</span>
+      <span class="meta-value" style="font-family:monospace" title="Futó sorszám · hex azonosító">${escapeHtml(idLabel)}</span>
+    </div>
     <div class="meta-item">
       <span class="meta-label">Állapot</span>
       <span class="meta-value">${statusLabels[card.status] || card.status}</span>
@@ -709,20 +770,37 @@ async function showCardDetail(card) {
     }
   } catch { /* ignore */ }
 
-  // Author select for new comment
-  populateAssigneeSelect('commentAuthor', 'Marveen')
+  // Author select for new comment. Default to the bot assignee resolved by
+  // type (never a hard-coded display name -- BOT_NAME differs per deployment),
+  // falling back to the first assignee. The old literal 'Marveen' never matched
+  // on non-Marveen installs, so the select stayed on "-- Nincs --" and the
+  // comment submit silently no-opped (addCommentBtn returns when !author).
+  // (Resolution of the #254/#241 overlap: keep #241's type-resolved default
+  // over #254's hard-coded "Gábor" -- same deployment-agnostic reasoning.)
+  const defaultCommentAuthor =
+    (kanbanAssignees.find((a) => a.type === 'bot') || kanbanAssignees[0] || {}).name || ''
+  populateAssigneeSelect('commentAuthor', defaultCommentAuthor)
 
   // Add comment
   document.getElementById('addCommentBtn').onclick = async () => {
     const content = document.getElementById('commentContent').value.trim()
     const author = document.getElementById('commentAuthor').value
-    if (!content || !author) return
+    if (!content) { document.getElementById('commentContent').focus(); return }
+    if (!author) { showToast('Válassz szerzőt a megjegyzéshez'); return }
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
+      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ author, content }),
       })
+      // Without this check an HTTP error (e.g. 400) still cleared the textarea
+      // and "refreshed", so the comment looked sent but was never saved.
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`
+        try { msg = (await res.json()).error || msg } catch {}
+        showToast('Megjegyzés nem mentődött: ' + msg)
+        return
+      }
       document.getElementById('commentContent').value = ''
       showCardDetail(card) // refresh
     } catch {
@@ -806,6 +884,7 @@ async function showCardDetail(card) {
       const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) { showToast(data.error || 'Hiba'); btn.disabled = false; btn.textContent = 'Breakdown'; return }
+      breakdownMode = 'kanban'
       breakdownCardId = card.id
       breakdownSubtasks = data.subtasks
       showBreakdownModal(data.subtasks, card)
@@ -827,6 +906,7 @@ async function triggerBreakdown(card) {
     const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
+    breakdownMode = 'kanban'
     breakdownCardId = card.id
     breakdownSubtasks = data.subtasks
     showBreakdownModal(data.subtasks, card)
@@ -887,10 +967,24 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
     const title = item.querySelector('.breakdown-title-input')?.value.trim() || breakdownSubtasks[idx]?.title
     const assignee = item.querySelector('.breakdown-assignee-select')?.value || breakdownSubtasks[idx]?.assignee
     const priority = breakdownSubtasks[idx]?.priority || 'normal'
-    accepted.push({ title, assignee, priority })
+    const description = breakdownSubtasks[idx]?.description || ''
+    accepted.push({ title, assignee, priority, description })
   })
-  if (accepted.length === 0) { showToast('Válassz legalább egy subtask-ot'); return }
+  if (accepted.length === 0) { showToast('Válassz legalább egy alfeladatot'); return }
   try {
+    if (breakdownMode === 'idea') {
+      const res = await fetch(`/api/ideas/${encodeURIComponent(breakdownIdeaId)}/promote-breakdown`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subtasks: accepted }),
+      })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Hiba'); return }
+      closeModal(breakdownOverlay)
+      showToast(`Kanbanra emelve: ${data.child_count} alfeladat + szülő kártya`)
+      loadIdeasPage()
+      return
+    }
     const res = await fetch(`/api/kanban/${encodeURIComponent(breakdownCardId)}/breakdown/accept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -934,8 +1028,16 @@ const AVATARS = [
 ]
 
 let selectedAvatar = null
+let selectedAvatarFile = null // custom upload chosen in the create wizard (deferred until the agent exists)
 let agents = []
 let currentAgent = null
+// API-safe agent id for the currently open detail modal. Sub-agents key off
+// their name; the main agent's detail object carries name:'marveen' for legacy
+// UI checks but its real agent-dir id is agentId (MAIN_AGENT_ID, e.g.
+// 'gorcsevivan') -- the /api/agents/<id>/skills endpoints need that real id.
+function agentApiName() {
+  return currentAgent ? (currentAgent.agentId || currentAgent.name) : ''
+}
 let wizardStep = 1
 let generatedClaudeMd = ''
 let generatedSoulMd = ''
@@ -993,6 +1095,9 @@ function populateAvatarGrid() {
       grid.querySelectorAll('.avatar-grid-item').forEach(i => i.classList.remove('selected'))
       item.classList.add('selected')
       selectedAvatar = avatar
+      // Gallery pick and custom upload are mutually exclusive.
+      selectedAvatarFile = null
+      resetCreateAvatarUpload()
     })
     grid.appendChild(item)
   }
@@ -1036,7 +1141,9 @@ function resetWizard() {
   agentModel.value = 'inherit'
   loadAvailableModels()
   selectedAvatar = null
+  selectedAvatarFile = null
   document.querySelectorAll('#avatarGrid .avatar-grid-item').forEach(i => i.classList.remove('selected'))
+  resetCreateAvatarUpload()
   generatedClaudeMd = ''
   generatedSoulMd = ''
   wizardCreatedName = ''
@@ -1112,8 +1219,16 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
 
     statusEl.textContent = 'Kész!'
 
-    // Set gallery avatar if selected
-    if (selectedAvatar) {
+    // Apply the chosen avatar. Custom upload wins over a gallery pick; both go
+    // to the same endpoint (FormData for a file, JSON for a gallery name).
+    if (selectedAvatarFile) {
+      const form = new FormData()
+      form.append('avatar', selectedAvatarFile, selectedAvatarFile.name)
+      await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
+        method: 'POST',
+        body: form,
+      })
+    } else if (selectedAvatar) {
       await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1217,12 +1332,59 @@ async function loadAgents() {
   }
 }
 
+// Format a context-token count for display (e.g. 699884 -> "≈700k token").
+function formatContextTokens(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n <= 0) return '-'
+  if (n < 1000) return `${n} token`
+  const k = n / 1000
+  return `≈${k < 10 ? k.toFixed(1) : Math.round(k)}k token`
+}
+
+// Populate the auto-restart controls + context display from an agent payload.
+// Works for sub-agents (agent.name) and the main session (agent.autoRestartId).
+function setupAutoRestartUI(agent) {
+  const ctxEl = document.getElementById('agentDetailContext')
+  if (ctxEl) ctxEl.textContent = formatContextTokens(agent && agent.contextTokens)
+
+  const ar = (agent && agent.autoRestart) || { enabled: false, mode: 'continue', dailyTime: null, intervalHours: null }
+  const enabled = document.getElementById('arEnabled')
+  const mode = document.getElementById('arMode')
+  const schedKind = document.getElementById('arSchedKind')
+  const dailyWrap = document.getElementById('arDailyWrap')
+  const dailyTime = document.getElementById('arDailyTime')
+  const intervalWrap = document.getElementById('arIntervalWrap')
+  const intervalHours = document.getElementById('arIntervalHours')
+  if (!enabled || !mode || !schedKind) return
+
+  enabled.checked = ar.enabled === true
+  mode.value = ar.mode === 'fresh' ? 'fresh' : 'continue'
+  if (ar.intervalHours) {
+    schedKind.value = 'interval'
+    intervalHours.value = ar.intervalHours
+  } else {
+    schedKind.value = 'daily'
+    if (ar.dailyTime) dailyTime.value = ar.dailyTime
+  }
+  const syncSched = () => {
+    const isInterval = schedKind.value === 'interval'
+    intervalWrap.hidden = !isInterval
+    dailyWrap.hidden = isInterval
+  }
+  syncSched()
+  // Attach the show/hide listener once.
+  if (schedKind.dataset.wired !== '1') {
+    schedKind.addEventListener('change', syncSched)
+    schedKind.dataset.wired = '1'
+  }
+}
+
 async function openMarveenDetail() {
   const m = window._marveen
   if (!m) return
 
   // Reuse the agent detail modal for Marveen
-  currentAgent = { ...m, name: 'marveen', claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
+  currentAgent = { ...m, name: mainAgentId(), claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
+  setupAutoRestartUI(currentAgent)
 
   const displayName = m.name || 'Marveen'
   document.getElementById('agentDetailTitle').textContent = displayName
@@ -1233,7 +1395,11 @@ async function openMarveenDetail() {
   document.getElementById('agentDetailDesc').textContent = m.description || ''
   document.getElementById('agentDetailModel').textContent = m.model || '-'
   document.getElementById('agentDetailChStatus').innerHTML = '<span class="tg-status"><span class="tg-dot connected"></span>Csatlakozva</span>'
-  document.getElementById('agentDetailSkillCount').textContent = '-'
+  // Populate the Skills tab for the main agent too: the endpoint returns the
+  // global ~/.claude/skills under its real id (agentId), which every agent
+  // inherits. Previously this was hard-set to '-' and loadSkills was never
+  // called, so the main agent's Skills tab always looked empty.
+  loadSkills(agentApiName())
 
   // Process control for Marveen - always running, no start/stop
   document.getElementById('processDot').className = 'process-dot running'
@@ -1269,7 +1435,7 @@ async function openMarveenDetail() {
   // Telegram tab -- without this the tab stays in the default "not connected"
   // view even though the bot is running and receiving messages.
   updateChannelTab({
-    name: 'marveen',
+    name: mainAgentId(),
     hasTelegram: mFull.hasTelegram !== undefined ? mFull.hasTelegram : true,
     hasDiscord: mFull.hasDiscord,
     hasSlack: mFull.hasSlack,
@@ -1321,6 +1487,20 @@ function getAvatarGradient(name) {
   return 'gradient-' + ((hash % 3) + 1)
 }
 
+// Tooltip text for the "Fut" / "Leállva" footer indicator (process state).
+function processTip(isRunning) {
+  return isRunning
+    ? 'Fut: él az ágens tmux session-je (a Claude Code folyamat fut). Forrás: tmux list-sessions.'
+    : 'Leállva: nincs élő tmux session az ágensnek. Forrás: tmux list-sessions.'
+}
+
+// Tooltip text for the "Online" / "Offline" footer indicator (channel state).
+function channelTip(isConnected) {
+  return isConnected
+    ? 'Online: van bekonfigurált csatorna-token (saját bot). Figyelem: ez nem élő kapcsolat, csak a token meglétét jelzi.'
+    : 'Offline: nincs csatorna bekötve (channel-less, csak inter-agent ágens).'
+}
+
 function renderAgents() {
   agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((el) => el.remove())
 
@@ -1340,10 +1520,19 @@ function renderAgents() {
       </div>
       <div class="agent-card-footer">
         <span class="agent-model-badge opus">opus</span>
-        <span class="process-indicator"><span class="process-dot running"></span>Fut</span>
-        <span class="tg-status"><span class="tg-dot connected"></span>Online</span>
+        <span class="process-indicator" title="Fut: a fő asszisztens mindig a --channels session-ben fut. Ez a kártya fixen Fut állapotot mutat, nincs per-ágens tmux-ellenőrzés."><span class="process-dot running"></span>Fut</span>
+        <span class="tg-status" title="Online: a fő asszisztens csatornáját a --channels session kezeli, ezért fixen online (nincs külön token-ellenőrzés)."><span class="tg-dot connected"></span>Online</span>
+      </div>
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          Terminal
+        </button>
       </div>
     `
+    mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openTerminalModal(mainAgentId())
+    })
     mCard.addEventListener('click', () => openMarveenDetail())
     agentsGrid.insertBefore(mCard, addBtn)
   }
@@ -1380,10 +1569,29 @@ function renderAgents() {
       </div>
       <div class="agent-card-footer">
         <span class="agent-model-badge ${escapeHtml(modelClass)}">${escapeHtml(modelLabel)}</span>
-        <span class="process-indicator"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
-        <span class="tg-status"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
+        <span class="process-indicator" title="${escapeHtml(processTip(isRunning))}"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
+        <span class="tg-status" title="${escapeHtml(channelTip(chConnected))}"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
+      </div>
+      ${agent.needsReauth ? `
+        <div class="agent-reauth-banner">
+          <span class="agent-reauth-reason">${escapeHtml(agent.reauthReason || 'Újrabejelentkezés szükséges')}</span>
+          <button class="btn-danger btn-compact agent-login-btn" data-phase="start">Bejelentkezés</button>
+        </div>` : ''}
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          Terminal
+        </button>
       </div>
     `
+    // Login button handler (start → confirm flow)
+    card.querySelectorAll('.agent-login-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => { e.stopPropagation(); handleAgentLogin(agent.name, btn) })
+    })
+    // Terminal button
+    card.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openTerminalModal(agent.name)
+    })
     card.addEventListener('click', () => openAgentDetail(agent.name))
     agentsGrid.insertBefore(card, addBtn)
   }
@@ -1436,6 +1644,9 @@ async function openAgentDetail(agentName) {
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
   document.getElementById('editMcpJson').value = currentAgent.mcpJson || ''
+
+  // Auto-restart settings + live context size
+  setupAutoRestartUI(currentAgent)
 
   // Telegram tab
   updateChannelTab(currentAgent)
@@ -1610,6 +1821,69 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
       showToast('Hiba a feltöltés során')
       resetAvatarUpload()
     }
+  }
+})()
+
+// === Create-wizard avatar upload ===
+// Mirrors the detail-modal uploader, but the agent does not exist yet, so the
+// file is held in `selectedAvatarFile` and POSTed after creation (see the
+// wizard create flow). Hoisted so populateAvatarGrid()/resetWizard() can reset.
+function resetCreateAvatarUpload() {
+  const fileInput = document.getElementById('createAvatarFileInput')
+  const content = document.getElementById('createAvatarUploadContent')
+  const preview = document.getElementById('createAvatarUploadPreview')
+  if (!fileInput || !content || !preview) return
+  fileInput.value = ''
+  content.hidden = false
+  preview.hidden = true
+}
+;(() => {
+  const zone = document.getElementById('createAvatarUploadZone')
+  if (!zone) return
+  const fileInput = document.getElementById('createAvatarFileInput')
+  const content = document.getElementById('createAvatarUploadContent')
+  const preview = document.getElementById('createAvatarUploadPreview')
+  const previewImg = document.getElementById('createAvatarPreviewImg')
+  const clearBtn = document.getElementById('createAvatarPreviewClear')
+  const MAX_SIZE = 1024 * 1024
+
+  zone.addEventListener('click', (e) => {
+    if (e.target === clearBtn || clearBtn.contains(e.target)) return
+    fileInput.click()
+  })
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over') })
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'))
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault()
+    zone.classList.remove('drag-over')
+    const file = e.dataTransfer.files[0]
+    if (file) handleCreateAvatarFile(file)
+  })
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleCreateAvatarFile(fileInput.files[0])
+  })
+  clearBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    selectedAvatarFile = null
+    resetCreateAvatarUpload()
+  })
+
+  function handleCreateAvatarFile(file) {
+    if (!file.type.match(/^image\/(png|jpe?g|webp)$/)) {
+      showToast('Csak png/jpg/webp formátum')
+      return
+    }
+    if (file.size > MAX_SIZE) {
+      showToast('Max 1 MB méretű kép')
+      return
+    }
+    // Custom upload and gallery pick are mutually exclusive.
+    selectedAvatar = null
+    document.querySelectorAll('#avatarGrid .avatar-grid-item').forEach(i => i.classList.remove('selected'))
+    selectedAvatarFile = file
+    previewImg.src = URL.createObjectURL(file)
+    content.hidden = true
+    preview.hidden = false
   }
 })()
 
@@ -1894,6 +2168,33 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
       return
     }
     startModelRestartPolling(name, newModel, triggeredAt)
+  } catch { showToast('Hiba a mentés során') }
+})
+
+document.getElementById('saveAutoRestartBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  // Auto-restart applies to the main session too, so (unlike model/profile) we
+  // do NOT skip role === 'main'. The store key is autoRestartId for the main
+  // session, the sanitized name for sub-agents.
+  const id = currentAgent.autoRestartId || currentAgent.name
+  const schedKind = document.getElementById('arSchedKind').value
+  const cfg = {
+    enabled: document.getElementById('arEnabled').checked,
+    mode: document.getElementById('arMode').value === 'fresh' ? 'fresh' : 'continue',
+    dailyTime: schedKind === 'daily' ? document.getElementById('arDailyTime').value : null,
+    intervalHours: schedKind === 'interval' ? Number(document.getElementById('arIntervalHours').value) : null,
+    handoff: false,
+  }
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}/auto-restart`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    })
+    if (!res.ok) throw new Error()
+    const body = await res.json()
+    if (currentAgent) currentAgent.autoRestart = body.autoRestart
+    showToast('Auto-restart beállítás mentve')
   } catch { showToast('Hiba a mentés során') }
 })
 
@@ -2771,25 +3072,36 @@ async function loadSkills(agentName) {
     for (const skill of skills) {
       const item = document.createElement('div')
       item.className = 'skill-item'
+      // Inherited global skills (~/.claude/skills) are shared across every
+      // agent, so they get a badge and no per-agent delete button -- only the
+      // agent's own local skills are deletable from this view.
+      const isGlobal = skill.source === 'global'
+      const badge = isGlobal
+        ? '<span class="skill-item-badge" title="Globális skill, minden agent örökli">globális</span>'
+        : ''
+      const deletable = skill.deletable !== false
       item.innerHTML = `
         <div class="skill-item-info">
-          <div class="skill-item-name">${escapeHtml(skill.name)}</div>
+          <div class="skill-item-name">${escapeHtml(skill.name)}${badge}</div>
           ${skill.description ? `<div class="skill-item-desc">${escapeHtml(skill.description)}</div>` : ''}
         </div>
         <div class="skill-item-actions">
-          <button class="btn-icon btn-icon-danger" title="Törlés">${trashIcon()}</button>
+          ${deletable ? `<button class="btn-icon btn-icon-danger" title="Törlés">${trashIcon()}</button>` : ''}
         </div>
       `
-      item.querySelector('.btn-icon-danger').addEventListener('click', async () => {
-        if (!confirm(`Skill törlése: ${skill.name}?`)) return
-        try {
-          await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
-          showToast('Skill törölve')
-          loadSkills(agentName)
-        } catch {
-          showToast('Hiba a törlés során')
-        }
-      })
+      const delBtn = item.querySelector('.btn-icon-danger')
+      if (delBtn) {
+        delBtn.addEventListener('click', async () => {
+          if (!confirm(`Skill törlése: ${skill.name}?`)) return
+          try {
+            await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
+            showToast('Skill törölve')
+            loadSkills(agentName)
+          } catch {
+            showToast('Hiba a törlés során')
+          }
+        })
+      }
       listEl.appendChild(item)
     }
   } catch {
@@ -2856,7 +3168,7 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
   try {
     const url = isGlobal
       ? '/api/skills'
-      : `/api/agents/${encodeURIComponent(currentAgent.name)}/skills`
+      : `/api/agents/${encodeURIComponent(agentApiName())}/skills`
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2874,7 +3186,7 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
     if (isGlobal) {
       loadGlobalSkills()
     } else {
-      loadSkills(currentAgent.name)
+      loadSkills(agentApiName())
     }
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2901,7 +3213,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     formData.append('file', skillFile)
     const url = isGlobal
       ? '/api/skills/import'
-      : `/api/agents/${encodeURIComponent(currentAgent.name)}/skills/import`
+      : `/api/agents/${encodeURIComponent(agentApiName())}/skills/import`
     const res = await fetch(url, {
       method: 'POST',
       body: formData,
@@ -2919,7 +3231,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     if (isGlobal) {
       loadGlobalSkills()
     } else {
-      loadSkills(currentAgent.name)
+      loadSkills(agentApiName())
     }
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -3035,6 +3347,9 @@ function resetScheduleForm() {
   document.getElementById('scheduleName').value = ''
   document.getElementById('scheduleDesc').value = ''
   document.getElementById('schedulePrompt').value = ''
+  document.getElementById('scheduleSkipIfBusy').checked = false
+  document.getElementById('scheduleForceSend').checked = false
+  document.getElementById('scheduleTargetSession').value = ''
   scheduleFrequency.value = 'daily'
   document.getElementById('scheduleTime').value = '09:00'
   document.getElementById('scheduleCustomCron').value = ''
@@ -3275,7 +3590,7 @@ function renderScheduleList(tasks) {
   for (const task of tasks) {
     const row = document.createElement('div')
     row.className = 'schedule-row'
-    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || 'marveen', avatar: '/api/marveen/avatar', label: task.agent || 'marveen' }
+    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar', label: task.agent || mainAgentId() }
 
     row.innerHTML = `
       <div class="schedule-agent-avatar">
@@ -3350,7 +3665,7 @@ function renderTimeline(tasks) {
   // Group tasks by agent
   const agentTasks = {}
   for (const task of tasks) {
-    const agentName = task.agent || 'marveen'
+    const agentName = task.agent || mainAgentId()
     if (!agentTasks[agentName]) agentTasks[agentName] = []
     agentTasks[agentName].push(task)
   }
@@ -3505,7 +3820,7 @@ function renderWeekView(data) {
       const count = tasks.length
 
       tasks.forEach((task, idx) => {
-        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || 'marveen', avatar: '/api/marveen/avatar' }
+        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar' }
 
         const card = document.createElement('div')
         card.className = 'week-task-card'
@@ -3560,6 +3875,9 @@ function openEditSchedule(task) {
     document.getElementById('scheduleDesc').value = task.description || ''
     document.getElementById('schedulePrompt').value = task.prompt || ''
     document.getElementById('scheduleEditName').value = task.name
+    document.getElementById('scheduleSkipIfBusy').checked = !!task.skipIfBusy
+    document.getElementById('scheduleForceSend').checked = !!task.forceSend
+    document.getElementById('scheduleTargetSession').value = task.targetSession || ''
 
     // Set type (heartbeat or task; custom types fall back to task)
     const typeEl = document.getElementById('scheduleType')
@@ -3687,6 +4005,12 @@ saveScheduleBtn.addEventListener('click', async () => {
   const schedule = getScheduleCron()
   const agent = document.getElementById('scheduleAgent').value
   const type = document.getElementById('scheduleType').value
+  // Advanced options -- the backend already persists these; expose them here.
+  const skipIfBusy = document.getElementById('scheduleSkipIfBusy').checked
+  const forceSend = document.getElementById('scheduleForceSend').checked
+  const targetSession = document.getElementById('scheduleTargetSession').value.trim()
+  const advanced = { skipIfBusy, forceSend }
+  if (targetSession) advanced.targetSession = targetSession
 
   if (!name) { document.getElementById('scheduleName').focus(); return }
   if (!prompt) { document.getElementById('schedulePrompt').focus(); return }
@@ -3702,7 +4026,7 @@ saveScheduleBtn.addEventListener('click', async () => {
       const res = await fetch(`/api/schedules/${encodeURIComponent(editName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description, prompt, schedule, agent, type }),
+        body: JSON.stringify({ description, prompt, schedule, agent, type, ...advanced }),
       })
       if (!res.ok) {
         const err = await res.json()
@@ -3714,7 +4038,7 @@ saveScheduleBtn.addEventListener('click', async () => {
       const res = await fetch('/api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description, prompt, schedule, agent, type }),
+        body: JSON.stringify({ name, description, prompt, schedule, agent, type, ...advanced }),
       })
       if (!res.ok) {
         const err = await res.json()
@@ -3948,7 +4272,7 @@ function renderMemories(memories) {
     const tierBadge = tierLabels[tier] || tier
     const badgeClass = 'badge-' + tier
     const shortContent = mem.content.length > 120 ? mem.content.slice(0, 120) + '...' : mem.content
-    const agentLabel = mem.agent_id || 'marveen'
+    const agentLabel = mem.agent_id || mainAgentId()
 
     // Build keywords HTML
     let keywordsHtml = ''
@@ -4290,7 +4614,7 @@ function buildGraph(memories) {
       connectionCount: 0,
       label: label,
       tier: mem.tier || mem.category || 'warm',
-      agent: mem.agent_id || 'marveen',
+      agent: mem.agent_id || mainAgentId(),
       keywords: keywords,
       mem: mem,
       searchMatch: true,
@@ -4754,7 +5078,7 @@ function hideGraphPanel() {
 
 function openEditMemory(mem) {
   document.getElementById('memModalTitle').textContent = 'Emlék szerkesztése'
-  document.getElementById('memAgent').value = mem.agent_id || 'marveen'
+  document.getElementById('memAgent').value = mem.agent_id || mainAgentId()
   document.getElementById('memTier').value = mem.tier || mem.category || 'warm'
   document.getElementById('memContent').value = mem.content || ''
   document.getElementById('memKeywords').value = mem.keywords || ''
@@ -5137,7 +5461,7 @@ function renderCatalog() {
       </div>
       <div class="catalog-card-footer">
         ${item.installed
-          ? `<span class="catalog-install-btn installed" title="Forrás: ${escapeHtml(item.installedSource || 'ismeretlen')}">Telepítve &#10003;${item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${item.installedSource === 'claude.ai' ? '' : `<a class="catalog-uninstall-link" data-id="${item.id}">Eltávolítás</a>`}`
+          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? 'Bekötve a .mcp.json-ban (a Connectors listán kezelhető)' : 'Forrás: ' + escapeHtml(item.installedSource || 'ismeretlen')}">Telepítve &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${item.id}">Eltávolítás</a>`}`
           : `<button class="catalog-install-btn install" data-id="${item.id}">Telepítés</button>${authHint}`
         }
       </div>
@@ -5419,11 +5743,17 @@ function renderConnectors() {
     connectorStats.innerHTML = ''
   } else {
     const connected = connectors.filter(c => c.status === 'connected').length
+    // 'configured' = declared in a .mcp.json (not health-checked, the backend
+    // never spawns them). These are known-good, not broken -- surface them in a
+    // positive count so file-defined servers (e.g. gmail-egov) do not look
+    // un-ready just because they never went through the claude mcp list cache.
+    const configured = connectors.filter(c => c.status === 'configured').length
     const needsAuth = connectors.filter(c => c.status === 'needs_auth').length
     const failed = connectors.filter(c => c.status === 'failed').length
     connectorStats.innerHTML = `
       <div class="stat-card"><div class="stat-value">${connectors.length}</div><div class="stat-label">Összes</div></div>
       <div class="stat-card"><div class="stat-value" style="color:var(--success)">${connected}</div><div class="stat-label">Aktív</div></div>
+      ${configured ? `<div class="stat-card"><div class="stat-value" style="color:var(--info)">${configured}</div><div class="stat-label">Konfigurálva</div></div>` : ''}
       ${needsAuth ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${needsAuth}</div><div class="stat-label">Auth szükséges</div></div>` : ''}
       ${failed ? `<div class="stat-card"><div class="stat-value" style="color:var(--danger)">${failed}</div><div class="stat-label">Hibás</div></div>` : ''}
     `
@@ -6296,8 +6626,8 @@ async function openConnectorDetail(connector) {
         assignedAgents.add(c.scope.replace('agent:', ''))
       }
     }
-    const mainAgent = allAgents.find(a => a.name === 'marveen')
-    const subAgents = allAgents.filter(a => a.name !== 'marveen')
+    const mainAgent = allAgents.find(a => a.name === mainAgentId())
+    const subAgents = allAgents.filter(a => a.name !== mainAgentId())
 
     const listEl = document.getElementById('connectorAgentList')
     listEl.innerHTML = ''
@@ -6477,14 +6807,14 @@ function escapeHtml(str) {
 // === Status ===
 // ============================================================
 
-const CLAUDE_SERVICES = [
-  { name: 'claude.ai', label: 'Claude.ai' },
-  { name: 'api', label: 'Claude API' },
-  { name: 'code', label: 'Claude Code' },
-  { name: 'platform', label: 'Platform' },
-  { name: 'cowork', label: 'Claude Cowork' },
-  { name: 'gov', label: 'Claude for Gov' },
-]
+// Statuspage component status -> short Hungarian label for non-operational states.
+const STATUS_COMPONENT_LABELS = {
+  operational: 'működik',
+  degraded_performance: 'lassú',
+  partial_outage: 'részleges kimaradás',
+  major_outage: 'kimaradás',
+  under_maintenance: 'karbantartás',
+}
 
 document.getElementById('refreshStatusBtn').addEventListener('click', loadStatus)
 
@@ -6511,20 +6841,25 @@ async function loadStatus() {
     overallEl.className = `status-overall ${data.overall}`
     overallEl.textContent = overallLabels[data.overall] || data.overall
 
-    // Services grid (static list with status derived from incidents)
-    const activeIssues = data.incidents.filter(i => i.status !== 'resolved')
-    for (const svc of CLAUDE_SERVICES) {
-      const affected = activeIssues.some(i =>
-        i.title.toLowerCase().includes(svc.name) ||
-        i.description.toLowerCase().includes(svc.name)
-      )
-      const div = document.createElement('div')
-      div.className = 'status-service'
-      div.innerHTML = `
-        <div class="status-service-dot ${affected ? 'degraded' : 'operational'}"></div>
-        <span class="status-service-name">${escapeHtml(svc.label)}</span>
-      `
-      gridEl.appendChild(div)
+    // Services grid: real per-service status from the Statuspage components API
+    // (data.components). No more inventing a service list and substring-matching
+    // incident text -- if the components feed is unavailable we say so honestly
+    // instead of rendering a fake all-green grid.
+    const components = Array.isArray(data.components) ? data.components : []
+    if (components.length === 0) {
+      gridEl.innerHTML = '<div class="status-service-empty" style="color:var(--text-muted);font-size:13px">Nincs per-szolgáltatás adat (a komponens-státusz nem elérhető).</div>'
+    } else {
+      for (const c of components) {
+        const ok = c.status === 'operational'
+        const div = document.createElement('div')
+        div.className = 'status-service'
+        div.innerHTML = `
+          <div class="status-service-dot ${ok ? 'operational' : 'degraded'}"></div>
+          <span class="status-service-name">${escapeHtml(c.name)}</span>
+          ${ok ? '' : `<span class="status-service-state" style="margin-left:auto;font-size:11px;color:var(--text-muted)">${escapeHtml(STATUS_COMPONENT_LABELS[c.status] || c.status)}</span>`}
+        `
+        gridEl.appendChild(div)
+      }
     }
 
     // Incidents
@@ -6682,7 +7017,7 @@ memImportSaveBtn.addEventListener('click', async () => {
 
     memImportStatus.textContent = `${allChunks.length} chunk kategorizálása és importálása...`
 
-    const agentId = document.getElementById('memImportAgent').value || 'marveen'
+    const agentId = document.getElementById('memImportAgent').value || mainAgentId()
     const resp = await fetch('/api/memories/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -6742,7 +7077,6 @@ async function loadMigrateAgents() {
 // Step 1: Scan
 document.getElementById('migrateScanBtn').addEventListener('click', async () => {
   const path = document.getElementById('migratePath').value.trim()
-  const type = document.getElementById('migrateType').value
   if (!path) { document.getElementById('migratePath').focus(); return }
 
   const btn = document.getElementById('migrateScanBtn')
@@ -6754,7 +7088,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
     const res = await fetch('/api/migrate/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourcePath: path, sourceType: type }),
+      body: JSON.stringify({ sourcePath: path }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Hiba')
@@ -7126,6 +7460,356 @@ function renderTeamGraph(container, data) {
 
 const refreshTeamBtn = document.getElementById('refreshTeamBtn')
 if (refreshTeamBtn) refreshTeamBtn.addEventListener('click', loadTeamGraph)
+
+// === Team: inter-agent message log + compose ===
+// View the /api/messages queue and let the operator send a message to an agent
+// from the dashboard. Targets come from /api/schedules/agents (the same allowed
+// agent list the scheduler uses) -- never a free-text target. The sender is the
+// owner (resolved by type from /api/kanban/assignees), so the receiving agent
+// sees a message from Gábor, not a spoofable string. /api/messages sits behind
+// the dashboard bearer token + Cloudflare Access.
+const MSG_STATUS_META = {
+  pending: { label: 'függőben', cls: 'badge-warm' },
+  delivered: { label: 'kézbesítve', cls: 'badge-active' },
+  done: { label: 'kész', cls: 'badge-active' },
+  failed: { label: 'hibás', cls: 'badge-paused' },
+}
+async function resolveOwnerName() {
+  try {
+    const res = await fetch('/api/kanban/assignees')
+    if (res.ok) {
+      const list = await res.json()
+      const owner = Array.isArray(list) ? list.find(a => a.type === 'owner') : null
+      if (owner && owner.name) return owner.name
+    }
+  } catch { /* fall through */ }
+  return 'owner'
+}
+
+// === Messages page ===
+// chatAgentHasAvatar: populated from /api/agents during loadChatAgentList
+const chatAgentHasAvatar = new Map() // name -> true|false
+let chatSelectedAgent = null
+
+function chatMonogramEl(agentName, size) {
+  const letter = agentName.charAt(0).toUpperCase()
+  const colors = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899']
+  const color = colors[agentName.split('').reduce((a,c)=>a+c.charCodeAt(0),0) % colors.length]
+  return `<div class="chat-avatar chat-avatar-mono" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.round(size*0.4)}px">${letter}</div>`
+}
+
+// Global onerror handler — avoids HTML-in-attribute escaping issues
+window.chatImgError = function(img) {
+  const name = img.getAttribute('data-agent-name') || img.alt || '?'
+  const size = parseInt(img.width) || 32
+  const letter = name.charAt(0).toUpperCase()
+  const colors = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899']
+  const color = colors[name.split('').reduce((a,c)=>a+c.charCodeAt(0),0) % colors.length]
+  const div = document.createElement('div')
+  div.className = 'chat-avatar chat-avatar-mono'
+  div.style.cssText = `width:${size}px;height:${size}px;background:${color};font-size:${Math.round(size*0.4)}px`
+  div.textContent = letter
+  img.replaceWith(div)
+}
+
+function chatAvatarHtml(agentName, size = 32) {
+  const lower = agentName.toLowerCase()
+  const hasAvatar = chatAgentHasAvatar.get(lower)
+  if (!hasAvatar) return chatMonogramEl(agentName, size)
+  const src = lower === mainAgentId().toLowerCase()
+    ? `/api/marveen/avatar?t=${Date.now()}`
+    : `/api/agents/${encodeURIComponent(lower)}/avatar?t=${Date.now()}`
+  return `<img class="chat-avatar" src="${src}" width="${size}" height="${size}" alt="${escapeHtml(agentName)}" data-agent-name="${escapeHtml(agentName)}" onerror="chatImgError(this)">`
+}
+
+async function loadMessagesPage() {
+  await loadChatAgentList()
+}
+
+const CHAT_SYSTEM_AGENTS = new Set(['heartbeat','telegram-coordinator','channel-coordinator'])
+const CHAT_OWNER_AGENT = 'Szabolcs' // pinned to top; display label overridden
+
+function chatLastSeenKey(agentName) { return 'chat_last_seen_' + agentName }
+function chatGetLastSeen(agentName) { return parseInt(localStorage.getItem(chatLastSeenKey(agentName)) || '0', 10) }
+function chatMarkSeen(agentName, maxId) {
+  if (maxId > chatGetLastSeen(agentName)) localStorage.setItem(chatLastSeenKey(agentName), String(maxId))
+}
+function chatIsUnread(agentName, threadInfo) {
+  if (agentName !== CHAT_OWNER_AGENT) return false
+  if (!threadInfo?.lastMsg) return false
+  return threadInfo.lastMsg.id > chatGetLastSeen(agentName)
+}
+
+async function loadChatAgentList() {
+  const sidebar = document.getElementById('chatAgentList')
+  if (!sidebar) return
+  try {
+    // Load fleet agents + threads in parallel
+    const [agentsRes, threadsRes] = await Promise.all([
+      fetch('/api/agents'),
+      fetch('/api/messages/threads'),
+    ])
+    const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
+    const threads = threadsRes.ok ? await threadsRes.json() : []
+
+    // Build fleet list: API agents + marveen, minus system agents
+    const fleetNames = [mainAgentId(), ...agentsRaw.map(a => a.name || a)]
+      .filter(n => !CHAT_SYSTEM_AGENTS.has(n))
+      .filter((n, i, arr) => arr.indexOf(n) === i)
+
+    // Populate avatar map from API data
+    chatAgentHasAvatar.clear()
+    chatAgentHasAvatar.set(mainAgentId(), true)
+    for (const a of agentsRaw) {
+      if (a.name) chatAgentHasAvatar.set(a.name, !!a.hasAvatar)
+    }
+
+    // Build index from /api/messages/threads (per-agent, no global-window bug)
+    const threadIndex = new Map() // agentName -> {lastMessage, count}
+    for (const t of threads) {
+      if (t.agent) threadIndex.set(t.agent, { lastMsg: t.lastMessage, count: t.count || 0 })
+    }
+    // Also include thread agents not in fleet (e.g. Szabolcs/owner direct msgs)
+    for (const t of threads) {
+      if (t.agent && !fleetNames.includes(t.agent) && !CHAT_SYSTEM_AGENTS.has(t.agent)) {
+        fleetNames.push(t.agent)
+      }
+    }
+
+    // Sort: owner pinned first, then agents with messages by recency, rest alphabetical
+    const sorted = [...fleetNames].sort((a, b) => {
+      if (a === CHAT_OWNER_AGENT) return -1
+      if (b === CHAT_OWNER_AGENT) return 1
+      const aHas = threadIndex.has(a), bHas = threadIndex.has(b)
+      if (aHas && !bHas) return -1
+      if (!aHas && bHas) return 1
+      if (aHas && bHas) {
+        const aTime = threadIndex.get(a).lastMsg?.created_at || 0
+        const bTime = threadIndex.get(b).lastMsg?.created_at || 0
+        return bTime - aTime
+      }
+      return a.localeCompare(b)
+    })
+
+    sidebar.innerHTML = sorted.map(name => {
+      const info = threadIndex.get(name)
+      const lm = info?.lastMsg
+      const when = lm?.created_at ? new Date(lm.created_at * 1000).toLocaleTimeString('hu-HU', {hour:'2-digit',minute:'2-digit'}) : ''
+      const preview = lm ? (lm.content || '').replace(/\n/g,' ').slice(0, 60) : 'Nincs üzenet'
+      const isSelected = name === chatSelectedAgent ? ' selected' : ''
+      const dimmed = info ? '' : ' style="opacity:0.5"'
+      const unread = chatIsUnread(name, info)
+      const displayName = name === CHAT_OWNER_AGENT ? 'Szabolcs (te)' : name
+      return `<div class="chat-agent-item${isSelected}${unread ? ' unread' : ''}" data-agent="${escapeHtml(name)}"${dimmed}>
+        <div class="chat-agent-avatar">${chatAvatarHtml(name, 40)}</div>
+        <div class="chat-agent-info">
+          <div class="chat-agent-name">${escapeHtml(displayName)}${unread ? '<span class="chat-unread-dot"></span>' : ''}</div>
+          <div class="chat-agent-preview ${unread ? 'unread-preview' : ''}">${escapeHtml(preview)}</div>
+        </div>
+        <div class="chat-agent-time">${when}</div>
+      </div>`
+    }).join('')
+
+    sidebar.querySelectorAll('.chat-agent-item').forEach(el => {
+      el.addEventListener('click', () => {
+        sidebar.querySelectorAll('.chat-agent-item').forEach(x => x.classList.remove('selected'))
+        el.classList.add('selected')
+        chatSelectedAgent = el.dataset.agent
+        loadChatThread(chatSelectedAgent)
+      })
+    })
+
+    if (!chatSelectedAgent) {
+      const first = sidebar.querySelector('.chat-agent-item')
+      if (first) first.click()
+    }
+  } catch (e) {
+    sidebar.innerHTML = `<div class="chat-sidebar-empty">Hiba: ${escapeHtml(String(e.message||e))}</div>`
+  }
+}
+
+// Pagination state for the open thread
+const chatThreadState = { agent: null, minLoadedId: null, hasMore: true, loading: false }
+const CHAT_PAGE_SIZE = 10
+const CHAT_LOAD_MORE = 20
+
+async function loadChatThread(agentName) {
+  const panel = document.getElementById('chatThreadPanel')
+  if (!panel) return
+
+  chatThreadState.agent = agentName
+  chatThreadState.minLoadedId = null
+  chatThreadState.hasMore = true
+  chatThreadState.loading = false
+
+  const threadDisplayName = agentName === CHAT_OWNER_AGENT ? 'Szabolcs (te)' : agentName
+
+  panel.innerHTML = `
+    <div class="chat-thread-header">
+      ${chatAvatarHtml(agentName, 32)}
+      <span class="chat-thread-title">${escapeHtml(threadDisplayName)}</span>
+      <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread('${escapeHtml(agentName)}')">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
+    </div>
+    <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">Betöltés...</div></div>
+    <div class="chat-compose">
+      <div class="chat-compose-row">
+        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="Üzenet ${escapeHtml(agentName)}-nek..."></textarea>
+        <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">Küldés</button>
+      </div>
+    </div>
+  `
+
+  document.getElementById('chatSendBtn')?.addEventListener('click', () => sendChatMessage(agentName))
+  document.getElementById('chatComposeText')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChatMessage(agentName) }
+  })
+
+  // Initial load
+  await fetchChatPage(agentName, null, CHAT_PAGE_SIZE, 'replace')
+  // Mark thread as read (localStorage last-seen)
+  const threadData = (await fetch('/api/messages/threads').then(r => r.ok ? r.json() : []).catch(() => []))
+    .find(t => t.agent === agentName)
+  if (threadData?.lastMessage?.id) {
+    chatMarkSeen(agentName, threadData.lastMessage.id)
+    // Remove unread indicator from sidebar item
+    document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"]`)?.classList.remove('unread')
+    const dot = document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"] .chat-unread-dot`)
+    if (dot) dot.remove()
+    const preview = document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"] .unread-preview`)
+    if (preview) preview.classList.remove('unread-preview')
+  }
+
+  // Scroll-up pagination handler
+  const bubbles = document.getElementById('chatBubbles')
+  if (bubbles) {
+    bubbles.addEventListener('scroll', () => {
+      if (bubbles.scrollTop < 80 && chatThreadState.hasMore && !chatThreadState.loading
+          && chatThreadState.agent === agentName) {
+        fetchChatPage(agentName, chatThreadState.minLoadedId, CHAT_LOAD_MORE, 'prepend')
+      }
+    })
+  }
+}
+
+function buildBubbleHtml(m) {
+  const isOutgoing = m.from_agent === mainAgentId()
+  const senderName = isOutgoing ? mainAgentId() : m.from_agent
+  const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
+  const statusMeta = MSG_STATUS_META[m.status] || { label: m.status || '', cls: 'badge' }
+  return `<div class="chat-bubble-row ${isOutgoing ? 'outgoing' : 'incoming'}" data-msg-id="${m.id}">
+    ${!isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(senderName, 28)}</div>` : ''}
+    <div class="chat-bubble ${isOutgoing ? 'bubble-out' : 'bubble-in'}">
+      <div class="bubble-meta">
+        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderName)}</span>` : ''}
+        <span class="bubble-id-chip">#${m.id}</span>
+        <span class="badge ${statusMeta.cls}" style="font-size:10px">${escapeHtml(statusMeta.label)}</span>
+      </div>
+      <div class="bubble-text">${escapeHtml(m.content || '')}</div>
+      <div class="bubble-time">${when}</div>
+    </div>
+    ${isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(mainAgentId(), 28)}</div>` : ''}
+  </div>`
+}
+
+async function fetchChatPage(agentName, beforeId, limit, mode) {
+  if (chatThreadState.loading) return
+  chatThreadState.loading = true
+  const container = document.getElementById('chatBubbles')
+  const loadingIndicator = document.getElementById('chatLoadingTop')
+  if (!container) { chatThreadState.loading = false; return }
+  if (loadingIndicator && mode === 'prepend') loadingIndicator.style.display = 'block'
+  try {
+    let url = `/api/messages?agent=${encodeURIComponent(agentName)}&limit=${limit}`
+    if (beforeId) url += `&before=${beforeId}`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const msgs = await res.json()
+    const sorted = Array.isArray(msgs) ? [...msgs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0)) : []
+
+    if (mode === 'replace') {
+      if (sorted.length === 0) {
+        container.innerHTML = '<p class="activity-empty">Nincs üzenet ebben a szálban.</p>'
+      } else {
+        container.innerHTML = '<div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">Betöltés...</div>'
+        container.insertAdjacentHTML('beforeend', sorted.map(buildBubbleHtml).join(''))
+        container.scrollTop = container.scrollHeight
+      }
+      if (sorted.length < limit) chatThreadState.hasMore = false
+    } else { // prepend
+      if (loadingIndicator) loadingIndicator.style.display = 'none'
+      if (!sorted.length) { chatThreadState.hasMore = false; chatThreadState.loading = false; return }
+      if (sorted.length < limit) chatThreadState.hasMore = false
+      const prevHeight = container.scrollHeight
+      const indicator = document.getElementById('chatLoadingTop')
+      const html = sorted.map(buildBubbleHtml).join('')
+      if (indicator) {
+        indicator.insertAdjacentHTML('afterend', html)
+      } else {
+        container.insertAdjacentHTML('afterbegin', html)
+      }
+      // Restore scroll position so view doesn't jump
+      container.scrollTop = container.scrollHeight - prevHeight
+    }
+
+    if (sorted.length > 0) {
+      const minId = Math.min(...sorted.map(m => m.id))
+      if (chatThreadState.minLoadedId === null || minId < chatThreadState.minLoadedId) {
+        chatThreadState.minLoadedId = minId
+      }
+    }
+  } catch (e) {
+    if (loadingIndicator) loadingIndicator.style.display = 'none'
+    if (mode === 'replace') {
+      container.innerHTML = `<p class="activity-empty">Hiba: ${escapeHtml(String(e.message||e))}</p>`
+    }
+  } finally {
+    chatThreadState.loading = false
+  }
+}
+
+function renderChatBubbles(msgs, agentName) {
+  const container = document.getElementById('chatBubbles')
+  if (!container) return
+  if (!msgs || msgs.length === 0) {
+    container.innerHTML = '<p class="activity-empty">Nincs üzenet ebben a szálban.</p>'
+    return
+  }
+  const sorted = [...msgs].sort((a,b) => (a.created_at||0) - (b.created_at||0))
+  container.innerHTML = sorted.map(buildBubbleHtml).join('')
+  container.scrollTop = container.scrollHeight
+}
+
+async function sendChatMessage(toAgent) {
+  const textarea = document.getElementById('chatComposeText')
+  const btn = document.getElementById('chatSendBtn')
+  const content = textarea?.value?.trim()
+  if (!content) { textarea?.focus(); return }
+  if (btn) btn.disabled = true
+  try {
+    const from = await resolveOwnerName()
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: toAgent, content }),
+    })
+    if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Hiba') }
+    if (textarea) textarea.value = ''
+    showToast('Üzenet elküldve')
+    await loadChatThread(toAgent)
+    await loadChatAgentList()
+  } catch (e) {
+    showToast('Hiba: ' + (e.message || e))
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+document.getElementById('chatRefreshBtn')?.addEventListener('click', () => {
+  loadChatAgentList()
+  if (chatSelectedAgent) loadChatThread(chatSelectedAgent)
+})
 
 function renderTeamEditor(agent, allAgents) {
   const team = agent.team || { role: 'member', reportsTo: null, delegatesTo: [], autoDelegation: false, trustFrom: [] }
@@ -7606,7 +8290,7 @@ loadAvailableModels()
 // secret-et tud felvenni, és visszatérve frissítjük a model listát.
 document.getElementById('deepseekConfigLink')?.addEventListener('click', (e) => {
   e.preventDefault()
-  switchPage('vault')
+  location.hash = 'vault'
 })
 
 // === Sudo modal for managed-settings.json (Slack setup pre-flight) ===
@@ -7768,6 +8452,9 @@ async function loadRecallPage() {
     document.getElementById('recallBtn').addEventListener('click', doRecall)
     document.getElementById('recallExpr').addEventListener('keydown', e => { if (e.key === 'Enter') doRecall() })
     document.getElementById('recallSearch').addEventListener('keydown', e => { if (e.key === 'Enter') doRecall() })
+    // Re-fetch per-agent log dates when the agent filter changes; without this
+    // the date hint stayed stuck on the agent active at first page load.
+    document.getElementById('recallAgent').addEventListener('change', loadRecallDates)
 
     loadRecallDates()
   }
@@ -7904,14 +8591,17 @@ async function loadBgTasksPage() {
   if (!bgInitialized) {
     bgInitialized = true
     try {
-      const res = await fetch('/api/agents')
+      // Use /api/schedules/agents (not /api/agents) so the main agent is a
+      // selectable background-task target too -- /api/agents lists sub-agents
+      // only, while the backend (spawnBackgroundTask) accepts any agent_id.
+      const res = await fetch('/api/schedules/agents')
       if (res.ok) {
         const agents = await res.json()
         const sel = document.getElementById('bgAgent')
         agents.forEach(a => {
           const opt = document.createElement('option')
           opt.value = a.name
-          opt.textContent = a.name
+          opt.textContent = a.label || a.name
           sel.appendChild(opt)
         })
         if (agents.length === 1) sel.value = agents[0].name
@@ -8995,9 +9685,12 @@ function renderIdeaCard(idea) {
         </div>
         ${desc}
       </div>
-      <div style="display:flex;gap:4px;flex-shrink:0">
+      <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
+        ${idea.status !== 'reviewed' && idea.status !== 'kanban' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','reviewed')" style="font-size:11px">Átnézve</button>` : ''}
+        ${idea.status !== 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','rejected')" style="font-size:11px;color:#ef4444">Elutasít</button>` : ''}
+        ${idea.status === 'reviewed' || idea.status === 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','new')" style="font-size:11px">Újra</button>` : ''}
         <button class="btn-secondary btn-compact" onclick="openIdeaEdit('${idea.id}')" style="font-size:11px">Szerkeszt</button>
-        <button class="btn-primary btn-compact" onclick="openIdeaPromote('${idea.id}')" style="font-size:11px">Kanban</button>
+        ${idea.status !== 'kanban' && idea.status !== 'rejected' ? `<button class="btn-primary btn-compact" onclick="openIdeaBreakdown('${idea.id}')" style="font-size:11px">Kanbanra (AI)</button>` : ''}
         <button class="btn-secondary btn-compact" onclick="deleteIdeaItem('${idea.id}')" style="font-size:11px;color:#ef4444">Töröl</button>
       </div>
     </div>
@@ -9009,7 +9702,7 @@ function openIdeaNew() {
   document.getElementById('ideaModalTitle').textContent = 'Új ötlet'
   document.getElementById('ideaTitleInput').value = ''
   document.getElementById('ideaDescInput').value = ''
-  document.getElementById('ideaModalOverlay').hidden = false
+  openModal(document.getElementById('ideaModalOverlay'))
 }
 
 function openIdeaEdit(id) {
@@ -9020,7 +9713,7 @@ function openIdeaEdit(id) {
   document.getElementById('ideaTitleInput').value = idea.title
   document.getElementById('ideaDescInput').value = idea.description || ''
   document.getElementById('ideaCategoryInput').value = idea.category
-  document.getElementById('ideaModalOverlay').hidden = false
+  openModal(document.getElementById('ideaModalOverlay'))
 }
 
 async function saveIdea() {
@@ -9032,7 +9725,7 @@ async function saveIdea() {
   } else {
     await fetch('/api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
   }
-  document.getElementById('ideaModalOverlay').hidden = true
+  closeModal(document.getElementById('ideaModalOverlay'))
   loadIdeasPage()
 }
 
@@ -9044,7 +9737,7 @@ async function deleteIdeaItem(id) {
 
 function openIdeaPromote(id) {
   ideasPromoteId = id
-  document.getElementById('ideaPromoteOverlay').hidden = false
+  openModal(document.getElementById('ideaPromoteOverlay'))
 }
 
 async function promoteIdea(phase) {
@@ -9052,155 +9745,55 @@ async function promoteIdea(phase) {
   const res = await fetch(`/api/ideas/${ideasPromoteId}/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phase }) })
   const data = await res.json()
   ideasPromoteId = null
-  document.getElementById('ideaPromoteOverlay').hidden = true
+  closeModal(document.getElementById('ideaPromoteOverlay'))
   if (data.ok) showToast(`Kanban kártya létrehozva: ${data.kanban_id}`)
   loadIdeasPage()
 }
 
+async function setIdeaStatus(id, status) {
+  try {
+    const res = await fetch(`/api/ideas/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
+    if (!res.ok) { showToast('Státusz mentés hiba'); return }
+    loadIdeasPage()
+  } catch { showToast('Státusz mentés hiba') }
+}
+
+// Promote an idea to the board via AI breakdown + per-subtask approval.
+// Reuses the shared breakdown modal (breakdownMode='idea').
+async function openIdeaBreakdown(id) {
+  const idea = ideas.find(i => i.id === id)
+  if (!idea) return
+  // The breakdown modal's assignee dropdown reads kanbanAssignees, which is only
+  // populated by loadKanban(). If the user lands here without visiting the board,
+  // fetch it so the AI-suggested assignees are selectable.
+  if (!kanbanAssignees.length) {
+    try { kanbanAssignees = await (await fetch('/api/kanban/assignees')).json() } catch { /* dropdown falls back to "nincs" */ }
+  }
+  showToast('AI kidolgozza az ötletet...')
+  try {
+    const res = await fetch(`/api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+    const data = await res.json()
+    if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
+    if (!data.subtasks || !data.subtasks.length) { showToast('Az AI nem adott vissza alfeladatot'); return }
+    breakdownMode = 'idea'
+    breakdownIdeaId = id
+    breakdownSubtasks = data.subtasks
+    showBreakdownModal(data.subtasks, { title: idea.title })
+  } catch {
+    showToast('Breakdown hiba')
+  }
+}
+
 document.getElementById('ideaNewBtn')?.addEventListener('click', openIdeaNew)
-document.getElementById('ideaModalClose')?.addEventListener('click', () => { document.getElementById('ideaModalOverlay').hidden = true })
-document.getElementById('ideaModalCancel')?.addEventListener('click', () => { document.getElementById('ideaModalOverlay').hidden = true })
+document.getElementById('ideaModalClose')?.addEventListener('click', () => { closeModal(document.getElementById('ideaModalOverlay')) })
+document.getElementById('ideaModalCancel')?.addEventListener('click', () => { closeModal(document.getElementById('ideaModalOverlay')) })
 document.getElementById('ideaModalSave')?.addEventListener('click', saveIdea)
-document.getElementById('ideaPromoteClose')?.addEventListener('click', () => { document.getElementById('ideaPromoteOverlay').hidden = true })
-document.getElementById('ideaPromoteCancel')?.addEventListener('click', () => { document.getElementById('ideaPromoteOverlay').hidden = true })
+document.getElementById('ideaPromoteClose')?.addEventListener('click', () => { closeModal(document.getElementById('ideaPromoteOverlay')) })
+document.getElementById('ideaPromoteCancel')?.addEventListener('click', () => { closeModal(document.getElementById('ideaPromoteOverlay')) })
 document.getElementById('ideaPromoteDetail')?.addEventListener('click', () => promoteIdea('detail'))
 document.getElementById('ideaPromotePlan')?.addEventListener('click', () => promoteIdea('plan'))
 document.getElementById('ideaStatusFilter')?.addEventListener('change', loadIdeasPage)
 document.getElementById('ideaCategoryFilter')?.addEventListener('change', loadIdeasPage)
-
-// ============================================================
-// Workflow Recordings
-// ============================================================
-let workflows = []
-let workflowEditId = null
-
-async function loadWorkflowsPage() {
-  const q = document.getElementById('workflowSearchInput')?.value?.trim() || ''
-  const url = q ? `/api/workflow-recordings?q=${encodeURIComponent(q)}` : '/api/workflow-recordings'
-  const res = await fetch(url)
-  workflows = await res.json()
-  renderWorkflowStats()
-  renderWorkflowList()
-}
-
-function renderWorkflowStats() {
-  const el = document.getElementById('workflowStats')
-  if (!el) return
-  const total = workflows.length
-  const totalRuns = workflows.reduce((s, w) => s + (w.run_count || 0), 0)
-  const totalSuccess = workflows.reduce((s, w) => s + (w.success_count || 0), 0)
-  const rate = totalRuns > 0 ? Math.round(totalSuccess / totalRuns * 100) : 0
-  el.innerHTML = [
-    { label: 'Workflow', value: total, color: 'var(--accent)' },
-    { label: 'Futtatás', value: totalRuns, color: 'var(--text)' },
-    { label: 'Sikerráta', value: totalRuns > 0 ? rate + '%' : '–', color: rate >= 80 ? '#22c55e' : '#f59e0b' },
-  ].map(s => `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 16px;min-width:90px">
-    <div style="font-size:22px;font-weight:700;color:${s.color}">${s.value}</div>
-    <div style="font-size:12px;color:var(--text-muted)">${s.label}</div>
-  </div>`).join('')
-}
-
-function renderWorkflowList() {
-  const el = document.getElementById('workflowList')
-  if (!el) return
-  if (!workflows.length) { el.innerHTML = '<div style="color:var(--text-muted);padding:32px;text-align:center">Nincs elmentett workflow</div>'; return }
-  el.innerHTML = workflows.map(w => {
-    const steps = (() => { try { return JSON.parse(w.steps_json) } catch { return [] } })()
-    const rate = w.run_count > 0 ? Math.round(w.success_count / w.run_count * 100) : null
-    const rateHtml = rate !== null ? `<span style="font-size:11px;color:${rate >= 80 ? '#22c55e' : '#f59e0b'}">${rate}% siker (${w.run_count}x)</span>` : `<span style="font-size:11px;color:var(--text-muted)">Még nem futott</span>`
-    const branchStats = (() => { try { return JSON.parse(w.branch_stats_json || '{}') } catch { return {} } })()
-    const branchStatsHtml = Object.keys(branchStats).length ? `
-      <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">
-        ${Object.entries(branchStats).map(([bId, bs]) => {
-          const br = bs
-          const bRate = br.runs > 0 ? Math.round(br.successes / br.runs * 100) : 0
-          const bColor = bRate >= 80 ? '#22c55e' : '#f59e0b'
-          return `<span style="font-size:10px;background:var(--surface-2,var(--surface));border:1px solid var(--border);border-radius:4px;padding:2px 6px">
-            <span style="color:var(--text-muted)">${escapeHtml(bId)}:</span> <span style="color:${bColor}">${bRate}%</span> <span style="color:var(--text-muted)">(${br.successes}/${br.runs})</span>
-          </span>`
-        }).join('')}
-      </div>` : ''
-    const kw = w.trigger_keywords ? `<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Triggerek: ${escapeHtml(w.trigger_keywords)}</div>` : ''
-    const stepTypeColor = { command: 'var(--accent)', decision: '#f59e0b', recovery: '#ef4444' }
-    const stepTypeLabel = { command: '⚙', decision: '⤷', recovery: '↺' }
-    const stepsHtml = steps.length ? `<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">${steps.map((s, i) => {
-      const typeColor = stepTypeColor[s.type] || 'var(--accent)'
-      const typeIcon = stepTypeLabel[s.type] || ''
-      const onFail = s.on_failure ? `<span style="font-size:10px;color:#ef4444;margin-left:4px">→ ${escapeHtml(s.on_failure)}</span>` : ''
-      const branches = s.branches ? `<div style="font-size:10px;color:var(--text-muted);margin-left:22px">${Object.entries(s.branches).map(([k, v]) => `${escapeHtml(k)}: [${v.join(', ')}]`).join(' | ')}</div>` : ''
-      return `<div style="font-size:12px;color:var(--text-muted);display:flex;gap:6px;flex-wrap:wrap">
-        <span style="opacity:.4;min-width:16px">${s.id || (i + 1) + '.'}</span>
-        <span><strong style="font-size:11px;color:${typeColor}">${typeIcon}${escapeHtml(s.tool || s.action || '')}</strong> — ${escapeHtml(s.description || s.action || '')}${onFail}</span>
-      </div>${branches}`
-    }).join('')}</div>` : ''
-    return `<div class="card" style="padding:14px 16px">
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
-        <div style="flex:1;min-width:0">
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-            <span style="font-weight:600;font-size:14px">${escapeHtml(w.name)}</span>${rateHtml}
-          </div>
-          ${w.description ? `<div style="font-size:13px;color:var(--text-muted);margin-top:2px">${escapeHtml(w.description)}</div>` : ''}
-          ${kw}${branchStatsHtml}${stepsHtml}
-        </div>
-        <div style="display:flex;gap:6px;flex-shrink:0">
-          <button class="btn-secondary btn-compact" onclick="openWorkflowEdit('${w.id}')" style="font-size:12px">Szerkeszt</button>
-          <button class="btn-secondary btn-compact" onclick="deleteWorkflow('${w.id}')" style="font-size:12px;color:#ef4444">Töröl</button>
-        </div>
-      </div>
-    </div>`
-  }).join('')
-}
-
-function openWorkflowNew() {
-  workflowEditId = null
-  document.getElementById('workflowModalTitle').textContent = 'Új workflow'
-  document.getElementById('workflowNameInput').value = ''
-  document.getElementById('workflowDescInput').value = ''
-  document.getElementById('workflowKeywordsInput').value = ''
-  document.getElementById('workflowTriggerDescInput').value = ''
-  document.getElementById('workflowStepsInput').value = '[]'
-  document.getElementById('workflowModalOverlay').hidden = false
-}
-
-function openWorkflowEdit(id) {
-  const w = workflows.find(x => x.id === id)
-  if (!w) return
-  workflowEditId = id
-  document.getElementById('workflowModalTitle').textContent = 'Workflow szerkesztése'
-  document.getElementById('workflowNameInput').value = w.name
-  document.getElementById('workflowDescInput').value = w.description || ''
-  document.getElementById('workflowKeywordsInput').value = w.trigger_keywords || ''
-  document.getElementById('workflowTriggerDescInput').value = w.trigger_description || ''
-  document.getElementById('workflowStepsInput').value = w.steps_json || '[]'
-  document.getElementById('workflowModalOverlay').hidden = false
-}
-
-async function saveWorkflow() {
-  const name = document.getElementById('workflowNameInput').value.trim()
-  if (!name) { showToast('Név kötelező', 'error'); return }
-  let steps
-  try { steps = JSON.parse(document.getElementById('workflowStepsInput').value) } catch { showToast('Érvénytelen JSON', 'error'); return }
-  const body = { name, description: document.getElementById('workflowDescInput').value.trim() || undefined, trigger_keywords: document.getElementById('workflowKeywordsInput').value.trim(), trigger_description: document.getElementById('workflowTriggerDescInput').value.trim() || undefined, steps }
-  if (workflowEditId) {
-    await fetch(`/api/workflow-recordings/${workflowEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  } else {
-    await fetch('/api/workflow-recordings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  }
-  document.getElementById('workflowModalOverlay').hidden = true
-  loadWorkflowsPage()
-}
-
-async function deleteWorkflow(id) {
-  if (!confirm('Biztosan törlöd?')) return
-  await fetch(`/api/workflow-recordings/${id}`, { method: 'DELETE' })
-  loadWorkflowsPage()
-}
-
-document.getElementById('workflowNewBtn')?.addEventListener('click', openWorkflowNew)
-document.getElementById('workflowModalClose')?.addEventListener('click', () => { document.getElementById('workflowModalOverlay').hidden = true })
-document.getElementById('workflowModalCancel')?.addEventListener('click', () => { document.getElementById('workflowModalOverlay').hidden = true })
-document.getElementById('workflowModalSave')?.addEventListener('click', saveWorkflow)
-document.getElementById('workflowSearchInput')?.addEventListener('input', () => loadWorkflowsPage())
 
 // ============================================================
 // === Session Context Page ===
@@ -9617,7 +10210,134 @@ async function loadRecordingsPage() {
   } catch (e) { listEl.innerHTML = `<p class="subtitle">Hiba: ${escapeHtml(String(e))}</p>` }
 }
 
+
+
+// === Agent reauth login flow ===
+async function handleAgentLogin(agentName, btn) {
+  const phase = btn.dataset.phase || 'start'
+  btn.disabled = true
+  const origText = btn.textContent
+  btn.textContent = phase === 'start' ? 'Indítás...' : 'Megerősítés...'
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phase }),
+    })
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || 'HTTP ' + res.status) }
+    if (phase === 'start') {
+      btn.dataset.phase = 'confirm'
+      btn.textContent = 'Auth kész → Megerősít'
+      btn.disabled = false
+      showToast('Auth folyamat elindítva — engedélyezd a böngészőben, majd kattints Megerősít')
+    } else {
+      btn.textContent = 'Bejelentkezve'
+      showToast('Bejelentkezés sikeres')
+      setTimeout(() => loadAgents(), 1500)
+    }
+  } catch (e) {
+    showToast('Hiba: ' + (e.message || e))
+    btn.textContent = origText
+    btn.dataset.phase = 'start'
+    btn.disabled = false
+  }
+}
+
+// === Agent terminal modal (xterm.js) ===
+let terminalInstance = null
+let terminalSSE = null
+let terminalFit = null
+
+function openTerminalModal(agentName) {
+  const overlay = document.getElementById('terminalOverlay')
+  const container = document.getElementById('terminalContainer')
+  const title = document.getElementById('terminalModalTitle')
+  if (!overlay || !container) return
+
+  title.textContent = agentName + ' — Terminal'
+
+  // Cleanup previous
+  if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
+  if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+  container.innerHTML = ''
+
+  // Init xterm — fontSize 12 + wider modal fits ~140 chars of tmux output
+  const term = new window.Terminal({
+    theme: { background: '#1a1a1a', foreground: '#e8e4da' },
+    fontFamily: 'JetBrains Mono, Menlo, monospace',
+    fontSize: 12,
+    cursorBlink: false,
+    disableStdin: false,
+    scrollback: 500,
+    convertEol: true,
+    allowProposedApi: true,
+  })
+  const fitAddon = new window.FitAddon.FitAddon()
+  term.loadAddon(fitAddon)
+  term.open(container)
+  fitAddon.fit()
+  terminalInstance = term
+  terminalFit = fitAddon
+
+  openModal(overlay)
+  setTimeout(() => term.focus(), 50)
+
+  // SSE pane stream
+  const token = localStorage.getItem('marveen-dashboard-token') || ''
+  const sse = new EventSource(`/api/agents/${encodeURIComponent(agentName)}/pane/stream?token=${encodeURIComponent(token)}`)
+  sse.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data)
+      if (msg.pane !== undefined) {
+        const clean = msg.pane.replace(/\x1b]8;[^\x1b]*\x1b\\/g, '')
+        term.write('\x1b[2J\x1b[H' + clean)
+      }
+    } catch {}
+  }
+  sse.onerror = () => term.write('\r\n[stream hiba vagy leállva]\r\n')
+  terminalSSE = sse
+
+  // Single onData handler — maps escape sequences to {special}, plain chars to {keys}
+  // Using onData only (no onKey) avoids double-firing on arrow/Enter keys
+  const ESC_TO_SPECIAL = {
+    '\r': 'Enter', '\x1b': 'Escape',
+    '\x1b[A': 'Up', '\x1b[B': 'Down', '\x1b[C': 'Right', '\x1b[D': 'Left',
+    '\x7f': 'BSpace', '\t': 'Tab', '\x1b[Z': 'S-Tab',
+    '\x03': 'C-c', '\x04': 'C-d', '\x15': 'C-u', '\x0c': 'C-l',
+    '\x1b[5~': 'PageUp', '\x1b[6~': 'PageDown',
+  }
+  term.onData(data => {
+    const special = ESC_TO_SPECIAL[data]
+    const body = special ? { special } : { keys: data }
+    fetch(`/api/agents/${encodeURIComponent(agentName)}/keys`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {})
+  })
+
+  // Resize fit on modal resize — observe the modal wrapper (not the xterm container
+  // itself) to avoid a ResizeObserver->fit->resize->ResizeObserver infinite loop
+  let fitTimer = null
+  const ro = new ResizeObserver(() => {
+    clearTimeout(fitTimer)
+    fitTimer = setTimeout(() => { try { fitAddon.fit() } catch {} }, 50)
+  })
+  const modalEl = container.closest('.terminal-modal') || container.parentElement
+  if (modalEl) ro.observe(modalEl)
+}
+
+document.getElementById('terminalClose')?.addEventListener('click', () => {
+  const overlay = document.getElementById('terminalOverlay')
+  if (overlay) closeModal(overlay)
+  if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
+  if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+})
 ;(() => {
-  const p = new URLSearchParams(window.location.search).get('page')
-  if (p) switchPage(p)
+  function routeFromHash() {
+    let pageId = decodeURIComponent((location.hash || '').replace(/^#/, ''))
+    if (!pageId) pageId = new URLSearchParams(window.location.search).get('page') || ''
+    if (pageId && document.getElementById(pageId + 'Page')) switchPage(pageId)
+  }
+  window.addEventListener('hashchange', routeFromHash)
+  routeFromHash()
 })()

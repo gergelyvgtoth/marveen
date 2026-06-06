@@ -1,6 +1,15 @@
 ﻿# Marveen - Windows telepítő (WSL alapú)
 # Futtatás: PowerShell-ben: .\install-windows.ps1
 
+# NOTE: wsl.exe emits its output as UTF-16LE, so PowerShell captures each char
+# followed by a \0 byte ("U\0b\0u\0n\0t\0u\0"). `-match "Ubuntu"` then fails ->
+# the script thinks Ubuntu is missing, re-runs `wsl --install -d Ubuntu` and
+# exits EVERY time, never reaching [3/5] (2026-06-04 re-entry bug, kártya
+# 3BB2E738). Fix: strip the stray \0 from wsl output before matching (see the
+# `-replace "`0", ""` at each wsl-capture site below). We intentionally do NOT
+# touch [Console]::OutputEncoding globally -- that can garble the banner glyphs
+# on Windows PowerShell 5.1; the targeted null-strip is side-effect-free.
+
 Write-Host ""
 Write-Host "  ▐▛███▜▌   Marveen" -ForegroundColor Cyan
 Write-Host " ▝▜█████▛▘  AI csapatod, ami fut amíg te alszol." -ForegroundColor Cyan
@@ -14,7 +23,7 @@ Write-Host "[1/5] WSL ellenőrzés..." -ForegroundColor White
 
 $wslInstalled = $false
 try {
-    $wslOutput = wsl --status 2>&1
+    $wslOutput = (wsl --status 2>&1 | Out-String) -replace "`0", ""
     if ($LASTEXITCODE -eq 0 -or $wslOutput -match "Default Distribution") {
         $wslInstalled = $true
         Write-Host "  ✓ WSL telepítve" -ForegroundColor Green
@@ -47,15 +56,39 @@ if (-not $wslInstalled) {
 Write-Host ""
 Write-Host "[2/5] Linux disztribúció ellenőrzés..." -ForegroundColor White
 
-$distros = wsl --list --quiet 2>&1
+$distros = (wsl --list --quiet 2>&1 | Out-String) -replace "`0", ""
 if ($distros -match "Ubuntu") {
     Write-Host "  ✓ Ubuntu elérhető" -ForegroundColor Green
 } else {
     Write-Host "  Ubuntu telepítése..." -ForegroundColor Yellow
     wsl --install -d Ubuntu
     Write-Host "  ✓ Ubuntu telepítve" -ForegroundColor Green
-    Write-Host "  Hozz létre egy felhasználónevet és jelszót az Ubuntu-ban," -ForegroundColor Yellow
-    Write-Host "  majd futtasd újra ezt a scriptet." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Az Ubuntu első indításakor létre kell hoznod egy Linux" -ForegroundColor Yellow
+    Write-Host "  felhasználónevet és jelszót. Ha a telepítés most rögtön" -ForegroundColor Yellow
+    Write-Host "  megnyitotta az Ubuntu ablakot, állítsd be ott a fiókot." -ForegroundColor Yellow
+    Write-Host ""
+    # Don't dead-end on exit (the old behaviour re-looped here forever). Offer to
+    # continue in the SAME sitting by handing control to install-linux.sh INSIDE
+    # WSL with interactive stdin -- the proven path (kártya 3BB2E738 workaround).
+    $cont = Read-Host "  Folytassam most a telepítést az Ubuntu-ban? (i/n) [i]"
+    if ([string]::IsNullOrEmpty($cont) -or $cont -eq "i") {
+        Write-Host "  Telepítés folytatása az Ubuntu-ban (install-linux.sh)..." -ForegroundColor Cyan
+        # Triggers first-run init if still pending; if the distro needs a reboot
+        # the call fails and we fall through to the manual instructions below.
+        wsl -d Ubuntu -- bash -c "curl -fsSL https://raw.githubusercontent.com/Szotasz/marveen/main/install-linux.sh -o /tmp/marveen-install.sh && bash /tmp/marveen-install.sh"
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host ""
+            Write-Host "  ✓ Marveen telepítve az Ubuntu-ban (install-linux.sh)." -ForegroundColor Green
+            exit 0
+        }
+        Write-Host "  Az automatikus folytatás nem sikerült (lehet hogy újraindítás kell az Ubuntu-hoz)." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Fejezd be így: indítsd el az Ubuntu-t (Start menü -> Ubuntu), állítsd" -ForegroundColor Yellow
+    Write-Host "  be a felhasználót, majd az Ubuntu shellben futtasd:" -ForegroundColor Yellow
+    Write-Host "    curl -fsSL https://raw.githubusercontent.com/Szotasz/marveen/main/install-linux.sh -o install.sh && bash install.sh" -ForegroundColor Cyan
+    Write-Host "  (vagy indítsd újra ezt a PowerShell scriptet, ha kell a gép-újraindítás)" -ForegroundColor DarkGray
     exit 0
 }
 

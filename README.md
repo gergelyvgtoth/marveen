@@ -83,6 +83,12 @@ cd marveen
 
 A Windows telepítő automatikusan beállítja a WSL-t (Windows Subsystem for Linux) és azon belül telepíti a Marveen-t.
 
+> **Ha a PowerShell ablak bezárul / a telepítő nem jut túl a WSL+Ubuntu lépésen:** nyisd meg az Ubuntu-t (Start menü → Ubuntu), majd a WSL Ubuntu shellben futtasd közvetlenül a Linux-telepítőt (a PowerShell wrapper megkerülése):
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/Szotasz/marveen/main/install-linux.sh -o install.sh && bash install.sh
+> ```
+> Ez a megbízható út, ha a `wsl.exe`/Windows-claude környezet összeakad.
+
 A telepítő végigvezet a beállításokon:
 1. Függőségek ellenőrzése és telepítése
 2. Claude Code bejelentkezés

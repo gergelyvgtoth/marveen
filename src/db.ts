@@ -29,20 +29,26 @@ function tightenDbPermissions(dbPath: string): void {
   }
 }
 
-export function initDatabase(): void {
-  mkdirSync(STORE_DIR, { recursive: true })
+// dbPathOverride is for tests: pass ':memory:' (or a temp path) to open an
+// isolated database instead of the real store/claudeclaw.db. The file-precreate
+// (openSync 'wx') and tightenDbPermissions steps are SKIPPED for an override --
+// they only make sense for a real on-disk store file, and ':memory:' has no path
+// to chmod. This keeps tests idempotent and stops them polluting the prod DB.
+export function initDatabase(dbPathOverride?: string): void {
+  const useOverride = dbPathOverride !== undefined
+  if (!useOverride) mkdirSync(STORE_DIR, { recursive: true })
   // Idempotent re-init: close a previous handle before opening a new one
   // so repeated calls (tests, hot-reload, recovery paths) do not leak
   // the old better-sqlite3 fd.
   if (db) {
     try { db.close() } catch { /* already closed */ }
   }
-  const dbPath = join(STORE_DIR, DB_FILENAME)
+  const dbPath = useOverride ? dbPathOverride! : join(STORE_DIR, DB_FILENAME)
   // Step 1: close the TOCTOU window on fresh installs. openSync with 'wx'
   // + 0o600 creates the file ONLY if it doesn't exist and sets the strict
   // mode atomically. better-sqlite3 then opens the existing file rather
-  // than creating one at the default umask.
-  if (!existsSync(dbPath)) {
+  // than creating one at the default umask. Skipped for a test override.
+  if (!useOverride && !existsSync(dbPath)) {
     try {
       closeSync(openSync(dbPath, 'wx', 0o600))
     } catch (err) {
@@ -56,7 +62,7 @@ export function initDatabase(): void {
   }
   db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
-  tightenDbPermissions(dbPath)
+  if (!useOverride) tightenDbPermissions(dbPath)
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -160,6 +166,8 @@ export function initDatabase(): void {
     // column already exists
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)')
+  // Migration: add dispatched_at to kanban_cards (kanban -> agent dispatch
+  // once-only guard). Older installs created the table without it.
   try {
     db.exec('ALTER TABLE kanban_cards ADD COLUMN dispatched_at INTEGER')
   } catch {
@@ -183,6 +191,33 @@ export function initDatabase(): void {
   }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id, category)`)
+
+  // --- Conversation-continuity ledger (deterministic; P0 2026-06-02) ---
+  // A durable ROLLING TRANSCRIPT of every channel turn -- inbound user messages
+  // AND outbound replies -- per agent_id + chat_id. On a respawn (a fresh
+  // --channels session with no memory of the live conversation) the SessionStart
+  // replay hook injects the last ~20 turns of context PLUS highlights the open
+  // question (the most recent inbound with no later outbound), so the fresh
+  // session continues exactly where the connection dropped -- ZERO agent
+  // discretion. Generic across all three channel agents (marveen/dia/erno-ba);
+  // agent_id is derived from the session cwd so each session only sees its own
+  // chat. Written by the settings.json hooks (UserPromptSubmit capture +
+  // PostToolUse outbound). UNIQUE(...) makes inbound capture idempotent; outbound
+  // rows carry message_id=NULL so they are never deduped against each other.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+      message_id TEXT,
+      text TEXT,
+      ts TEXT,
+      created_at INTEGER NOT NULL,
+      UNIQUE(agent_id, chat_id, direction, message_id)
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_convlog_agent ON conversation_log(agent_id, created_at)`)
 
   // Migration: hot/warm/cold/shared tier system with an enforced CHECK.
   // Rebuilds the table whenever its current schema doesn't include the
@@ -1215,6 +1250,9 @@ export function updateTask(id: string, prompt: string, schedule: string, nextRun
 
 export interface KanbanCard {
   id: string
+  // Stable running number derived from the SQLite rowid (insertion order, never
+  // reused) -- a human-friendly "#N" shown next to the 8-char hex id.
+  seq?: number
   title: string
   description: string | null
   status: 'planned' | 'in_progress' | 'waiting' | 'done'
@@ -1227,6 +1265,10 @@ export interface KanbanCard {
   created_at: number
   updated_at: number
   archived_at: number | null
+  // Set the first time the card is moved to in_progress and the assigned agent
+  // is woken (kanban -> agent dispatch). NULL = never dispatched; the once-only
+  // guard so re-dragging a card does not re-prompt the agent.
+  dispatched_at: number | null
 }
 
 export interface KanbanComment {
@@ -1244,7 +1286,7 @@ export function listKanbanCards(): KanbanCard[] {
     "UPDATE kanban_cards SET archived_at = ? WHERE status = 'done' AND archived_at IS NULL AND updated_at < ?"
   ).run(Math.floor(Date.now() / 1000), thirtyDaysAgo)
   return db
-    .prepare('SELECT * FROM kanban_cards WHERE archived_at IS NULL ORDER BY sort_order ASC')
+    .prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE archived_at IS NULL ORDER BY sort_order ASC')
     .all() as KanbanCard[]
 }
 
@@ -1255,7 +1297,7 @@ export function listKanbanCardsSummary(): { status: string; title: string; assig
 }
 
 export function getKanbanCard(id: string): KanbanCard | undefined {
-  return db.prepare('SELECT * FROM kanban_cards WHERE id = ?').get(id) as KanbanCard | undefined
+  return db.prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE id = ?').get(id) as KanbanCard | undefined
 }
 
 export function createKanbanCard(card: {
@@ -1308,6 +1350,13 @@ export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrd
   ).run(status, sortOrder, now, id).changes > 0
 }
 
+// Stamp the once-only kanban -> agent dispatch guard. Returns false if the
+// card id does not exist.
+export function markKanbanCardDispatched(id: string): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare('UPDATE kanban_cards SET dispatched_at=? WHERE id=?').run(now, id).changes > 0
+}
+
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
@@ -1321,8 +1370,22 @@ export function listKanbanProjects(): string[] {
 }
 
 export function deleteKanbanCard(id: string): boolean {
-  db.prepare('DELETE FROM kanban_comments WHERE card_id = ?').run(id)
-  return db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(id).changes > 0
+  // Wrapped in a transaction to ensure atomicity: all three mutations
+  // succeed together or none of them do. Steps in FK-safe order:
+  //   1. Delete comments that reference this card (FK: kanban_comments.card_id).
+  //   2. Null-out child cards that reference this card as their parent
+  //      (FK: kanban_cards.parent_id). Setting parent_id = NULL keeps the
+  //      children alive as root-level cards rather than leaving them with a
+  //      dangling reference. FK enforcement is currently OFF by default
+  //      (better-sqlite3 default), but the dangling parent_id is still a
+  //      data bug -- orphaned children do not appear under any parent and
+  //      are invisible in hierarchy views.
+  //   3. Delete the card itself.
+  return db.transaction((cardId: string) => {
+    db.prepare('DELETE FROM kanban_comments WHERE card_id = ?').run(cardId)
+    db.prepare('UPDATE kanban_cards SET parent_id = NULL WHERE parent_id = ?').run(cardId)
+    return db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId).changes > 0
+  })(id) as boolean
 }
 
 export function getKanbanComments(cardId: string): KanbanComment[] {
@@ -1436,6 +1499,74 @@ export function getAgentActivity(): AgentActivityRow[] {
     GROUP BY agent
     ORDER BY last_active_at DESC
   `).all() as AgentActivityRow[]
+}
+
+// System/automation participants that are not real conversation peers. They are
+// excluded as THREAD rows in the dashboard sidebar (you don't chat with the
+// heartbeat or the coordinator), but messages involving them still count toward
+// the human/agent peer they are paired with (so a thread's count matches what
+// getAgentConversation returns when you open it).
+export const CHAT_SYSTEM_AGENTS = ['heartbeat', 'telegram-coordinator', 'channel-coordinator', 'system'] as const
+
+const AGENT_MESSAGE_LIMIT_CAP = 200
+
+// The actual last-N messages for ONE agent, filtered in SQL (NOT global-last-N
+// then JS-filter -- that starved rarely-active agents' threads, dashboard bug
+// 2026-06-03). `beforeId` pages older: pass the oldest id you already have to
+// fetch the next-older batch (scroll-up pagination). Newest-first.
+export function getAgentConversation(agent: string, limit = 50, beforeId?: number): AgentMessage[] {
+  const cap = Math.min(Math.max(1, Math.floor(limit) || 1), AGENT_MESSAGE_LIMIT_CAP)
+  if (beforeId !== undefined && Number.isFinite(beforeId)) {
+    return db.prepare(
+      'SELECT * FROM agent_messages WHERE (from_agent = ? OR to_agent = ?) AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
+    ).all(agent, agent, beforeId, cap) as AgentMessage[]
+  }
+  return db.prepare(
+    'SELECT * FROM agent_messages WHERE (from_agent = ? OR to_agent = ?) ORDER BY created_at DESC, id DESC LIMIT ?'
+  ).all(agent, agent, cap) as AgentMessage[]
+}
+
+export interface AgentThread {
+  agent: string
+  count: number
+  lastMessage: AgentMessage | null
+}
+
+// One row per distinct conversation peer (from_agent OR to_agent), excluding
+// CHAT_SYSTEM_AGENTS, each with its total message count and its most-recent
+// message. Drives the dashboard sidebar. Recency is computed per-peer (max
+// created_at) so a rarely-active peer's last message is never hidden behind the
+// global recency window (the bug the JS-filter path had). Sorted newest-first.
+export function getAgentConversationThreads(): AgentThread[] {
+  const parties = db.prepare(`
+    WITH parties AS (
+      SELECT from_agent AS agent FROM agent_messages
+      UNION
+      SELECT to_agent AS agent FROM agent_messages
+    )
+    SELECT p.agent AS agent,
+      (SELECT COUNT(*) FROM agent_messages m WHERE m.from_agent = p.agent OR m.to_agent = p.agent) AS count
+    FROM parties p
+  `).all() as { agent: string; count: number }[]
+
+  const lastStmt = db.prepare(
+    'SELECT * FROM agent_messages WHERE from_agent = ? OR to_agent = ? ORDER BY created_at DESC, id DESC LIMIT 1'
+  )
+
+  const system = new Set<string>(CHAT_SYSTEM_AGENTS)
+  const threads: AgentThread[] = []
+  for (const p of parties) {
+    if (!p.agent || system.has(p.agent)) continue
+    const lastMessage = (lastStmt.get(p.agent, p.agent) as AgentMessage | undefined) ?? null
+    threads.push({ agent: p.agent, count: p.count, lastMessage })
+  }
+  threads.sort((a, b) => {
+    const ca = a.lastMessage?.created_at ?? 0
+    const cb = b.lastMessage?.created_at ?? 0
+    if (cb !== ca) return cb - ca
+    return (b.lastMessage?.id ?? 0) - (a.lastMessage?.id ?? 0) // tiebreak: newest id first
+  })
+  return threads
 }
 
 // --- Task Run History ---
@@ -1898,11 +2029,6 @@ export function getUndispatchedHighPriorityCards(): KanbanDispatchCandidate[] {
   ).all() as KanbanDispatchCandidate[]
 }
 
-export function markKanbanCardDispatched(id: string): void {
-  const now = Math.floor(Date.now() / 1000)
-  db.prepare('UPDATE kanban_cards SET dispatched_at = ? WHERE id = ?').run(now, id)
-}
-
 // --- Idea Box ---
 
 export interface IdeaBoxRow {
@@ -1954,8 +2080,6 @@ export function deleteIdea(id: string): boolean {
 export function listIdeaCategories(): string[] {
   return (db.prepare('SELECT DISTINCT category FROM idea_box ORDER BY category').all() as { category: string }[]).map(r => r.category)
 }
-
-// --- Workflow Recordings ---
 
 // --- Tool Call Log ---
 

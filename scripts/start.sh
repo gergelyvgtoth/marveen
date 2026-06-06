@@ -12,6 +12,11 @@ if [ -f "$INSTALL_DIR/.env" ]; then
 fi
 SLUG="${SLUG:-marveen}"
 
+# Root VPS / container: claude refuses --dangerously-skip-permissions as uid 0.
+# The dashboard (and the agent tmux sessions it spawns) hit the same wall as
+# channels.sh, so export the sandbox escape hatch for the whole stack when root.
+[ "$(id -u)" = "0" ] && export IS_SANDBOX=1
+
 echo "${BOT_NAME:-Marveen} inditas..."
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
@@ -23,7 +28,23 @@ elif [ "$OS" = "Linux" ]; then
   else
     echo "systemd not available (WSL or container), using direct launch..."
     mkdir -p "$INSTALL_DIR/store"
-    nohup bun "$INSTALL_DIR/src/web/serve.ts" > "$INSTALL_DIR/store/dashboard.log" 2>&1 &
+    # The entry is src/index.ts (built to dist/index.js); the old src/web/serve.ts
+    # is gone. better-sqlite3 is unsupported under bun (oven-sh/bun#4290), and on
+    # some setups `node` on PATH actually resolves to bun -- so pick a real node
+    # (its --version starts with "v"; bun's does not) and run the built output.
+    NODE_BIN=""
+    for cand in node nodejs; do
+      cand_path="$(command -v "$cand" 2>/dev/null)" || continue
+      case "$("$cand_path" --version 2>/dev/null)" in
+        v*) NODE_BIN="$cand_path"; break ;;
+      esac
+    done
+    if [ -z "$NODE_BIN" ]; then
+      echo "ERROR: no real node found on PATH (bun cannot run better-sqlite3)." >&2
+      exit 1
+    fi
+    [ -f "$INSTALL_DIR/dist/index.js" ] || (cd "$INSTALL_DIR" && npm run build)
+    nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" > "$INSTALL_DIR/store/dashboard.log" 2>&1 &
     echo $! > "$INSTALL_DIR/store/dashboard.pid"
     nohup bash "$INSTALL_DIR/scripts/channels.sh" > "$INSTALL_DIR/store/channels.log" 2>&1 &
     echo $! > "$INSTALL_DIR/store/channels.pid"

@@ -4,9 +4,12 @@ import {
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard,
   getKanbanComments, addKanbanComment, listKanbanProjects,
   getKanbanCard, getChildCards, getDb,
+  createAgentMessage, markKanbanCardDispatched,
 } from '../../db.js'
-import { OWNER_NAME, BOT_NAME } from '../../config.js'
+import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID } from '../../config.js'
 import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
+import { isAgentRunning } from '../agent-process.js'
+import { resolveKanbanDispatchTarget } from '../../kanban-dispatch.js'
 import { generateBreakdown } from '../llm-breakdown.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
@@ -16,6 +19,32 @@ import type { RouteContext } from './types.js'
 async function notifyDone(title: string, assignee: string | null | undefined): Promise<void> {
   const who = assignee || 'ismeretlen'
   await notifyTelegram(`✅ Kanban kész: <b>${title}</b>\nFelelős: ${who}`).catch(() => {})
+}
+
+// Option D: kanban -> agent dispatch. When a card moves to in_progress, wake the
+// assigned agent once via the inter-agent message router (createAgentMessage),
+// which gives retry / dedup / trust-wrapping / busy-receiver handling for free.
+// dispatched_at is the once-only guard; errors never block the card move.
+function fireKanbanDispatch(id: string): void {
+  try {
+    const card = getKanbanCard(id)
+    if (!card || card.dispatched_at) return
+    const target = resolveKanbanDispatchTarget(card.assignee, {
+      ownerName: OWNER_NAME,
+      botName: BOT_NAME,
+      mainAgentId: MAIN_AGENT_ID,
+      agentNames: listAgentNames(),
+      isRunning: isAgentRunning,
+    })
+    if (!target) return
+    const desc = (card.description ?? '').trim()
+    const content = `[Kanban feladat #${id}]: ${card.title}${desc ? ' — ' + desc : ''}\n\nA kártyát in_progress-re húzták. Ha kész vagy, húzd "done"-ra.`
+    createAgentMessage(MAIN_AGENT_ID, target, content)
+    markKanbanCardDispatched(id)
+    logger.info({ id, target, assignee: card.assignee }, 'Kanban in_progress dispatch fired')
+  } catch (err) {
+    logger.warn({ err, id }, 'Kanban dispatch failed (card move still succeeded)')
+  }
 }
 
 export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
@@ -84,6 +113,8 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
       if (status === 'done' && before?.status !== 'done') {
         notifyDone(before?.title ?? id, before?.assignee)
       }
+      // Wake the assigned agent once when the card enters in_progress.
+      if (status === 'in_progress') fireKanbanDispatch(id)
       json(res, { ok: true })
       return true
     }

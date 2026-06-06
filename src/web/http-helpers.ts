@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { extname } from 'node:path'
 
 export const MIME: Record<string, string> = {
@@ -53,15 +53,71 @@ export function readBody(
 }
 
 export function json(res: http.ServerResponse, data: unknown, status = 200): void {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+  // Cache-Control: private, no-store prevents CDN / proxy caching of API
+  // responses that may contain user-specific data or session state. Without
+  // this header, intermediate caches can serve stale or cross-user data.
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'private, no-store',
+  })
   res.end(JSON.stringify(data))
 }
 
-export function serveFile(res: http.ServerResponse, filePath: string): void {
+/**
+ * Normalise an If-None-Match value for comparison with an ETag. Strips a
+ * single leading W/ prefix (weak validator) so `W/"abc"` compares equal to
+ * `"abc"`. Multiple W/ prefixes or bare unquoted values are left as-is
+ * (malformed; the comparison will simply miss and the full response is sent).
+ *
+ * The header value may arrive as string[] when proxies or HTTP/1.1 clients
+ * send multiple If-None-Match header lines. RFC 7230 §3.2.2 allows this and
+ * the canonical interpretation is to join them with ", ". We coerce here so
+ * the caller (serveFile) does not need to handle the union type explicitly,
+ * and a string[] value does not throw or produce a wrong 404/500.
+ */
+export function etagMatches(ifNoneMatch: string | string[] | undefined, etag: string): boolean {
+  if (!ifNoneMatch) return false
+  const raw = Array.isArray(ifNoneMatch) ? ifNoneMatch.join(', ') : ifNoneMatch
+  const normalised = raw.startsWith('W/') ? raw.slice(2) : raw
+  return normalised === etag
+}
+
+export function serveFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  filePath: string,
+): void {
   try {
-    const data = readFileSync(filePath)
+    const stat = statSync(filePath)
     const ext = extname(filePath)
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' })
+    // ETag: "<mtime_ms>-<size>" — cheap to compute, stable across identical
+    // file content at the same path, and invalidated automatically on any
+    // write (mtime advances). Quoted string as required by RFC 7232.
+    const etag = `"${stat.mtimeMs}-${stat.size}"`
+    const lastModified = stat.mtime.toUTCString()
+
+    // RFC 7232 conditional GET: if the client has a matching ETag, serve 304.
+    const ifNoneMatch = req.headers['if-none-match']
+    if (etagMatches(ifNoneMatch, etag)) {
+      res.writeHead(304, {
+        ETag: etag,
+        'Last-Modified': lastModified,
+        'Cache-Control': 'no-cache',
+      })
+      res.end()
+      return
+    }
+
+    const data = readFileSync(filePath)
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      ETag: etag,
+      'Last-Modified': lastModified,
+      // no-cache: revalidate on every request (not "no caching" — that is
+      // no-store). Allows 304 round-trips which save bandwidth on repeated
+      // loads of the same static assets.
+      'Cache-Control': 'no-cache',
+    })
     res.end(data)
   } catch {
     res.writeHead(404)

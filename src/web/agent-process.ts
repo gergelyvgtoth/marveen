@@ -17,7 +17,7 @@ import { CHANNEL_PROVIDER } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
 import { getSecret } from './vault.js'
-import { reapChannelOrphans } from './channel-poller-reap.js'
+import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
@@ -69,7 +69,7 @@ export function agentHasChannel(name: string): boolean {
   return false
 }
 
-export function startAgentProcess(name: string): { ok: boolean; pid?: number; error?: string } {
+export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
   if (isAgentRunning(name)) return { ok: false, error: 'Agent is already running' }
 
   const dir = agentDir(name)
@@ -107,6 +107,18 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
       reapChannelOrphans(agentProvider, dir)
     } catch (err) {
       logger.warn({ err, name }, 'pre-launch channel-poller reap failed (continuing)')
+    }
+
+    // Also reap DETACHED channel claudes (the parent-process leak): a prior
+    // --continue session that survived kill-session keeps a poller 409-racing
+    // this agent's bot token, which the health monitor reads as "down" and
+    // restarts -- a self-feeding thrash loop (zara, 2026-06-03). We just killed
+    // this agent's tmux session above, so its leftover claude is now detached;
+    // pane attribution spares every live sibling and the main session.
+    try {
+      reapDetachedChannelClaudes({ tmuxPath: TMUX })
+    } catch (err) {
+      logger.warn({ err, name }, 'pre-launch detached-claude reap failed (continuing)')
     }
 
     const model = readAgentModel(name)
@@ -170,7 +182,10 @@ export function startAgentProcess(name: string): { ok: boolean; pid?: number; er
       : join(homedir(), '.claude', 'projects')
     const encodedProject = dir.replace(/\//g, '-')
     const hasPriorSession = existsSync(join(projectsRoot, encodedProject))
-    const continueFlag = hasPriorSession ? '--continue ' : ''
+    // opts.fresh forces a brand-new conversation (auto-restart 'fresh' mode):
+    // omit --continue so the heavy accumulated context is dropped. Without it
+    // we resume the prior session (the 'continue' mode / normal restart).
+    const continueFlag = (hasPriorSession && !opts.fresh) ? '--continue ' : ''
     const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : agentProvider === 'discord' ? 'DISCORD_STATE_DIR' : 'TELEGRAM_STATE_DIR'
     const unsetTokens = 'unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN'
     // Slack plugin is third-party; its "not on approved allowlist" check is
@@ -247,12 +262,12 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
   }
 }
 
-export function restartAgentProcess(name: string): { ok: boolean; pid?: number; error?: string } {
+export function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
   if (isAgentRunning(name)) {
     const stopResult = stopAgentProcess(name)
     if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
   }
-  return startAgentProcess(name)
+  return startAgentProcess(name, opts)
 }
 
 // Claude Code occasionally pops a "How is Claude doing this session? (optional)"
@@ -362,7 +377,7 @@ const SUBMIT_RETRY_POLL_MS = '0.3'
 // Buffer-clear (Ctrl-U) used pre-flight when shouldClearTruncatedPreamble
 // flags a stale preamble. Sent as a single key name (no `-l` literal
 // flag) so tmux interprets it as the control sequence.
-function clearInputBuffer(session: string): void {
+export function clearInputBuffer(session: string): void {
   try {
     execFileSync(TMUX, ['send-keys', '-t', session, 'C-u'], { timeout: 5000 })
     // Settle briefly so the next send-keys lands in the freshly cleared

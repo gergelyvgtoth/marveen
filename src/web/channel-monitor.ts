@@ -1,14 +1,16 @@
 import { existsSync, readFileSync, statSync, writeFileSync, utimesSync } from 'node:fs'
+import { hostname } from 'node:os'
 import { join } from 'node:path'
-import { execSync, execFileSync } from 'node:child_process'
+import { execSync, execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT } from '../config.js'
+import { MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
 import {
   agentHasChannel,
   agentSessionName,
   capturePane,
+  clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
   isAgentRunning,
   sendPromptToSession,
@@ -16,16 +18,24 @@ import {
   stopAgentProcess,
   scheduleIdentitySetup,
 } from './agent-process.js'
-import { reapChannelOrphans } from './channel-poller-reap.js'
+import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
-import { detectPaneState, decidePaneErrorAlert, type PaneErrorAlertState, type PaneState } from '../pane-state.js'
+import {
+  detectPaneState, decidePaneErrorAlert, type PaneErrorAlertState, type PaneState,
+  stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
+  type StuckInputState, type StuckInputThresholds,
+} from '../pane-state.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
 import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestamp, TRANSCRIPT_DIR } from './inbound-probe.js'
 import { shouldAutoRestartDownAgent, parseEtimeToSeconds } from './agent-restart-policy.js'
+// getClaudePidForSession + hasChannelPluginAlive live in the shared liveness
+// module so the standalone channel-coordinator reuses the exact same probe.
+import { getClaudePidForSession, hasChannelPluginAlive } from '../channel-coordinator/liveness.js'
+import { getDesiredAgents } from './agent-desired-state.js'
 
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude')
@@ -54,120 +64,6 @@ function resolveAgentProvider(name: string): ChannelProviderType {
 // main agent's channels session we can only alert + escalate, because
 // killing it would terminate the live agent.
 
-function getClaudePidForSession(session: string): number | null {
-  try {
-    const out = execFileSync(TMUX, ['list-panes', '-t', session, '-F', '#{pane_pid}'], { timeout: 3000, encoding: 'utf-8' })
-    const panePid = parseInt(out.trim().split('\n')[0], 10)
-    if (!panePid) return null
-    const cmd = execFileSync('/bin/ps', ['-p', String(panePid), '-o', 'comm='], { timeout: 3000, encoding: 'utf-8' }).trim()
-    if (cmd === 'claude' || cmd.endsWith('/claude')) return panePid
-    try {
-      const child = execFileSync('/usr/bin/pgrep', ['-P', String(panePid), '-x', 'claude'], { timeout: 3000, encoding: 'utf-8' }).trim()
-      if (child) return parseInt(child.split('\n')[0], 10)
-    } catch { /* none */ }
-    return null
-  } catch {
-    return null
-  }
-}
-
-function hasChannelPluginAlive(claudePid: number, providerType: ChannelProviderType, agentName?: string): boolean {
-  try {
-    const ps = execFileSync('/bin/ps', ['-axo', 'pid,ppid,command'], { timeout: 3000, encoding: 'utf-8' })
-    const lines = ps.split('\n').slice(1)
-    const childrenOf = new Map<number, number[]>()
-    const cmdOf = new Map<number, string>()
-    for (const line of lines) {
-      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/)
-      if (!m) continue
-      const pid = parseInt(m[1], 10)
-      const ppid = parseInt(m[2], 10)
-      cmdOf.set(pid, m[3])
-      const arr = childrenOf.get(ppid) || []
-      arr.push(pid)
-      childrenOf.set(ppid, arr)
-    }
-
-    const stack = [claudePid]
-    const seen = new Set<number>()
-    while (stack.length) {
-      const p = stack.pop()!
-      if (seen.has(p)) continue
-      seen.add(p)
-      const cmd = cmdOf.get(p) || ''
-      if (providerType === 'telegram') {
-        if (cmd.includes('/telegram/') && cmd.includes('bun')) return true
-        if (/\bbun\b/.test(cmd) && cmd.includes('server.ts')) return true
-      } else if (providerType === 'discord') {
-        if (cmd.includes('discord') && (cmd.includes('node') || cmd.includes('bun'))) return true
-      } else {
-        if (cmd.includes('slack') && cmd.includes('node')) return true
-        if (cmd.includes('slack-channel') && (cmd.includes('bun') || cmd.includes('node'))) return true
-      }
-      for (const k of (childrenOf.get(p) || [])) stack.push(k)
-    }
-
-    // Fallback: plugin may have been reparented to init (ppid=1) after its
-    // intermediate parent crashed. Check bot.pid directly as last-resort.
-    const stateDir = agentName
-      ? channelStateDir(providerType, agentDir(agentName))
-      : channelStateDir(providerType)
-    const pidPath = join(stateDir, 'bot.pid')
-    if (existsSync(pidPath)) {
-      const pid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10)
-      if (pid > 1) {
-        try {
-          process.kill(pid, 0)
-          const cmd = cmdOf.get(pid) || ''
-          const isRelevant = providerType === 'telegram'
-            ? (cmd.includes('bun') || cmd.includes('server.ts') || cmd.includes('telegram'))
-            : providerType === 'discord'
-              ? (cmd.includes('discord') && (cmd.includes('node') || cmd.includes('bun')))
-              : (cmd.includes('node') || cmd.includes('slack'))
-          if (isRelevant) {
-            logger.debug({ claudePid, orphanPid: pid, agentName, providerType }, 'Channel plugin alive via bot.pid (reparented)')
-            return true
-          }
-        } catch { /* process gone */ }
-      }
-    }
-
-    // Slack Socket Mode: no bot.pid file; check if the slack app token is
-    // being actively used by a child process. This is a heuristic -- Slack
-    // plugins keep a WebSocket open but don't write a pid file.
-    if (providerType === 'slack') {
-      for (const [pid, cmd] of cmdOf) {
-        if (seen.has(pid)) continue
-        if ((cmd.includes('slack') || cmd.includes('socket-mode')) && (cmd.includes('node') || cmd.includes('bun'))) {
-          try {
-            process.kill(pid, 0)
-            logger.debug({ claudePid, slackPid: pid, agentName }, 'Slack plugin alive via process scan')
-            return true
-          } catch { /* gone */ }
-        }
-      }
-    }
-
-    // Discord: same heuristic -- no bot.pid, check for discord node/bun process.
-    if (providerType === 'discord') {
-      for (const [pid, cmd] of cmdOf) {
-        if (seen.has(pid)) continue
-        if (cmd.includes('discord') && (cmd.includes('node') || cmd.includes('bun'))) {
-          try {
-            process.kill(pid, 0)
-            logger.debug({ claudePid, discordPid: pid, agentName }, 'Discord plugin alive via process scan')
-            return true
-          } catch { /* gone */ }
-        }
-      }
-    }
-
-    return false
-  } catch {
-    return false
-  }
-}
-
 const agentDownSince: Map<string, number> = new Map()
 const agentLastRestart: Map<string, number> = new Map()
 const AGENT_RESTART_GRACE_MS = 90_000
@@ -177,6 +73,28 @@ const AGENT_RESTART_GRACE_MS = 90_000
 // than this on a "plugin down" reading, or the watchdog crash-loops it.
 const AGENT_STARTUP_GRACE_MS = 180_000
 const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
+
+// Stuck channel-input recovery (MAIN session only). A channel notification
+// delivered while Boss is busy can be parked as plain text at the ❯ prompt
+// without being submitted ('typing' state) -- it wedges the session because
+// skipIfBusy heartbeats read 'typing' as not-idle and Boss never processes
+// the message. The parked text already carries the full
+// <channel ... chat_id=...> block, so recovery only needs to get it SUBMITTED.
+let mainStuckInput: StuckInputState = { parkedSig: null, firstSeenAt: null, lastRecoverAt: null, attempts: 0 }
+// Raw Enters tried before escalating to clear+re-inject. Enter is faithful
+// (it submits the REAL buffer, no capture-truncation risk); re-inject is the
+// fallback for a TUI that swallows the Enter in raw-mode.
+const MAIN_STUCK_ENTER_ATTEMPTS = 2
+const MAIN_STUCK_THRESHOLDS: StuckInputThresholds = {
+  // Same text must stay parked this long before the first recovery action so a
+  // turn about to submit on its own is not pre-empted (>=2 observations at the
+  // 60s tick).
+  confirmMs: 90_000,
+  // One recovery action per ~tick.
+  dedupMs: 45_000,
+  // 2 Enters + up to 2 re-injects, then hold (logged).
+  maxAttempts: 4,
+}
 
 // Per-session tracking for the wedged thinking-block error (a Claude
 // session stuck returning `400 ... thinking blocks cannot be modified`
@@ -280,7 +198,14 @@ export function buildMainSessionRespawnCmd(opts: {
   ].join(' ')
 }
 
-function resumeMarveenSession(): boolean {
+// Exported so the stuck-tool-call-watcher recovers a wedged main session via
+// this respawn-pane path (reap + `tmux respawn-pane -k --continue`) INSTEAD of
+// the launchctl hard-restart. respawn-pane replaces only the claude process in
+// the pane: it does NOT `tmux kill-session`, so an attached client is never
+// kicked ([exited]) -- the #248 user-visible crash. It also runs the
+// pane-attribution detached-claude reap first, breaking the orphan->409->freeze
+// doom-loop that the launchctl path (channels.sh env-grep reap) never cleaned.
+export function resumeMarveenSession(): boolean {
   const provider = getProvider(getMainAgentProvider())
   try {
     // Reap any orphan bun/node poller BEFORE we respawn. tmux respawn-pane -k
@@ -292,6 +217,20 @@ function resumeMarveenSession(): boolean {
       reapChannelOrphans(provider.type, PROJECT_ROOT)
     } catch (err) {
       logger.warn({ err }, 'resumeMarveenSession: pre-respawn reap failed (continuing)')
+    }
+
+    // Also reap DETACHED main-session claudes. reapChannelOrphans (env-scan)
+    // cannot see the main session: channels.sh launches it without a
+    // *_STATE_DIR export, so neither the claude nor its bun poller match the
+    // env needle, and bot.pid is never written. A --continue respawn that did
+    // not tear down the prior claude leaves it detached (reparented to the tmux
+    // server) with a live poller hammering the shared token. Pane attribution
+    // spares the live session (this pane) and kills only the leftovers.
+    // See project_channels_continue_respawn_leak.
+    try {
+      reapDetachedChannelClaudes({ tmuxPath: TMUX })
+    } catch (err) {
+      logger.warn({ err }, 'resumeMarveenSession: detached-claude reap failed (continuing)')
     }
 
     const claudeCmd = buildMainSessionRespawnCmd({
@@ -364,8 +303,9 @@ let marveenLastHardRestart = 0
 // restarts onto a session that was merely still booting. 6 min comfortably
 // covers the slowest realistic cold start while staying under the 18-min
 // keepalive-staleness net, so a session that is genuinely dead after a respawn
-// is still caught by another path.
-const MARVEEN_POST_RESPAWN_GRACE_MS = 360_000
+// is still caught by another path. Exported so the stuck-tool-call-watcher
+// shares the same post-respawn grace (single source of truth).
+export const MARVEEN_POST_RESPAWN_GRACE_MS = 360_000
 
 /**
  * B2 fix: shared cross-path grace accessor.
@@ -397,6 +337,72 @@ function writeRespawnStamp(): void {
   try {
     writeFileSync(RESPAWN_STAMP_FILE, String(Math.floor(Date.now() / 1000)))
   } catch { /* best effort */ }
+}
+
+// --- Vanished-session recovery (self-healing main session) ---
+//
+// The down-cascade (handleMarveenDown) recovers a main session whose claude
+// process is alive but whose channel plugin died, by replacing the claude
+// process in the EXISTING pane via `tmux respawn-pane`. respawn-pane needs a
+// live pane: it cannot bring back a session that has disappeared entirely
+// (crash, self-update mid-restart, OOM kill, host reboot). On a deployment
+// where nothing supervises the session -- marveen-channels.service disabled,
+// or any pure-tmux install -- a vanished session stays gone, and because the
+// scheduler skips every task whose target tmux session is missing
+// (schedule-runner !sessionExists branch), ALL main-agent scheduled jobs
+// (morning briefing, daily-log, dream-engine, audits, heartbeats) silently
+// stop firing with no error surfaced anywhere. This closes that gap by
+// recreating the session from scratch via the canonical scripts/channels.sh --
+// the same path the service uses -- so recovery is channel-independent and
+// works even with the service disabled.
+const CHANNELS_SCRIPT = join(PROJECT_ROOT, 'scripts', 'channels.sh')
+// channels.sh creates the session, runs the first-run dialog auto-accept, sets
+// /name, and brings up the channel plugin -- a cold start that takes minutes.
+// Throttle relaunches so a session that is still booting is not torn down and
+// recreated on the next 60s poll.
+const MAIN_SESSION_CREATE_GRACE_MS = 360_000
+let marveenLastSessionCreate = 0
+
+export function mainChannelsSessionExists(): boolean {
+  try {
+    execFileSync(TMUX, ['has-session', '-t', MAIN_CHANNELS_SESSION], { timeout: 3000 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function createMainChannelsSession(): boolean {
+  const now = Date.now()
+  if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
+    return false
+  }
+  if (!existsSync(CHANNELS_SCRIPT)) {
+    logger.error({ script: CHANNELS_SCRIPT }, 'Cannot recreate main channels session: channels.sh missing')
+    return false
+  }
+  try {
+    // Detached + unref'd: channels.sh is a long-lived supervisor (it tails the
+    // session in a wait loop), so it must outlive this check() tick without
+    // keeping the dashboard event loop alive. stdio ignored -- channels.sh does
+    // its own logging to store/channels-failures.log.
+    const child = spawn('/bin/bash', [CHANNELS_SCRIPT], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: PROJECT_ROOT,
+    })
+    child.unref()
+    marveenLastSessionCreate = now
+    // Fold into the shared cold-start grace so the down-cascade defers to this
+    // boot instead of stacking a respawn on a session that is still coming up.
+    writeRespawnStamp()
+    logger.warn({ session: MAIN_CHANNELS_SESSION }, 'Main channels session absent -- recreating via channels.sh')
+    sendAlert(`♻️ A ${MAIN_CHANNELS_SESSION} session eltunt -- ujrainditom (channels.sh). Enelkul minden utemezett feladat csendben kimaradna.`)
+    return true
+  } catch (err) {
+    logger.error({ err }, 'Failed to recreate main channels session via channels.sh')
+    return false
+  }
 }
 
 // Hard-restart fallback when there is no systemd unit to bounce: respawn the
@@ -752,7 +758,16 @@ function shouldEscalateMarveenDown(): boolean {
   return now - marveenSuspectFirstSeen >= MARVEEN_DOWN_CONFIRM_MS
 }
 
-export function startChannelPluginMonitor(): NodeJS.Timeout {
+export function startChannelPluginMonitor(): NodeJS.Timeout | null {
+  // Respawn/keep-alive is production-only. On any non-production host (e.g. a
+  // local dev checkout) we never respawn the main agent or auto-restart
+  // sub-agents -- otherwise two machines would fight over the same bot tokens.
+  // Applies to ALL agents because the whole monitor loop is skipped here.
+  if (!RESPAWN_ENABLED) {
+    logger.info({ host: hostname() }, 'Channel plugin monitor disabled (respawn is production-only)')
+    return null
+  }
+
   const mainProvider = getMainAgentProvider()
 
   function check() {
@@ -794,6 +809,44 @@ export function startChannelPluginMonitor(): NodeJS.Timeout {
       }
     }
 
+    // Stuck channel-input recovery (MAIN session only). Recover a channel
+    // notification stranded at the ❯ prompt by getting it SUBMITTED. The gate
+    // (parkedChannelInput != null) fires ONLY for a parked <channel> block, so
+    // a human's own hand-typed draft is never touched. Enter-first (faithful);
+    // escalate to clear+re-inject only after MAIN_STUCK_ENTER_ATTEMPTS, and
+    // only when the captured block looks COMPLETE -- a truncated capture stays
+    // on Enter rather than risk a partial re-inject to the wrong chat_id.
+    {
+      const mainPane = capturePane(MAIN_CHANNELS_SESSION)
+      const parked = mainPane != null ? parkedChannelInput(mainPane) : null
+      const sig = parked != null && mainPane != null ? stuckInputSignature(mainPane) : null
+      const decision = decideStuckInputRecovery(sig, mainStuckInput, Date.now(), MAIN_STUCK_THRESHOLDS)
+      mainStuckInput = decision.next
+      if (decision.recover && parked != null) {
+        const attempt = decision.next.attempts
+        const reinject = attempt > MAIN_STUCK_ENTER_ATTEMPTS && parked.complete && parked.block != null
+        if (reinject) {
+          logger.warn({ session: MAIN_CHANNELS_SESSION, chatId: parked.chatId, attempt }, 'Stuck channel input -- escalating to clear + verbatim re-inject')
+          try {
+            clearInputBuffer(MAIN_CHANNELS_SESSION)
+            sendPromptToSession(MAIN_CHANNELS_SESSION, parked.block!)
+          } catch (err) {
+            logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'Stuck-input re-inject failed')
+          }
+        } else {
+          // Enter-first, and the truncation-guard fallback: if escalation was
+          // due but the block looks incomplete, hold on Enter instead.
+          const heldForTruncation = attempt > MAIN_STUCK_ENTER_ATTEMPTS && !parked.complete
+          logger.warn({ session: MAIN_CHANNELS_SESSION, attempt, heldForTruncation }, 'Stuck channel input -- recovery Enter')
+          try {
+            execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Enter'], { timeout: 5000 })
+          } catch (err) {
+            logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'Stuck-input recovery Enter failed')
+          }
+        }
+      }
+    }
+
     for (const t of targets) {
       const claudePid = getClaudePidForSession(t.session)
       if (!claudePid) {
@@ -802,7 +855,22 @@ export function startChannelPluginMonitor(): NodeJS.Timeout {
           if (lastRestart && Date.now() - lastRestart < AGENT_RESTART_GRACE_MS) continue
         }
         if (t.isMarveen) {
-          if (shouldEscalateMarveenDown()) handleMarveenDown()
+          // The claude pid is gone. WHY decides recovery: a session that no
+          // longer exists at all must be recreated from scratch (respawn-pane,
+          // the only tool the down-cascade has on Linux, cannot resurrect a
+          // vanished session); a session that still exists with a dead/wedged
+          // claude is the down-cascade's job. Without this split a crashed,
+          // self-updated or rebooted main session never returns on installs
+          // with no supervising service, and every scheduled main-agent task
+          // silently skips (scheduler !sessionExists branch).
+          if (!mainChannelsSessionExists()) {
+            if (shouldEscalateMarveenDown() && createMainChannelsSession()) {
+              marveenDownState = null
+              marveenSuspectFirstSeen = null
+            }
+          } else if (shouldEscalateMarveenDown()) {
+            handleMarveenDown()
+          }
         }
         continue
       }
@@ -853,9 +921,52 @@ export function startChannelPluginMonitor(): NodeJS.Timeout {
         }
       }
     }
+
+    // Desired-state reconciliation: bring back agents the operator wants
+    // running but whose tmux session vanished entirely (shared tmux server
+    // killed by a channels-unit restart, or a machine reboot). The per-target
+    // loop above only handles sessions that still exist with a dead plugin.
+    // Staggered to avoid the simultaneous-start race that kills agents.
+    void reconcileDesiredAgents()
   }
   setTimeout(check, 30000)
   return setInterval(check, 60000)
+}
+
+// Start desired-but-missing agents one at a time (~15s apart). The stagger is
+// mandatory: starting several channel agents at once makes them all die in the
+// resume-from-summary modal race. A single in-flight burst at a time.
+let reconcileBurstInProgress = false
+const AGENT_RECONCILE_STAGGER_MS = 15000
+function delay(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)) }
+
+async function reconcileDesiredAgents(): Promise<void> {
+  if (reconcileBurstInProgress) return
+  const desired = getDesiredAgents()
+  if (desired.size === 0) return
+  const down = [...desired].filter((name) => !isAgentRunning(name))
+  if (down.length === 0) return
+  reconcileBurstInProgress = true
+  try {
+    for (const name of down) {
+      if (isAgentRunning(name)) continue
+      const last = agentLastRestart.get(name)
+      if (last != null && Date.now() - last < AGENT_RESTART_GRACE_MS) continue
+      logger.warn({ agent: name }, 'Desired agent not running -- auto-starting (reconcile)')
+      try {
+        const r = startAgentProcess(name)
+        agentLastRestart.set(name, Date.now())
+        if (!r.ok && r.error !== 'Agent is already running') {
+          logger.error({ agent: name, error: r.error }, 'Reconcile start failed')
+        }
+      } catch (err) {
+        logger.error({ err, agent: name }, 'Reconcile start threw')
+      }
+      await delay(AGENT_RECONCILE_STAGGER_MS)
+    }
+  } finally {
+    reconcileBurstInProgress = false
+  }
 }
 
 // Backward-compatible alias
