@@ -7,10 +7,13 @@
 # is down. It is the COARSE net (total-pipe-death / session-wedge); the
 # dashboard's userbot inbound-probe handles the finer inbound-only deafness.
 #
-# Signal: store/.channel-keepalive mtime. The keep-alive scheduled task does a
-# real Telegram MCP edit_message round-trip every ~6 min and touches that file
-# on success, so a stale file means the session's MCP pipe is no longer doing
-# round-trips (wedged / deaf).
+# Signal: store/.channel-keepalive mtime. In practice the file's only feeder is
+# inbound traffic (the dashboard advances its mtime to the last ingested
+# <channel> block; the historically-documented ~6-min edit_message keep-alive
+# task does NOT exist as a scheduled task). So a stale file means EITHER the
+# pipe is wedged/deaf OR the channel has simply been quiet. Gate 3b below
+# distinguishes the two by checking whether the telegram plugin process is alive
+# before respawning -- a quiet-but-healthy channel must not be respawned.
 #
 # Recovery: `tmux respawn-pane` of ONLY the <id>-channels pane. NEVER
 # `systemctl restart` -- the tmux SERVER is shared across every agent and lives
@@ -72,6 +75,35 @@ if [ "$age" -lt "$STALE_SECONDS" ]; then
   # Healthy round-trips -> reset the consecutive-respawn counter.
   rm -f "$RESPAWN_COUNT_FILE" 2>/dev/null || true
   exit 0
+fi
+
+# --- gate 3b: telegram plugin liveness (avoid false respawns of a quiet channel) ---
+# The keepalive file's only feeder is inbound traffic, so a QUIET but perfectly
+# healthy channel ages the file out and used to be respawned ~45x/day -- each
+# respawn kills the live session and can drop an in-flight inbound message.
+# Before respawning, confirm the telegram plugin (bun server.ts) is NOT alive
+# under the channels pane. If it IS alive, treat the staleness as a healthy-quiet
+# false positive and skip the respawn. A coarse HARD_CEILING still respawns a
+# process-alive-but-pipe-wedged session as a last-resort backstop (the userbot
+# inbound-probe is the intended fine-grained deafness detector).
+HARD_CEILING_SECONDS=$(( 60 * 60 ))
+pane_pid=$("$TMUX" list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
+if [ -n "$pane_pid" ]; then
+  ps_out=$(ps -axo pid,ppid,command 2>/dev/null)
+  descendants="$pane_pid"; frontier="$pane_pid"
+  for _ in 1 2 3 4 5 6 7 8; do
+    next=$(printf '%s\n' "$ps_out" | awk -v f="$frontier" 'BEGIN{n=split(f,a," ");for(i=1;i<=n;i++)P[a[i]]=1} ($2 in P){print $1}')
+    [ -z "$next" ] && break
+    descendants="$descendants $next"; frontier="$next"
+  done
+  if printf '%s\n' "$ps_out" | awk -v d="$descendants" 'BEGIN{n=split(d,a," ");for(i=1;i<=n;i++)P[a[i]]=1} ($1 in P) && /bun server\.ts/ {f=1} END{exit !f}'; then
+    if [ "$age" -lt "$HARD_CEILING_SECONDS" ]; then
+      log "keepalive stale ${age}s but telegram plugin (bun server.ts) alive under pane $pane_pid -- healthy-quiet (no idle keepalive feeder); skipping respawn"
+      rm -f "$RESPAWN_COUNT_FILE" 2>/dev/null || true
+      exit 0
+    fi
+    log "keepalive stale ${age}s exceeds hard ceiling ${HARD_CEILING_SECONDS}s despite live plugin -- suspected pipe wedge, proceeding to respawn"
+  fi
 fi
 
 # --- gate 4: respawn grace (shared with the dashboard watchdog) ---
