@@ -5,9 +5,17 @@ import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { getDb } from '../db.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects')
+
+// Claude Code encodes a project's absolute path into a directory name by
+// replacing every non-alphanumeric/non-dash character with `-`. The main
+// agent's transcripts live under that exact directory, regardless of what
+// the agent calls itself.
+function encodeProjectPath(p: string): string {
+  return p.replace(/[^a-zA-Z0-9-]/g, '-')
+}
 
 interface AgentTranscriptSource {
   agent: string
@@ -17,6 +25,7 @@ interface AgentTranscriptSource {
 function discoverAgentSources(): AgentTranscriptSource[] {
   const sources: AgentTranscriptSource[] = []
   if (!existsSync(PROJECTS_DIR)) return sources
+  const mainDirName = encodeProjectPath(PROJECT_ROOT)
   for (const entry of readdirSync(PROJECTS_DIR)) {
     const full = join(PROJECTS_DIR, entry)
     let stat
@@ -26,7 +35,7 @@ function discoverAgentSources(): AgentTranscriptSource[] {
     const agentMatch = entry.match(/-agents-([a-z]+)$/)
     if (agentMatch) {
       sources.push({ agent: agentMatch[1], projectDir: full })
-    } else if (entry.includes(`-${MAIN_AGENT_ID}`) && !entry.includes('-agents-')) {
+    } else if (entry === mainDirName) {
       sources.push({ agent: MAIN_AGENT_ID, projectDir: full })
     }
   }

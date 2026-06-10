@@ -1,15 +1,25 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { agentDir } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
 
-function resolveTemplatePlaceholders(content: string): string {
-  return content.replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
+export function resolveTemplatePlaceholders(content: string): string {
+  // Identity placeholders, kept in sync with the install scripts'
+  // (install-macos.sh / install-linux.sh) sed substitutions, so a shipped
+  // template never seeds a foreign absolute path or name into a user's tree.
+  // {{INSTALL_DIR}} and {{PROJECT_ROOT}} both denote this install location.
+  return content
+    .replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
+    .replaceAll('{{INSTALL_DIR}}', PROJECT_ROOT)
+    .replaceAll('{{MAIN_AGENT_ID}}', MAIN_AGENT_ID)
+    .replaceAll('{{BOT_NAME}}', BOT_NAME)
+    .replaceAll('{{OWNER_NAME}}', OWNER_NAME)
+    .replaceAll('{{WEB_PORT}}', String(WEB_PORT))
 }
 
 // Idempotent migration: every agent's settings.json should carry the
@@ -100,10 +110,21 @@ export function ensureDefaultScheduledTasks(): void {
     for (const file of readdirSync(src)) {
       const srcFile = join(src, file)
       const destFile = join(dest, file)
+      // Seeded task dirs are flat; skip any nested directory rather than
+      // letting readFileSync/copyFileSync throw EISDIR and abort the whole
+      // seed for every remaining task.
+      if (statSync(srcFile).isDirectory()) continue
       if (file === 'task-config.json') {
         copyTaskConfigWithAgentRewrite(srcFile, destFile)
       } else {
-        copyFileSync(srcFile, destFile)
+        // Substitute the identity placeholders (same set the install scripts
+        // sed) so a template's SKILL.md never seeds a foreign absolute path or
+        // name into the user's task. Binary/unreadable -> fall back to a copy.
+        try {
+          writeFileSync(destFile, resolveTemplatePlaceholders(readFileSync(srcFile, 'utf-8')))
+        } catch {
+          copyFileSync(srcFile, destFile)
+        }
       }
     }
   }

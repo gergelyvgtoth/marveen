@@ -440,6 +440,7 @@ if [ -d "$SCHED_TPL_DIR" ]; then
           -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
           -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
           -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+          -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
           "$f" > "$target/$(basename "$f")"
     done
     echo -e "  ${GREEN}✓${NC} Utemezett feladat scaffoldolva: $task_name"
@@ -575,6 +576,7 @@ if [ -d "$SEED_SCHED_DIR" ]; then
           -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
           -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
           -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+          -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
           "$f" > "$target/$(basename "$f")"
     done
     SCHED_NEW=$((SCHED_NEW + 1))

@@ -180,6 +180,12 @@ const ENABLE_RX = /\benable\b/i
 describe('attemptChannelMcpReconnect', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    // Idle gate (channel-mcp-reconnect.ts): the function first captures the
+    // pane and only proceeds when it shows the Claude TUI idle footer
+    // ("bypass permissions on"). If Claude is mid-turn it defers to the next
+    // health-monitor cycle. Satisfy that pre-check so the per-test capture
+    // sequences below model the post-/mcp submenu navigation as before.
+    mockCapturePane.mockReturnValueOnce('bypass permissions on')
   })
 
   it('connected state: steps Down onto Reconnect, then activates it', () => {

@@ -20,12 +20,27 @@ import os
 import json
 import urllib.request
 
-API = "http://localhost:3420/api"
-
-
 def _project_root():
     # scripts/hooks/ -> project root is two up.
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _web_port():
+    # Config-driven dashboard port: WEB_PORT env, else .env, default 3420.
+    port = os.environ.get("WEB_PORT")
+    if not port:
+        try:
+            with open(os.path.join(_project_root(), ".env")) as f:
+                for line in f:
+                    if line.startswith("WEB_PORT="):
+                        port = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except Exception:
+            pass
+    return port or "3420"
+
+
+API = "http://localhost:%s/api" % _web_port()
 
 
 def _token():

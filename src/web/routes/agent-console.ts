@@ -157,7 +157,7 @@ export async function tryHandleAgentConsole(ctx: RouteContext): Promise<boolean>
 
     const agentInfo = AGENT_INFO[agentId]
     const isRunning = isSessionRunning(agentInfo.sessionName)
-    const rawOutput = isRunning ? capturePane(sessionName, SCROLLBACK_LINES) : null
+    const rawOutput = isRunning ? capturePane(sessionName, null, SCROLLBACK_LINES) : null
     const output = getCaptureLines(rawOutput, SCROLLBACK_LINES)
 
     json(res, {

@@ -6,6 +6,10 @@ INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$INSTALL_DIR/logs/watchdog.log"
 mkdir -p "$INSTALL_DIR/logs"
 
+# Dashboard port: config-driven (.env WEB_PORT), default 3420.
+[ -f "$INSTALL_DIR/.env" ] && WEB_PORT="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
+WEB_PORT="${WEB_PORT:-3420}"
+
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
 
@@ -30,7 +34,7 @@ replay_unfinished_messages() {
 
   RESPONSE=$(curl -s -m 5 \
     -H "Authorization: Bearer $TOKEN" \
-    "http://localhost:3420/api/messages?to=${AGENT_ID}&limit=200" 2>/dev/null) || return
+    "http://localhost:${WEB_PORT}/api/messages?to=${AGENT_ID}&limit=200" 2>/dev/null) || return
 
   [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ] && return
 
@@ -202,7 +206,7 @@ for AGENT_DIR in "$INSTALL_DIR/agents"/*/; do
     continue
   fi
 
-  CMD="export PATH=\"/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" && unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN && export TELEGRAM_STATE_DIR=\"$CHAN_DIR\" && cd \"$AGENT_DIR\" && ${CLAUDE_BIN} --dangerously-skip-permissions --model $MODEL --channels plugin:telegram@claude-plugins-official"
+  CMD="export PATH=\"/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" && unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN && export TELEGRAM_STATE_DIR=\"$CHAN_DIR\" && cd \"$AGENT_DIR\" && ${CLAUDE_BIN} --dangerously-skip-permissions --model '$MODEL' --channels plugin:telegram@claude-plugins-official"
 
   tmux new-session -d -s "$SESSION_NAME" "$CMD" 2>/dev/null
   sleep 2

@@ -104,6 +104,14 @@ function resolveClaudeCodeBin(): string | undefined {
   return cachedClaudeCodeBin
 }
 
+// Backend selector (jun.15 subscription migration). 'worker' (default) routes
+// to a persistent INTERACTIVE Claude Code session in tmux (subscription login);
+// 'sdk' keeps the legacy Agent SDK `query` path (API billing) as an emergency
+// rollback via MARVEEN_AGENT_BACKEND=sdk.
+function agentBackend(): 'worker' | 'sdk' {
+  return (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() === 'sdk' ? 'sdk' : 'worker'
+}
+
 export async function runAgent(
   message: string,
   sessionId?: string,
@@ -112,6 +120,24 @@ export async function runAgent(
   cwd: string = PROJECT_ROOT,
   env?: Record<string, string | undefined>,
 ): Promise<{ text: string | null; newSessionId?: string; error?: string }> {
+  if (agentBackend() === 'worker') {
+    // The interactive worker is a single shared session with its own fixed,
+    // isolated, NEUTRAL cwd/config -- so the SDK-era per-call cwd/env isolation
+    // hacks (CLAUDE_CONFIG_DIR to dodge the telegram-plugin 409) are subsumed
+    // and intentionally ignored here. resume/sessionId is unsupported (no caller
+    // uses it). Dynamic import keeps the SDK module off the worker-path hot path
+    // and avoids any load-order coupling.
+    if (sessionId) logger.warn('runAgent(worker): resume/sessionId not supported on worker backend, ignoring')
+    const { runViaWorker } = await import('./web/agent-worker.js')
+    const { text, error, authFailed } = await runViaWorker(message, AGENT_TIMEOUT_MS)
+    // authFailed = the worker could not recover its subscription auth even after
+    // a reseed + clear-keychain + restart + retry. Fall through to the SDK path
+    // so the call still completes (API billing) instead of dying silently (the
+    // 2026-06-10 bake failure mode). Every other outcome returns as-is.
+    if (!authFailed) return { text, error }
+    logger.error('runAgent: worker auth unrecoverable, falling back to SDK backend for this call (API billing)')
+  }
+  // --- legacy SDK path (rollback: MARVEEN_AGENT_BACKEND=sdk; API billing) ---
   let newSessionId: string | undefined
   let resultText: string | null = null
   let blockedReason: string | undefined

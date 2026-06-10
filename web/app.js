@@ -1501,6 +1501,42 @@ function channelTip(isConnected) {
     : 'Offline: nincs csatorna bekötve (channel-less, csak inter-agent ágens).'
 }
 
+// Build the copy-paste tmux attach command for an agent live session. A local
+// agent session runs on the orchestrator host (a direct `tmux attach`); a remote
+// agent session runs on its configured remoteHost, reached over ssh. Only
+// meaningful for running agents.
+function tmuxAttachCommand(agent) {
+  const session = agent.session || ('agent-' + agent.name)
+  const direct = 'tmux attach -t ' + session
+  const remoteHost = agent.remoteHost || null
+  return remoteHost ? 'ssh ' + remoteHost + " -t '" + direct + "'" : direct
+}
+
+// Append a single "copy tmux attach command" button to a running agent card.
+// Clicks copy to clipboard and never bubble to the card open-detail handler.
+function attachTmuxCopyButtons(card, agent) {
+  const cmd = tmuxAttachCommand(agent)
+  const row = document.createElement('div')
+  row.className = 'agent-tmux-cmds'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'tmux-copy-btn'
+  btn.setAttribute('aria-label', 'tmux attach parancs masolasa')
+  btn.title = cmd
+  btn.innerHTML = '<span class="tmux-copy-ico">⧉</span>tmux'
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    navigator.clipboard.writeText(cmd).then(() => {
+      const orig = btn.innerHTML
+      btn.classList.add('copied')
+      btn.innerHTML = '<span class="tmux-copy-ico">✓</span>masolva'
+      setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('copied') }, 1400)
+    }).catch(() => showToast('Masolas sikertelen'))
+  })
+  row.appendChild(btn)
+  card.appendChild(row)
+}
+
 function renderAgents() {
   agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((el) => el.remove())
 
@@ -1593,6 +1629,9 @@ function renderAgents() {
       e.stopPropagation(); openTerminalModal(agent.name)
     })
     card.addEventListener('click', () => openAgentDetail(agent.name))
+    // Only running agents have a live session to look at, so only they get the
+    // copy-the-tmux-command buttons.
+    if (isRunning) attachTmuxCopyButtons(card, agent)
     agentsGrid.insertBefore(card, addBtn)
   }
 }
@@ -3609,6 +3648,9 @@ function renderScheduleList(tasks) {
         </div>
       </div>
       <div class="schedule-actions">
+        <button class="btn-icon" data-action="run" title="Futtatás most">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+        </button>
         <button class="btn-icon" data-action="toggle" title="${task.enabled ? 'Szüneteltetés' : 'Folytatás'}">
           ${task.enabled ? pauseIcon() : playIcon()}
         </button>
@@ -3625,6 +3667,17 @@ function renderScheduleList(tasks) {
     })
 
     // Action buttons
+    row.querySelector('[data-action="run"]').addEventListener('click', async (e) => {
+      e.stopPropagation()
+      try {
+        const r = await fetch(`/api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
+        const data = await r.json().catch(() => ({}))
+        if (r.ok) showToast('Feladat elindítva' + (data.result ? ': ' + data.result : ''))
+        else showToast('Hiba: ' + (data.error || r.status))
+        loadSchedules()
+      } catch { showToast('Hiba a futtatáskor') }
+    })
+
     row.querySelector('[data-action="toggle"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
@@ -7418,37 +7471,63 @@ function renderTeamGraph(container, data) {
     }
     return div
   }
-  // BFS levels starting from main
-  const levels = [[mainAgentId]]
+  // Render as a nested tree so each report sits directly under its own
+  // manager. A flat BFS-by-row layout made a leader's reports look like they
+  // belonged to whichever node happened to be above them in the row.
   const seen = new Set([mainAgentId])
-  while (levels[levels.length - 1].length) {
-    const nextIds = []
-    for (const id of levels[levels.length - 1]) {
-      for (const child of childrenOf.get(id) || []) {
-        if (!seen.has(child)) { seen.add(child); nextIds.push(child) }
-      }
-    }
-    if (nextIds.length === 0) break
-    levels.push(nextIds)
-  }
-  // Orphans (nodes not reachable from main, shouldn't happen with the auto
-  // fallback on the backend but guard just in case) go to a trailing level.
-  const orphans = nodes.filter(n => !seen.has(n.id))
-  if (orphans.length) levels.push(orphans.map(n => n.id))
-  for (let i = 0; i < levels.length; i++) {
-    const level = document.createElement('div')
-    level.className = 'team-level'
-    for (const id of levels[i]) {
-      const node = byId.get(id)
-      if (!node) continue
-      level.appendChild(renderNode(node))
-    }
-    container.appendChild(level)
-    if (i < levels.length - 1) {
+  const renderSubtree = (id) => {
+    const node = byId.get(id)
+    if (!node) return null
+    const col = document.createElement('div')
+    col.className = 'team-subtree'
+    col.appendChild(renderNode(node))
+    const kids = (childrenOf.get(id) || []).filter(c => !seen.has(c) && byId.has(c))
+    for (const c of kids) seen.add(c)
+    if (kids.length) {
       const conn = document.createElement('div')
       conn.className = 'team-connector'
-      container.appendChild(conn)
+      col.appendChild(conn)
+      const row = document.createElement('div')
+      row.className = 'team-children'
+      for (const c of kids) {
+        const sub = renderSubtree(c)
+        if (sub) row.appendChild(sub)
+      }
+      col.appendChild(row)
     }
+    return col
+  }
+  // Main on top, then a row of its direct reports (each carrying its own
+  // subtree beneath it).
+  const mainNode = byId.get(mainAgentId)
+  if (mainNode) {
+    const mainRow = document.createElement('div')
+    mainRow.className = 'team-level'
+    mainRow.appendChild(renderNode(mainNode))
+    container.appendChild(mainRow)
+  }
+  const directs = (childrenOf.get(mainAgentId) || []).filter(c => !seen.has(c) && byId.has(c))
+  for (const c of directs) seen.add(c)
+  if (directs.length) {
+    const conn = document.createElement('div')
+    conn.className = 'team-connector'
+    container.appendChild(conn)
+    const row = document.createElement('div')
+    row.className = 'team-children team-roots'
+    for (const c of directs) {
+      const sub = renderSubtree(c)
+      if (sub) row.appendChild(sub)
+    }
+    container.appendChild(row)
+  }
+  // Orphans (nodes not reachable from main, shouldn't happen with the auto
+  // fallback on the backend but guard just in case) go to a trailing row.
+  const orphans = nodes.filter(n => !seen.has(n.id))
+  if (orphans.length) {
+    const row = document.createElement('div')
+    row.className = 'team-level'
+    for (const n of orphans) row.appendChild(renderNode(n))
+    container.appendChild(row)
   }
   if (nodes.length === 1) {
     const empty = document.createElement('div')

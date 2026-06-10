@@ -1,5 +1,5 @@
 # Dependencies & build
-node_modules/
+node_modules
 dist/
 
 # Python bytecode cache (e.g. scripts/hooks/__pycache__/*.pyc)
@@ -53,3 +53,21 @@ claudeclaw.log
 # Local backup archives from scripts/backup.sh
 backups/
 dist.prev/
+
+# GitNexus knowledge-graph index (local, per-clone; auto-rebuilt by the post-commit hook)
+.gitnexus/
+
+# Local one-off artifacts (brainstorm docs, runtime state, rebuild prompts) --
+# never committed; ignored to prevent accidental `git add -A` bloat.
+DREAM.md
+.external-ops-last-run
+REBUILD_PROMPT_V3.1.md
+
+# Operator's branded support auto-reply. The shipped support-mail tooling is a
+# generic IMAP/SMTP CLI (no operator data); each operator keeps their own
+# branded auto-reply here locally. Ignored so it never ships to other installs.
+scripts/support-mail/no-support-reply.html
+
+# Python bytecode cache
+__pycache__/
+*.pyc

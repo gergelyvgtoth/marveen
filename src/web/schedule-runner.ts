@@ -1,7 +1,5 @@
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
-import { execSync, execFileSync } from 'node:child_process'
-import { resolveFromPath } from '../platform.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
 import {
@@ -29,18 +27,20 @@ import {
   listScheduledTasks,
   type ScheduledTask,
 } from './scheduled-tasks-io.js'
-import { listAgentNames, readFileOr } from './agent-config.js'
+import { listAgentNames, readFileOr, readAgentRemoteHost } from './agent-config.js'
 import {
   agentSessionName,
   isAgentRunning,
   isSessionReadyForPrompt,
   capturePane,
   sendPromptToSession,
+  startAgentProcess,
+  sessionExistsOnHost,
+  sendEnterToSession,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
-
-const TMUX = resolveFromPath('tmux')
+import { runCommandTask } from './command-task.js'
 
 // --- Schedule Runner ---
 // Checks every minute if any scheduled task is due and injects the prompt
@@ -112,7 +112,7 @@ function persistScheduleLastRun(): void {
 // Try to fire a task at a single target agent. Returns the outcome so the
 // caller can decide whether to queue a retry. Splitting this out means the
 // pendingTaskRetries loop and the normal cron loop share one code path.
-function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'error' {
+function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'starting' | 'error' {
   const isMainAgent = agentName === MAIN_AGENT_ID
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
@@ -120,15 +120,32 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
     ? task.targetSession
     : isMainAgent ? MAIN_CHANNELS_SESSION : agentSessionName(agentName)
 
-  let sessionExists = false
-  try {
-    const sessions = execSync(`${TMUX} list-sessions -F "#{session_name}"`, { timeout: 3000, encoding: 'utf-8' })
-    sessionExists = sessions.split('\n').some(s => s.trim() === session)
-  } catch { /* no tmux */ }
+  // A remote sub-agent's session lives on the laptop -- resolve its host so the
+  // existence/readiness checks and the send cross the ssh boundary. A custom
+  // targetSession override and the main channels agent stay local (host=null).
+  const host = (task.targetSession || isMainAgent) ? null : readAgentRemoteHost(agentName)
 
-  if (!sessionExists) {
-    logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session not running, skipping')
-    return 'missing'
+  if (!sessionExistsOnHost(host, session)) {
+    // Auto-start the agent, then deliver on a later tick. A daily batch agent
+    // (e.g. a `0 2 * * *` digest) has no 24/7 session, so a cron fire used to
+    // just skip here -- the task never ran. Launch the session now and return
+    // 'starting'; the caller enqueues a retry that bypasses skipIfBusy (waking
+    // the agent for its scheduled run is the whole point, so a skipIfBusy=true
+    // task must NOT drop the delivery). The next tick finds the session up and
+    // sends once Claude has booted (isSessionReadyForPrompt). host-aware:
+    // startAgentProcess is itself remote-aware and launches over ssh when the
+    // target agent is remote, so a missing remote session is auto-started too.
+    const start = startAgentProcess(agentName)
+    if (!start.ok) {
+      // "already running" means it raced up between the check and here -- treat
+      // as busy so the normal retry path delivers. Any other failure (config
+      // error, launch failure) is a real miss: log and skip this tick.
+      if (/already running/i.test(start.error ?? '')) return 'busy'
+      logger.warn({ task: task.name, agent: agentName, session, error: start.error }, 'Schedule target session missing, auto-start failed')
+      return 'missing'
+    }
+    logger.info({ task: task.name, agent: agentName, session }, 'Schedule target session missing, auto-started agent; will deliver on retry')
+    return 'starting'
   }
 
   // Rate limit guard: check stored expiry first, then sample the live pane.
@@ -156,7 +173,7 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
   // will process it at the next idle slot. This prevents the infinite
   // retry loop observed when the target session stays busy for hours
   // (275 retries overnight in production).
-  if (!task.forceSend && !isSessionReadyForPrompt(session)) {
+  if (!task.forceSend && !isSessionReadyForPrompt(session, host)) {
     logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session busy or has pending input, will retry')
     return 'busy'
   }
@@ -198,7 +215,7 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
       UNTRUSTED_PREAMBLE + '\n' +
       prefix.trimEnd() + '\n\n' +
       wrapUntrusted(`scheduled-task:${task.name}`, task.prompt)
-    sendPromptToSession(session, fullPrompt)
+    sendPromptToSession(session, fullPrompt, host)
     scheduleLastRun.set(task.name, now)
     persistScheduleLastRun()
     appendTaskRun(task.name, agentName)
@@ -215,14 +232,16 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
       : `[Utemezett feladat: ${task.name}]`
     const resubmit = (attempt: number) => {
       try {
-        const pane = execFileSync(TMUX, ['capture-pane', '-t', session, '-p'], { timeout: 3000, encoding: 'utf-8' })
-        const stuck = /❯\s+\S/.test(pane) && pane.includes(marker)
+        // Host-aware so a remote agent's post-send stuck-check + recovery Enter
+        // hit the laptop session, not a (nonexistent) local one.
+        const pane = capturePane(session, host)
+        const stuck = pane != null && /❯\s+\S/.test(pane) && pane.includes(marker)
         if (!stuck) return
         if (attempt >= 5) {
           logger.warn({ task: task.name, session }, 'Scheduled prompt still stuck after 5 Enter retries -- giving up')
           return
         }
-        execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 3000 })
+        sendEnterToSession(session, host)
         setTimeout(() => resubmit(attempt + 1), 3000)
       } catch (err) {
         logger.warn({ err, task: task.name }, 'Post-send resubmit failed')
@@ -234,6 +253,36 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
     logger.warn({ err, task: task.name }, 'Failed to fire scheduled task')
     return 'error'
   }
+}
+
+// Manual "Run now": fire a scheduled task immediately, bypassing the cron
+// match + lastRun catch-up + skipIfBusy guards (the operator explicitly asked
+// for it). Reuses attemptFireTask, so a stopped agent is auto-started and the
+// prompt is queued for delivery exactly like a real cron fire. Returns a
+// per-target summary string for the API/UI.
+export function runScheduledTaskNow(taskName: string): { ok: boolean; result?: string; error?: string } {
+  const task = listScheduledTasks().find(t => t.name === taskName)
+  if (!task) return { ok: false, error: 'Schedule not found' }
+  if (!task.enabled) return { ok: false, error: 'Schedule is disabled' }
+
+  const now = Date.now()
+  const targets = task.agent === 'all'
+    ? [MAIN_AGENT_ID, ...listAgentNames().filter(a => isAgentRunning(a))]
+    : [task.agent || MAIN_AGENT_ID]
+
+  const summary: string[] = []
+  for (const agentName of targets) {
+    const result = attemptFireTask(task, agentName, now)
+    // A manual run ALWAYS wants delivery: an auto-started ('starting') or a
+    // busy session both get a queued retry that lands once the session is
+    // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
+    // redundant cron ticks, but an explicit run-now must not be dropped.
+    if (result === 'starting' || result === 'busy') {
+      insertPendingTaskRetryIfNew(task.name, agentName, now, result)
+    }
+    summary.push(`${agentName}: ${result}`)
+  }
+  return { ok: true, result: summary.join(', ') }
 }
 
 // Fire a Telegram alert when a pending retry has been stuck past the
@@ -367,6 +416,17 @@ export function startScheduleRunner(): NodeJS.Timeout {
       const lastRun = scheduleLastRun.get(task.name) || 0
       if (now - lastRun < catchUp) continue
 
+      // type='command' tasks run a raw shell command directly -- no LLM, no
+      // tmux, no target agent. They self-manage failure streaks + Telegram
+      // alerts. Record the run time like a fired task so the catch-up window
+      // does not double-run them on a dashboard restart.
+      if (task.type === 'command') {
+        runCommandTask(task, now)
+        scheduleLastRun.set(task.name, now)
+        persistScheduleLastRun()
+        continue
+      }
+
       let targetAgents: string[]
 
       if (task.agent === 'all') {
@@ -383,7 +443,14 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
         const result = attemptFireTask(task, agentName, now)
-        if (result === 'busy') {
+        if (result === 'starting') {
+          // Agent was auto-started this tick. ALWAYS enqueue the retry that
+          // delivers the prompt once the session is ready -- skipIfBusy must
+          // NOT drop it (that flag is for genuinely-busy short-cadence tasks;
+          // here we deliberately woke the agent for its scheduled run). The
+          // pending-retry loop then sends as soon as Claude has booted.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting')
+        } else if (result === 'busy') {
           if (task.skipIfBusy) {
             // Opt-in skip for short-cadence tasks (e.g. 30-min heartbeats):
             // a single missed tick is harmless because the next one is
