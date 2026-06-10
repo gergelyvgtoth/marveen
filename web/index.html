@@ -1357,17 +1357,21 @@
         <div class="page-header-row">
           <div>
             <h1>Naptár</h1>
-            <p class="subtitle">Kanban határidők havi nézetben</p>
+            <p class="subtitle" id="calSubtitle">Kanban határidők heti nézetben</p>
           </div>
-          <div style="display:flex;gap:8px;align-items:center;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <div class="cal-mode-toggle">
+              <button class="cal-mode-btn active" id="calModeWeek" data-mode="week">Heti</button>
+              <button class="cal-mode-btn" id="calModeMonth" data-mode="month">Havi</button>
+            </div>
             <button class="btn-secondary btn-compact" id="calPrev">&#8249;</button>
-            <span id="calMonthLabel" style="font-weight:600;min-width:140px;text-align:center;font-size:15px;"></span>
+            <span id="calMonthLabel" style="font-weight:600;min-width:160px;text-align:center;font-size:15px;"></span>
             <button class="btn-secondary btn-compact" id="calNext">&#8250;</button>
             <button class="btn-secondary btn-compact" id="calToday">Ma</button>
           </div>
         </div>
       </div>
-      <div class="cal-grid-header">
+      <div class="cal-grid-header" id="calGridHeader">
         <div>H</div><div>K</div><div>Sze</div><div>Cs</div><div>P</div><div>Szo</div><div>V</div>
       </div>
       <div class="cal-grid" id="calGrid"></div>

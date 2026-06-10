@@ -10750,20 +10750,44 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
   if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
 })
 // === Calendar ===
-let calYear = new Date().getFullYear()
-let calMonth = new Date().getMonth() + 1
-
 const MONTH_NAMES = ['Január','Február','Március','Április','Május','Június','Július','Augusztus','Szeptember','Október','November','December']
 const PRIORITY_CLASS = { urgent: 'cal-card--urgent', high: 'cal-card--high' }
 
+const calState = {
+  mode: 'week',
+  year: new Date().getFullYear(),
+  month: new Date().getMonth() + 1,
+  day: new Date().getDate()
+}
+
+function calIsoDate(y, m, d) {
+  return y + '-' + String(m).padStart(2,'0') + '-' + String(d).padStart(2,'0')
+}
+
+function calWeekMonday(y, m, d) {
+  const dt = new Date(y, m - 1, d)
+  const dow = dt.getDay() === 0 ? 7 : dt.getDay()
+  dt.setDate(dt.getDate() - (dow - 1))
+  return dt
+}
+
 async function loadCalendar() {
-  document.getElementById('calMonthLabel').textContent = MONTH_NAMES[calMonth - 1] + ' ' + calYear
+  const { mode, year, month, day } = calState
   const grid = document.getElementById('calGrid')
+  const label = document.getElementById('calMonthLabel')
+  const subtitle = document.getElementById('calSubtitle')
+
+  document.getElementById('calModeWeek').classList.toggle('active', mode === 'week')
+  document.getElementById('calModeMonth').classList.toggle('active', mode === 'month')
+
   grid.innerHTML = '<div style="padding:20px;color:var(--text-muted)">Betöltés...</div>'
+
+  let params = `year=${year}&month=${month}&mode=${mode}`
+  if (mode === 'week') params += `&day=${day}`
 
   let data
   try {
-    const res = await fetch(`/api/calendar?year=${calYear}&month=${calMonth}`)
+    const res = await fetch(`/api/calendar?${params}`)
     data = await res.json()
   } catch {
     grid.innerHTML = '<div style="padding:20px;color:var(--danger)">Betöltési hiba</div>'
@@ -10772,62 +10796,112 @@ async function loadCalendar() {
 
   const byDate = data.byDate || {}
   const today = new Date()
-  const todayStr = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0')
+  const todayStr = calIsoDate(today.getFullYear(), today.getMonth()+1, today.getDate())
 
-  // first day of month (1=Mon .. 7=Sun in ISO week)
-  const firstDay = new Date(calYear, calMonth - 1, 1)
-  const daysInMonth = new Date(calYear, calMonth, 0).getDate()
-  let startDow = firstDay.getDay() // 0=Sun
-  if (startDow === 0) startDow = 7 // convert to Mon-based
-  const leadingEmpty = startDow - 1
+  if (mode === 'week') {
+    subtitle.textContent = 'Kanban határidők heti nézetben'
+    const mon = calWeekMonday(year, month, day)
+    const sun = new Date(mon); sun.setDate(mon.getDate() + 6)
+    const monStr = (mon.getDate()) + '. ' + MONTH_NAMES[mon.getMonth()].slice(0,3)
+    const sunStr = (sun.getDate()) + '. ' + MONTH_NAMES[sun.getMonth()].slice(0,3)
+    label.textContent = monStr + ' - ' + sunStr + ' ' + year
 
-  // prev month fill
-  const prevMonthDays = new Date(calYear, calMonth - 1, 0).getDate()
+    const cells = []
+    for (let i = 0; i < 7; i++) {
+      const dt = new Date(mon); dt.setDate(mon.getDate() + i)
+      cells.push({
+        dt,
+        dateStr: calIsoDate(dt.getFullYear(), dt.getMonth()+1, dt.getDate()),
+        other: false
+      })
+    }
 
-  const cells = []
-  for (let i = leadingEmpty - 1; i >= 0; i--) {
-    cells.push({ day: prevMonthDays - i, other: true, dateStr: null })
-  }
-  for (let d = 1; d <= daysInMonth; d++) {
-    const dateStr = calYear + '-' + String(calMonth).padStart(2,'0') + '-' + String(d).padStart(2,'0')
-    cells.push({ day: d, other: false, dateStr })
-  }
-  const trailing = 7 - (cells.length % 7)
-  if (trailing < 7) {
-    for (let d = 1; d <= trailing; d++) cells.push({ day: d, other: true, dateStr: null })
-  }
-
-  grid.innerHTML = cells.map(cell => {
-    const cards = (cell.dateStr && byDate[cell.dateStr]) || []
-    let cls = 'cal-day'
-    if (cell.other) cls += ' cal-day--other'
-    if (cell.dateStr === todayStr) cls += ' cal-day--today'
-    const cardHtml = cards.map(c => {
-      let ccls = 'cal-card'
-      if (PRIORITY_CLASS[c.priority]) ccls += ' ' + PRIORITY_CLASS[c.priority]
-      if (c.status === 'done') ccls += ' cal-card--done'
-      const proj = c.project ? `<span class="cal-card-project">${escapeHtml(c.project)}</span>` : ''
-      return `<div class="${ccls}" title="${escapeHtml(c.title)}">${proj}${escapeHtml(c.title)}</div>`
+    grid.style.gridTemplateColumns = 'repeat(7, 1fr)'
+    grid.innerHTML = cells.map(cell => {
+      const cards = byDate[cell.dateStr] || []
+      let cls = 'cal-day cal-day--week'
+      if (cell.dateStr === todayStr) cls += ' cal-day--today'
+      const dow = ['V','H','K','Sze','Cs','P','Szo'][cell.dt.getDay()]
+      const cardHtml = cards.map(c => {
+        let ccls = 'cal-card'
+        if (PRIORITY_CLASS[c.priority]) ccls += ' ' + PRIORITY_CLASS[c.priority]
+        if (c.status === 'done') ccls += ' cal-card--done'
+        const proj = c.project ? `<span class="cal-card-project">${escapeHtml(c.project)}</span>` : ''
+        return `<div class="${ccls}" title="${escapeHtml(c.title)}">${proj}${escapeHtml(c.title)}</div>`
+      }).join('')
+      return `<div class="${cls}"><span class="cal-day-num">${dow} ${cell.dt.getDate()}.</span>${cardHtml}</div>`
     }).join('')
-    return `<div class="${cls}"><span class="cal-day-num">${cell.day}</span>${cardHtml}</div>`
-  }).join('')
+
+  } else {
+    subtitle.textContent = 'Kanban határidők havi nézetben'
+    label.textContent = MONTH_NAMES[month - 1] + ' ' + year
+
+    const firstDay = new Date(year, month - 1, 1)
+    const daysInMonth = new Date(year, month, 0).getDate()
+    let startDow = firstDay.getDay()
+    if (startDow === 0) startDow = 7
+    const leadingEmpty = startDow - 1
+    const prevMonthDays = new Date(year, month - 1, 0).getDate()
+
+    const cells = []
+    for (let i = leadingEmpty - 1; i >= 0; i--) {
+      cells.push({ day: prevMonthDays - i, other: true, dateStr: null })
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+      cells.push({ day: d, other: false, dateStr: calIsoDate(year, month, d) })
+    }
+    const trailing = 7 - (cells.length % 7)
+    if (trailing < 7) {
+      for (let d = 1; d <= trailing; d++) cells.push({ day: d, other: true, dateStr: null })
+    }
+
+    grid.style.gridTemplateColumns = 'repeat(7, 1fr)'
+    grid.innerHTML = cells.map(cell => {
+      const cards = (cell.dateStr && byDate[cell.dateStr]) || []
+      let cls = 'cal-day'
+      if (cell.other) cls += ' cal-day--other'
+      if (cell.dateStr === todayStr) cls += ' cal-day--today'
+      const cardHtml = cards.map(c => {
+        let ccls = 'cal-card'
+        if (PRIORITY_CLASS[c.priority]) ccls += ' ' + PRIORITY_CLASS[c.priority]
+        if (c.status === 'done') ccls += ' cal-card--done'
+        const proj = c.project ? `<span class="cal-card-project">${escapeHtml(c.project)}</span>` : ''
+        return `<div class="${ccls}" title="${escapeHtml(c.title)}">${proj}${escapeHtml(c.title)}</div>`
+      }).join('')
+      return `<div class="${cls}"><span class="cal-day-num">${cell.day}</span>${cardHtml}</div>`
+    }).join('')
+  }
 }
 
 document.getElementById('calPrev')?.addEventListener('click', () => {
-  calMonth--
-  if (calMonth < 1) { calMonth = 12; calYear-- }
+  if (calState.mode === 'week') {
+    const mon = calWeekMonday(calState.year, calState.month, calState.day)
+    mon.setDate(mon.getDate() - 7)
+    calState.year = mon.getFullYear(); calState.month = mon.getMonth()+1; calState.day = mon.getDate()
+  } else {
+    calState.month--
+    if (calState.month < 1) { calState.month = 12; calState.year-- }
+  }
   loadCalendar()
 })
 document.getElementById('calNext')?.addEventListener('click', () => {
-  calMonth++
-  if (calMonth > 12) { calMonth = 1; calYear++ }
+  if (calState.mode === 'week') {
+    const mon = calWeekMonday(calState.year, calState.month, calState.day)
+    mon.setDate(mon.getDate() + 7)
+    calState.year = mon.getFullYear(); calState.month = mon.getMonth()+1; calState.day = mon.getDate()
+  } else {
+    calState.month++
+    if (calState.month > 12) { calState.month = 1; calState.year++ }
+  }
   loadCalendar()
 })
 document.getElementById('calToday')?.addEventListener('click', () => {
-  calYear = new Date().getFullYear()
-  calMonth = new Date().getMonth() + 1
+  const n = new Date()
+  calState.year = n.getFullYear(); calState.month = n.getMonth()+1; calState.day = n.getDate()
   loadCalendar()
 })
+document.getElementById('calModeWeek')?.addEventListener('click', () => { calState.mode = 'week'; loadCalendar() })
+document.getElementById('calModeMonth')?.addEventListener('click', () => { calState.mode = 'month'; loadCalendar() })
 
 ;(() => {
   function routeFromHash() {

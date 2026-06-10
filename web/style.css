@@ -5383,6 +5383,28 @@ main {
 .xterm { height: 100% !important; }
 
 /* === Calendar === */
+.cal-mode-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.cal-mode-btn {
+  background: var(--bg-card);
+  border: none;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.cal-mode-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+.cal-mode-btn:hover:not(.active) { background: var(--bg-card-hover); }
+
 .cal-grid-header {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
@@ -5400,6 +5422,9 @@ main {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   gap: 4px;
+}
+.cal-day--week {
+  min-height: 200px;
 }
 .cal-day {
   min-height: 90px;
