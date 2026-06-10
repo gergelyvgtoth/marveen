@@ -8067,11 +8067,68 @@ async function loadSystemHealth() {
 let sysHealthTimer = null
 function startSystemHealthPoll() {
   loadSystemHealth()
+  loadWatchdogCard()
   if (sysHealthTimer) return
-  sysHealthTimer = setInterval(loadSystemHealth, 20000)
+  sysHealthTimer = setInterval(() => { loadSystemHealth(); loadWatchdogCard() }, 20000)
 }
 function stopSystemHealthPoll() {
   if (sysHealthTimer) { clearInterval(sysHealthTimer); sysHealthTimer = null }
+}
+
+function fmtTs(ms) {
+  if (!ms) return '—'
+  const now = Date.now()
+  const diff = now - ms
+  if (diff < 0) {
+    const future = -diff
+    if (future < 60000) return `${Math.round(future/1000)}mp múlva`
+    if (future < 3600000) return `${Math.round(future/60000)} perc múlva`
+    return `${Math.round(future/3600000)} óra múlva`
+  }
+  if (diff < 60000) return `${Math.round(diff/1000)} másodperce`
+  if (diff < 3600000) return `${Math.round(diff/60000)} perce`
+  if (diff < 86400000) return `${Math.round(diff/3600000)} órája`
+  return new Date(ms).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+}
+
+async function loadWatchdogCard() {
+  const container = document.getElementById('watchdogTable')
+  const meta = document.getElementById('watchdogCardMeta')
+  if (!container) return
+  try {
+    const res = await fetch('/api/watchdog-status')
+    if (!res.ok) return
+    const d = await res.json()
+    const wds = d.watchdogs || []
+    if (meta) meta.textContent = `${wds.filter(w => w.active).length}/${wds.length} aktív`
+    let html = '<table class="wd-table"><thead><tr>'
+      + '<th>Watchdog</th><th>Státusz</th><th>Utolsó futás</th><th>Következő</th><th>Log</th>'
+      + '</tr></thead><tbody>'
+    for (const w of wds) {
+      const dot = `<span class="sys-health-dot ${w.active ? (w.lastResult==='failed'?'bad':'ok') : 'bad'}" style="flex-shrink:0"></span>`
+      const statusText = !w.active ? 'leállt' : w.lastResult === 'failed' ? 'hibás' : 'aktív'
+      const logHtml = w.recentLog && w.recentLog.length
+        ? `<div class="wd-log">${w.recentLog.map(l => escHtml(l)).join('\n')}</div>`
+        : '<span style="color:var(--text-muted);font-size:11px">nincs log</span>'
+      html += `<tr>
+        <td>
+          <div style="font-weight:600">${escHtml(w.label)}</div>
+          <div class="wd-desc">${escHtml(w.description)}</div>
+          <div class="wd-schedule">${escHtml(w.scheduler === 'cron' ? '🔁 cron' : '⏱ systemd')} · ${escHtml(w.schedule)}</div>
+        </td>
+        <td><div class="wd-status">${dot}<span>${statusText}</span></div></td>
+        <td>${fmtTs(w.lastRunAt)}</td>
+        <td>${fmtTs(w.nextRunAt)}</td>
+        <td>${logHtml}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    container.innerHTML = html
+  } catch { /* best-effort */ }
+}
+
+function escHtml(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
 }
 
 async function loadOverview() {

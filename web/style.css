@@ -453,6 +453,18 @@ main {
 }
 .overview-card-head h3 { font-size: 16px; font-weight: 600; }
 .overview-card-meta { font-size: 12px; color: var(--text-muted); }
+.overview-card--full { grid-column: 1 / -1; }
+
+/* Watchdog table */
+.wd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.wd-table th { text-align: left; padding: 6px 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+.wd-table td { padding: 10px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.wd-table tr:last-child td { border-bottom: none; }
+.wd-table tr:hover td { background: var(--bg-hover, rgba(255,255,255,.03)); }
+.wd-status { display: flex; align-items: center; gap: 6px; }
+.wd-desc { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+.wd-schedule { color: var(--text-muted); font-size: 11px; }
+.wd-log { margin-top: 6px; padding: 6px 8px; background: var(--bg-code, #1a1a1a); border-radius: 4px; font-family: monospace; font-size: 11px; color: var(--text-secondary); max-height: 90px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
 
 .overview-team-graph {
   padding: 12px 0;

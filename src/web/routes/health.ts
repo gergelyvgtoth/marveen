@@ -1,4 +1,6 @@
 import { execSync } from 'node:child_process'
+import { existsSync, statSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { MAIN_AGENT_ID } from '../../config.js'
 import { MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import { isSessionRunning } from '../agent-process.js'
@@ -8,10 +10,15 @@ import type { RouteContext } from './types.js'
 
 interface WatchdogStatus {
   name: string
+  label: string
+  description: string        // what this watchdog guards
+  scheduler: 'systemd' | 'cron'
+  schedule: string           // human-readable interval
   active: boolean
   lastRunAt: number | null   // ms epoch
   nextRunAt: number | null   // ms epoch
   lastResult: string | null  // 'success' | 'failed' | null
+  recentLog: string[]        // last N log lines
 }
 
 function parseSystemdDate(val: string): number | null {
@@ -37,8 +44,36 @@ function parseMonotonicOffset(val: string): number | null {
   return total > 0 ? Date.now() + total : null
 }
 
-function queryTimer(timerUnit: string): WatchdogStatus {
+function readLogTail(logPath: string, lines = 8): string[] {
+  if (!existsSync(logPath)) return []
+  try {
+    const content = readFileSync(logPath, 'utf8')
+    return content.trim().split('\n').slice(-lines).filter(Boolean)
+  } catch { return [] }
+}
+
+const WATCHDOG_META: Record<string, { label: string; description: string; schedule: string }> = {
+  'channel-watchdog': {
+    label: 'Csatorna watchdog',
+    description: 'Telegram/Slack plugin-kapcsolat ellenőrzése. Ha a csatorna néma vagy a bot-process megáll, riaszt és újraindítja.',
+    schedule: '5 percenként',
+  },
+  'marveen-fleet-watchdog': {
+    label: 'Fleet watchdog',
+    description: 'Az összes al-ágens (agrolanc, coder, mutacsi, tanulo) tmux-session állapotát figyeli. Leállt agenst automatikusan újraindítja.',
+    schedule: '5 percenként',
+  },
+  'watchdog-cron': {
+    label: 'Backend watchdog',
+    description: 'A dashboard backend (port 3420) élőségét ellenőrzi /api/health probe-bal. Ha nem válaszol, megöli a zombi-processt és újraindítja.',
+    schedule: '30 percenként (cron)',
+  },
+}
+
+function queryTimer(timerUnit: string, logPath?: string): WatchdogStatus {
   const name = timerUnit.replace('.timer', '')
+  const meta = WATCHDOG_META[name] ?? { label: name, description: '', schedule: '?' }
+  const recentLog = logPath ? readLogTail(logPath) : []
   try {
     const uid = process.getuid?.() ?? 1000
     const env = { ...process.env, XDG_RUNTIME_DIR: `/run/user/${uid}` }
@@ -53,7 +88,6 @@ function queryTimer(timerUnit: string): WatchdogStatus {
     }
     const active = props['ActiveState'] === 'active'
     const lastRunAt = parseSystemdDate(props['LastTriggerUSec'] ?? '')
-    // NextElapseUSecRealtime is empty for monotonic timers; fall back to monotonic offset
     const nextRunAt = parseSystemdDate(props['NextElapseUSecRealtime'] ?? '')
       ?? parseMonotonicOffset(props['NextElapseUSecMonotonic'] ?? '')
     let lastResult: string | null = null
@@ -65,9 +99,37 @@ function queryTimer(timerUnit: string): WatchdogStatus {
       const r = svcRaw.trim().split('=')[1] ?? ''
       lastResult = r === 'success' ? 'success' : r || null
     } catch { /* service may not exist separately */ }
-    return { name, active, lastRunAt, nextRunAt, lastResult }
+    return {
+      name, label: meta.label, description: meta.description,
+      scheduler: 'systemd', schedule: meta.schedule,
+      active, lastRunAt, nextRunAt, lastResult, recentLog,
+    }
   } catch {
-    return { name, active: false, lastRunAt: null, nextRunAt: null, lastResult: null }
+    return {
+      name, label: meta.label, description: meta.description,
+      scheduler: 'systemd', schedule: meta.schedule,
+      active: false, lastRunAt: null, nextRunAt: null, lastResult: null, recentLog,
+    }
+  }
+}
+
+function queryCronWatchdog(logPath: string): WatchdogStatus {
+  const meta = WATCHDOG_META['watchdog-cron']!
+  const recentLog = readLogTail(logPath)
+  // Derive last run from log file mtime (cron doesn't give us a timer API)
+  let lastRunAt: number | null = null
+  try { lastRunAt = statSync(logPath).mtimeMs } catch { /* no log yet */ }
+  // Next run: 30min after last run (cron */30)
+  const nextRunAt = lastRunAt ? lastRunAt + 30 * 60 * 1000 : null
+  // Detect failures: last log line contains 'unhealthy' or 'failed'
+  const lastLine = recentLog[recentLog.length - 1] ?? ''
+  const lastResult = lastLine.includes('unhealthy') || lastLine.includes('FAIL')
+    ? 'failed' : recentLog.length > 0 ? 'success' : null
+  return {
+    name: 'watchdog-cron', label: meta.label, description: meta.description,
+    scheduler: 'cron', schedule: meta.schedule,
+    active: existsSync(logPath),
+    lastRunAt, nextRunAt, lastResult, recentLog,
   }
 }
 
@@ -79,8 +141,10 @@ export async function tryHandleHealth(ctx: RouteContext): Promise<boolean> {
   const { res, path, method } = ctx
 
   if (path === '/api/watchdog-status' && method === 'GET') {
+    const logDir = join(process.cwd(), 'logs')
     json(res, {
       watchdogs: [
+        queryCronWatchdog(join(logDir, 'watchdog.log')),
         queryTimer('channel-watchdog.timer'),
         queryTimer('marveen-fleet-watchdog.timer'),
       ],
