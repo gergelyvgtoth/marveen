@@ -112,6 +112,8 @@ function switchPage(pageId) {
   if (pageId === 'agentHealth') { loadAgentHealthPage(); startAgentHealthAutoRefresh() }
   else stopAgentHealthAutoRefresh()
   if (pageId === 'calendar') loadCalendar()
+  if (pageId === 'workspace') loadWorkspace()
+  else if (pageId !== 'workspace') wsStopOutputPoll()
 }
 
 // Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
@@ -10902,6 +10904,200 @@ document.getElementById('calToday')?.addEventListener('click', () => {
 })
 document.getElementById('calModeWeek')?.addEventListener('click', () => { calState.mode = 'week'; loadCalendar() })
 document.getElementById('calModeMonth')?.addEventListener('click', () => { calState.mode = 'month'; loadCalendar() })
+
+// === Workspace ===
+let wsCtxData = { memories: [], skills: [] }
+const wsSelMem = new Set()
+const wsSelSkills = new Set()
+let wsOutputSession = null
+let wsOutputTimer = null
+
+function wsStopOutputPoll() {
+  clearInterval(wsOutputTimer)
+  wsOutputTimer = null
+}
+
+async function loadWorkspace() {
+  wsSelMem.clear()
+  wsSelSkills.clear()
+  document.getElementById('wsMemCount').textContent = '0 kiv.'
+  document.getElementById('wsSkillCount').textContent = '0 kiv.'
+  const area = document.getElementById('wsOutputArea')
+  if (area) area.hidden = true
+  wsStopOutputPoll()
+  await refreshWsCtx()
+  await refreshWsSessions()
+}
+
+async function refreshWsCtx() {
+  try {
+    const res = await fetch('/api/workspace/context?agent=marveen')
+    wsCtxData = await res.json()
+  } catch { return }
+  renderWsMem()
+  renderWsSkills()
+}
+
+function renderWsMem() {
+  const q = (document.getElementById('wsMemSearch')?.value || '').toLowerCase()
+  const list = document.getElementById('wsMemList')
+  if (!list) return
+  list.innerHTML = ''
+  const items = (wsCtxData.memories || []).filter(m =>
+    !q || m.content.toLowerCase().includes(q) || (m.keywords || '').toLowerCase().includes(q)
+  )
+  if (!items.length) { list.innerHTML = '<div class="ws-empty">Nincs találat</div>'; return }
+  items.forEach(m => {
+    const div = document.createElement('div')
+    div.className = 'ws-check-item'
+    const label = m.content.length > 80 ? m.content.slice(0, 80) + '…' : m.content
+    div.innerHTML = `<label><input type="checkbox" data-id="${m.id}"${wsSelMem.has(m.id) ? ' checked' : ''}> <span class="ws-item-badge ws-badge-${escHtml(m.category)}">${escHtml(m.category)}</span> ${escHtml(label)}</label>`
+    div.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) wsSelMem.add(m.id); else wsSelMem.delete(m.id)
+      document.getElementById('wsMemCount').textContent = wsSelMem.size + ' kiv.'
+    })
+    list.appendChild(div)
+  })
+}
+
+function renderWsSkills() {
+  const list = document.getElementById('wsSkillList')
+  if (!list) return
+  list.innerHTML = ''
+  const items = wsCtxData.skills || []
+  if (!items.length) { list.innerHTML = '<div class="ws-empty">Nincs skill</div>'; return }
+  items.forEach(s => {
+    const div = document.createElement('div')
+    div.className = 'ws-check-item'
+    const desc = (s.description || '').slice(0, 60)
+    div.innerHTML = `<label><input type="checkbox" data-name="${escHtml(s.name)}"${wsSelSkills.has(s.name) ? ' checked' : ''}> <strong>${escHtml(s.name)}</strong>${desc ? ' <span class="ws-skill-desc">' + escHtml(desc) + '</span>' : ''}</label>`
+    div.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) wsSelSkills.add(s.name); else wsSelSkills.delete(s.name)
+      document.getElementById('wsSkillCount').textContent = wsSelSkills.size + ' kiv.'
+    })
+    list.appendChild(div)
+  })
+}
+
+async function refreshWsSessions() {
+  try {
+    const res = await fetch('/api/workspace/sessions')
+    const data = await res.json()
+    renderWsSessions(data.sessions || [])
+  } catch { renderWsSessions([]) }
+}
+
+function renderWsSessions(sessions) {
+  const el = document.getElementById('wsSessionsList')
+  if (!el) return
+  if (!sessions.length) {
+    el.innerHTML = '<div class="ws-empty">Nincs aktív session</div>'
+    return
+  }
+  el.innerHTML = ''
+  sessions.forEach(s => {
+    const row = document.createElement('div')
+    row.className = 'ws-session-row'
+    row.innerHTML = `
+      <span class="ws-session-id">#${escHtml(s.id)}</span>
+      <span class="ws-session-prompt">${escHtml(s.prompt)}</span>
+      <span class="ws-session-model">${escHtml(s.model)}</span>
+      <button class="btn-secondary btn-compact ws-view-btn">Kimenet</button>
+      <button class="btn-danger btn-compact ws-kill-btn">Stop</button>
+    `
+    row.querySelector('.ws-view-btn').addEventListener('click', () => wsViewOutput(s.id))
+    row.querySelector('.ws-kill-btn').addEventListener('click', () => wsKillSession(s.id))
+    el.appendChild(row)
+  })
+}
+
+async function wsViewOutput(id) {
+  const area = document.getElementById('wsOutputArea')
+  const label = document.getElementById('wsOutputLabel')
+  if (!area) return
+  area.hidden = false
+  if (label) label.textContent = `Session #${id} -- kimenet`
+  wsOutputSession = id
+  wsStopOutputPoll()
+  await wsPollOutput(id)
+  wsOutputTimer = setInterval(() => wsPollOutput(id), 2000)
+  area.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+}
+
+async function wsPollOutput(id) {
+  try {
+    const res = await fetch(`/api/workspace/sessions/${id}/output`)
+    if (!res.ok) { wsStopOutputPoll(); return }
+    const data = await res.json()
+    const pre = document.getElementById('wsOutputPre')
+    if (pre) pre.textContent = data.output || '(üres kimenet)'
+    if (!data.alive) {
+      wsStopOutputPoll()
+      const label = document.getElementById('wsOutputLabel')
+      if (label && !label.textContent.includes('befejezett')) label.textContent += ' (befejezett)'
+      refreshWsSessions()
+    }
+  } catch { wsStopOutputPoll() }
+}
+
+async function wsKillSession(id) {
+  try { await fetch(`/api/workspace/sessions/${id}`, { method: 'DELETE' }) } catch {}
+  if (wsOutputSession === id) {
+    wsStopOutputPoll()
+    const area = document.getElementById('wsOutputArea')
+    if (area) area.hidden = true
+    wsOutputSession = null
+  }
+  refreshWsSessions()
+}
+
+document.getElementById('wsMemSearch')?.addEventListener('input', renderWsMem)
+document.getElementById('wsRefreshCtx')?.addEventListener('click', refreshWsCtx)
+document.getElementById('wsRefreshSessions')?.addEventListener('click', refreshWsSessions)
+
+document.getElementById('wsOutputClose')?.addEventListener('click', () => {
+  wsStopOutputPoll()
+  wsOutputSession = null
+  const area = document.getElementById('wsOutputArea')
+  if (area) area.hidden = true
+})
+
+document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
+  const promptEl = document.getElementById('wsPrompt')
+  const prompt = promptEl?.value?.trim()
+  if (!prompt) { promptEl?.focus(); return }
+  const model = document.getElementById('wsModel')?.value || 'claude-sonnet-4-6'
+  const plan = document.getElementById('wsPlan')?.checked ?? false
+  const btn = document.getElementById('wsLaunchBtn')
+  btn.disabled = true
+  btn.innerHTML = '<span class="spinner" style="width:12px;height:12px;margin-right:4px"></span>Indítás…'
+  try {
+    const res = await fetch('/api/workspace/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        model,
+        plan,
+        memories: [...wsSelMem],
+        skills: [...wsSelSkills]
+      })
+    })
+    const data = await res.json()
+    if (data.ok) {
+      promptEl.value = ''
+      await refreshWsSessions()
+      wsViewOutput(data.id)
+    } else {
+      alert('Hiba: ' + (data.error || 'ismeretlen'))
+    }
+  } catch (e) {
+    alert('Hálózati hiba: ' + e)
+  } finally {
+    btn.disabled = false
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Indítás'
+  }
+})
 
 ;(() => {
   function routeFromHash() {

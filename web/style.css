@@ -5486,3 +5486,200 @@ main {
   opacity: 0.75;
   display: block;
 }
+
+/* === Workspace === */
+.ws-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+.ws-context-panel {
+  width: 270px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+}
+.ws-context-section {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.ws-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--fg);
+}
+.ws-count-badge {
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 500;
+}
+.ws-search {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  box-sizing: border-box;
+  margin-bottom: 6px;
+}
+.ws-checklist {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ws-check-item label {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 4px;
+  border-radius: 4px;
+  line-height: 1.35;
+  color: var(--fg);
+}
+.ws-check-item label:hover { background: var(--hover); }
+.ws-check-item input[type="checkbox"] { margin-top: 2px; flex-shrink: 0; accent-color: var(--accent); }
+.ws-item-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ws-badge-hot { background: rgba(239,68,68,.12); color: #ef4444; }
+.ws-badge-warm { background: rgba(249,115,22,.12); color: #f97316; }
+.ws-badge-cold { background: rgba(59,130,246,.12); color: #3b82f6; }
+.ws-badge-shared { background: rgba(139,92,246,.12); color: #8b5cf6; }
+.ws-skill-desc { opacity: .6; font-size: 11px; }
+.ws-empty { color: var(--muted, #888); font-size: 12px; padding: 8px 4px; }
+.ws-main-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.ws-prompt-area {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ws-prompt {
+  width: 100%;
+  min-height: 140px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--fg);
+  resize: vertical;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+.ws-prompt:focus { outline: none; border-color: var(--accent); }
+.ws-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ws-model {
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.ws-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.ws-sessions-area {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.ws-sessions-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--fg);
+}
+.ws-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.ws-session-id { font-family: monospace; opacity: 0.55; flex-shrink: 0; }
+.ws-session-prompt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.ws-session-model { color: var(--muted, #888); flex-shrink: 0; font-size: 11px; }
+.ws-output-area {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.ws-output-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.ws-output-pre {
+  background: #1e1e2e;
+  color: #cdd6f4;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 420px;
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  margin: 0;
+}
+@media (max-width: 768px) {
+  .ws-layout { flex-direction: column; }
+  .ws-context-panel { width: 100%; position: static; }
+}
