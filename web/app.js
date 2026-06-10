@@ -111,6 +111,7 @@ function switchPage(pageId) {
   if (pageId === 'recordings') loadRecordingsPage()
   if (pageId === 'agentHealth') { loadAgentHealthPage(); startAgentHealthAutoRefresh() }
   else stopAgentHealthAutoRefresh()
+  if (pageId === 'calendar') loadCalendar()
 }
 
 // Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
@@ -10748,6 +10749,86 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
   if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
   if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
 })
+// === Calendar ===
+let calYear = new Date().getFullYear()
+let calMonth = new Date().getMonth() + 1
+
+const MONTH_NAMES = ['Január','Február','Március','Április','Május','Június','Július','Augusztus','Szeptember','Október','November','December']
+const PRIORITY_CLASS = { urgent: 'cal-card--urgent', high: 'cal-card--high' }
+
+async function loadCalendar() {
+  document.getElementById('calMonthLabel').textContent = MONTH_NAMES[calMonth - 1] + ' ' + calYear
+  const grid = document.getElementById('calGrid')
+  grid.innerHTML = '<div style="padding:20px;color:var(--text-muted)">Betöltés...</div>'
+
+  let data
+  try {
+    const res = await fetch(`/api/calendar?year=${calYear}&month=${calMonth}`)
+    data = await res.json()
+  } catch {
+    grid.innerHTML = '<div style="padding:20px;color:var(--danger)">Betöltési hiba</div>'
+    return
+  }
+
+  const byDate = data.byDate || {}
+  const today = new Date()
+  const todayStr = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0')
+
+  // first day of month (1=Mon .. 7=Sun in ISO week)
+  const firstDay = new Date(calYear, calMonth - 1, 1)
+  const daysInMonth = new Date(calYear, calMonth, 0).getDate()
+  let startDow = firstDay.getDay() // 0=Sun
+  if (startDow === 0) startDow = 7 // convert to Mon-based
+  const leadingEmpty = startDow - 1
+
+  // prev month fill
+  const prevMonthDays = new Date(calYear, calMonth - 1, 0).getDate()
+
+  const cells = []
+  for (let i = leadingEmpty - 1; i >= 0; i--) {
+    cells.push({ day: prevMonthDays - i, other: true, dateStr: null })
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr = calYear + '-' + String(calMonth).padStart(2,'0') + '-' + String(d).padStart(2,'0')
+    cells.push({ day: d, other: false, dateStr })
+  }
+  const trailing = 7 - (cells.length % 7)
+  if (trailing < 7) {
+    for (let d = 1; d <= trailing; d++) cells.push({ day: d, other: true, dateStr: null })
+  }
+
+  grid.innerHTML = cells.map(cell => {
+    const cards = (cell.dateStr && byDate[cell.dateStr]) || []
+    let cls = 'cal-day'
+    if (cell.other) cls += ' cal-day--other'
+    if (cell.dateStr === todayStr) cls += ' cal-day--today'
+    const cardHtml = cards.map(c => {
+      let ccls = 'cal-card'
+      if (PRIORITY_CLASS[c.priority]) ccls += ' ' + PRIORITY_CLASS[c.priority]
+      if (c.status === 'done') ccls += ' cal-card--done'
+      const proj = c.project ? `<span class="cal-card-project">${escapeHtml(c.project)}</span>` : ''
+      return `<div class="${ccls}" title="${escapeHtml(c.title)}">${proj}${escapeHtml(c.title)}</div>`
+    }).join('')
+    return `<div class="${cls}"><span class="cal-day-num">${cell.day}</span>${cardHtml}</div>`
+  }).join('')
+}
+
+document.getElementById('calPrev')?.addEventListener('click', () => {
+  calMonth--
+  if (calMonth < 1) { calMonth = 12; calYear-- }
+  loadCalendar()
+})
+document.getElementById('calNext')?.addEventListener('click', () => {
+  calMonth++
+  if (calMonth > 12) { calMonth = 1; calYear++ }
+  loadCalendar()
+})
+document.getElementById('calToday')?.addEventListener('click', () => {
+  calYear = new Date().getFullYear()
+  calMonth = new Date().getMonth() + 1
+  loadCalendar()
+})
+
 ;(() => {
   function routeFromHash() {
     let pageId = decodeURIComponent((location.hash || '').replace(/^#/, ''))
