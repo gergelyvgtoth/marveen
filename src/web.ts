@@ -61,6 +61,7 @@ import { tryHandleInbox } from './web/routes/inbox.js'
 import { tryHandleOutboundQueue } from './web/routes/outbound-queue.js'
 import { tryHandleSalesOpportunities } from './web/routes/sales-opportunities.js'
 import { tryHandleVersion } from './web/routes/version.js'
+import { tryHandleWorkspace } from './web/routes/workspace.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import type { RouteContext } from './web/routes/types.js'
 
@@ -181,6 +182,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleInbox(routeCtx)) return
       if (await tryHandleOutboundQueue(routeCtx)) return
       if (await tryHandleSalesOpportunities(routeCtx)) return
+      if (await tryHandleWorkspace(routeCtx)) return
       if (await tryHandleVersion(routeCtx, WEB_DIR)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
