@@ -12,7 +12,8 @@
     "schedule": "tsx src/schedule-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/frontend-smoke.mjs"
+    "smoke": "node scripts/frontend-smoke.mjs",
+    "merge-check": "node scripts/merge-check.mjs"
   },
   "engines": {
     "node": ">=20 <24"
