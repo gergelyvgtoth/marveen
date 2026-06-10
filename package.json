@@ -13,7 +13,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/frontend-smoke.mjs",
-    "merge-check": "node scripts/merge-check.mjs"
+    "merge-check": "node scripts/merge-check.mjs",
+    "fork-diff": "node scripts/fork-diff.mjs",
+    "behavior-gate": "node scripts/behavior-gate.mjs"
   },
   "engines": {
     "node": ">=20 <24"
