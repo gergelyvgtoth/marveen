@@ -8011,9 +8011,8 @@ function fmtUptime(sec) {
   return `${m}p`
 }
 
-// System-health banner: backend (npm start side) uptime + Telegram channel
-// liveness. Polls /api/health so a silent backend restart or a dead channel
-// is visible at a glance on the overview page.
+// System-health banner: backend uptime, channel liveness, and watchdog timers.
+// Polls /api/health + /api/watchdog-status every 20s.
 async function loadSystemHealth() {
   const bDot = document.getElementById('sysHealthBackendDot')
   const bVal = document.getElementById('sysHealthBackendVal')
@@ -8035,12 +8034,35 @@ async function loadSystemHealth() {
         ? 'él'
         : `reconnect (${ch.reconnectAttempts || 0}x)`
   } catch (e) {
-    // If /api/health itself is unreachable, the backend is down/unresponsive.
     bDot.className = 'sys-health-dot bad'
     bVal.textContent = 'nem elérhető'
     cDot.className = 'sys-health-dot unknown'
     cVal.textContent = '—'
   }
+  // Watchdog timers
+  try {
+    const wRes = await fetch('/api/watchdog-status')
+    if (!wRes.ok) return
+    const wd = await wRes.json()
+    const pillIds = ['sysHealthWdChannel', 'sysHealthWdFleet']
+    const now = Date.now()
+    ;(wd.watchdogs || []).forEach((w, i) => {
+      const dot = document.getElementById(pillIds[i] + 'Dot')
+      const val = document.getElementById(pillIds[i] + 'Val')
+      if (!dot || !val) return
+      dot.className = 'sys-health-dot ' + (w.active ? 'ok' : 'bad')
+      if (w.lastRunAt) {
+        const agoMin = Math.round((now - w.lastRunAt) / 60000)
+        const result = w.lastResult === 'failed' ? ' ✗' : ''
+        val.textContent = agoMin < 90
+          ? `${agoMin}p · ${w.lastResult === 'failed' ? 'hiba' : 'ok'}${result}`
+          : `${Math.round(agoMin / 60)}ó · ${w.lastResult === 'failed' ? 'hiba' : 'ok'}`
+        if (w.lastResult === 'failed') dot.className = 'sys-health-dot bad'
+      } else {
+        val.textContent = w.active ? 'aktív' : 'leállt'
+      }
+    })
+  } catch { /* watchdog status is best-effort */ }
 }
 let sysHealthTimer = null
 function startSystemHealthPoll() {
