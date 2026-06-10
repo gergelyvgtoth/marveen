@@ -496,9 +496,14 @@ export function sendEnterToSession(session: string): boolean {
 
 // Capture a pane snapshot with an execSync timeout. Null on any error so
 // the caller can treat "capture failed" as "not ready".
-export function capturePane(session: string): string | null {
+//
+// scrollbackLines (optional): when >0, capture that many lines of tmux
+// scrollback history above the visible pane (`-S -N`). Default omits the
+// flag so state-detection callers keep seeing only the live frame.
+export function capturePane(session: string, scrollbackLines?: number): string | null {
   try {
-    return execSync(`${TMUX} capture-pane -t ${session} -p`, { timeout: 3000, encoding: 'utf-8' })
+    const startArg = scrollbackLines && scrollbackLines > 0 ? ` -S -${scrollbackLines}` : ''
+    return execSync(`${TMUX} capture-pane -t ${session} -p${startArg}`, { timeout: 3000, encoding: 'utf-8' })
   } catch {
     return null
   }

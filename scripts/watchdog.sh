@@ -1,6 +1,6 @@
 #!/bin/bash
-# Watchdog: checks sessions every 5 minutes, restarts if missing.
-# Cron: */5 * * * * ~/marveen/scripts/watchdog.sh
+# Watchdog: checks sessions every 30 minutes, restarts if missing.
+# Cron: */30 * * * * ~/marveen/scripts/watchdog.sh
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$INSTALL_DIR/logs/watchdog.log"
@@ -77,14 +77,34 @@ PYEOF
   rm -f "$TMPDATA"
 }
 
-# ── Dashboard ──────────────────────────────────────────────────────────────
-DASHBOARD_PID=$(ps -ef | grep "node dist/index.js" | grep -v grep | awk '{print $2}' | head -1)
-if [ -z "$DASHBOARD_PID" ]; then
-  echo "$(timestamp) [watchdog] Dashboard down, restarting..." >> "$LOG"
+# ── Dashboard (HTTP liveness, NOT process existence) ───────────────────────
+# A process-grep ("is `node dist/index.js` running?") is a liar: a backend that
+# caught SIGTERM and then wedged half-way through its "Leallitas..." shutdown
+# stays alive in `ps` while :3420 serves nothing. That exact failure stranded
+# the backend for 88 min on 2026-06-07 (stuck inbox-sla prompt -> SIGTERM ->
+# hung shutdown -> grep saw the zombie -> never restarted). Probe the real
+# endpoint instead, twice (3s apart) so we never kill a merely-booting/busy one.
+health_code() {
+  curl -s -o /dev/null -m 5 -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" \
+    "http://localhost:3420/api/health" 2>/dev/null
+}
+HEALTH=$(health_code)
+if [ "$HEALTH" != "200" ]; then
+  sleep 3
+  HEALTH=$(health_code)
+fi
+if [ "$HEALTH" != "200" ]; then
+  echo "$(timestamp) [watchdog] Dashboard unhealthy (HTTP '${HEALTH:-none}'), reaping + restarting..." >> "$LOG"
+  # Reap a wedged/half-dead backend so the port frees up before relaunch.
+  pkill -f "node dist/index.js" 2>/dev/null
+  sleep 2
+  pkill -9 -f "node dist/index.js" 2>/dev/null
+  sleep 1
   cd "$INSTALL_DIR" && nohup npm start >> "$INSTALL_DIR/logs/dashboard.log" 2>&1 &
-  sleep 5
-  NEW_PID=$(ps -ef | grep "node dist/index.js" | grep -v grep | awk '{print $2}' | head -1)
-  echo "$(timestamp) [watchdog] Dashboard restarted (PID: ${NEW_PID:-?})" >> "$LOG"
+  sleep 8
+  NEW_HEALTH=$(health_code)
+  echo "$(timestamp) [watchdog] Dashboard restart -> HTTP '${NEW_HEALTH:-none}'" >> "$LOG"
 fi
 
 # ── Restart rate limiter (max 3/hour per agent) ───────────────────────────

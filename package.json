@@ -11,7 +11,8 @@
     "status": "tsx scripts/status.ts",
     "schedule": "tsx src/schedule-cli.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/frontend-smoke.mjs"
   },
   "engines": {
     "node": ">=20 <24"
@@ -26,6 +27,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
+    "jsdom": "^29.1.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"

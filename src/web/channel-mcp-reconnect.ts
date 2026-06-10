@@ -121,6 +121,17 @@ export function attemptChannelMcpReconnect(agentName: string): ReconnectResult {
   const providerType = resolveAgentProviderType(agentName)
   const pluginPattern = getPluginPattern(providerType)
 
+  // Idle gate: only send /mcp keystrokes when the session shows the bypass-
+  // permissions footer (Claude TUI idle state). If Claude is mid-turn the
+  // keystrokes land in the wrong context and leave the session stuck on the
+  // MCP dialog until manual Escape. The channel-health-monitor's 60s tick
+  // will retry on the next cycle when the session is idle.
+  const prePane = capturePane(session)
+  if (!prePane || !/bypass permissions on/.test(prePane)) {
+    logger.info({ agentName, session }, 'channel-mcp-reconnect: session not idle, deferring reconnect to next cycle')
+    return { ok: false, message: 'session not idle' }
+  }
+
   try {
     execFileSync(TMUX, ['send-keys', '-t', session, 'Escape'], { timeout: 3000 })
     execFileSync('/bin/sleep', ['1'], { timeout: 2000 })

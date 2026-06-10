@@ -255,6 +255,21 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
     exit 0
   fi
 
+  # Safety gate: only probe /mcp when the session is idle (shows the ❯ prompt).
+  # If Claude is mid-task, injecting /mcp Enter would land inside the active
+  # output and leave the session stuck on the MCP dialog. Skip and let the
+  # dashboard's channel-monitor handle recovery instead.
+  IDLE_CHECK="$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)"
+  case "$IDLE_CHECK" in
+    *"❯"*|*"> "*)
+      : # session is at the prompt, safe to probe
+      ;;
+    *)
+      echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: session not idle, skipping /mcp probe (dashboard monitor will recover if needed)" >> "$INSTALL_DIR/store/channels-failures.log"
+      exit 0
+      ;;
+  esac
+
   # Check 2: TUI confirmation that the plugin shows ✗ Failed. The /mcp view
   # also shows "(disabled)" markers; we only fire on Failed, never on disabled
   # (Enable-only submenu has no Reconnect, the Up+Enter+Enter sequence would

@@ -8173,6 +8173,37 @@ document.getElementById('updatesApplyBtn').addEventListener('click', async () =>
 pollUpdatesBadge()
 setInterval(pollUpdatesBadge, 5 * 60_000)
 
+// === Stale-UI detection ===
+// Frontend assets are served live from disk with no cache-busting, so after a
+// deploy the open tab keeps running old app.js (and may talk to a new backend).
+// Poll /api/version; the first response pins the loaded version, and any later
+// change shows a non-intrusive reload banner instead of needing a manual
+// Ctrl+Shift+R.
+let __loadedAppVersion = null
+async function checkAppVersion() {
+  try {
+    const res = await fetch('/api/version')
+    if (!res.ok) return
+    const data = await res.json()
+    if (!data || !data.version) return
+    if (__loadedAppVersion === null) { __loadedAppVersion = data.version; return }
+    if (data.version !== __loadedAppVersion) showAppUpdateBanner()
+  } catch { /* offline / backend restarting -- try again next tick */ }
+}
+function showAppUpdateBanner() {
+  if (document.getElementById('appUpdateBanner')) return
+  const b = document.createElement('div')
+  b.id = 'appUpdateBanner'
+  b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#4CAF50;color:#fff;' +
+    'padding:10px 16px;text-align:center;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.3)'
+  b.innerHTML = 'Új verzió érhető el. <button id="appUpdateReload" style="margin-left:10px;padding:4px 12px;' +
+    'border:none;border-radius:4px;background:#fff;color:#333;cursor:pointer;font-weight:600">Frissítés</button>'
+  document.body.appendChild(b)
+  document.getElementById('appUpdateReload').addEventListener('click', () => location.reload())
+}
+checkAppVersion()
+setInterval(checkAppVersion, 30_000)
+
 // ============================================================
 // === Agent Console ===
 // ============================================================
@@ -8180,6 +8211,121 @@ setInterval(pollUpdatesBadge, 5 * 60_000)
 let consoleRefreshTimer = null
 let currentConsoleSession = 'marveen-channels'
 let currentConsoleAgentId = 'marveen'
+// When true, the next output render jumps to the bottom (initial load + tab
+// switch). Otherwise we only follow the tail if the user is already there, so
+// scrolling back to read history isn't yanked away by the 2s poll.
+let consoleForceScroll = true
+// Latest stripped output text + active search state. We keep the raw text so a
+// search term can be (re)applied on every 2s poll without refetching.
+let consoleLastRaw = '[no output]'
+let consoleSearchTerm = ''
+let consoleMatchIndex = 0
+let consoleSearchBound = false
+// 'live'  = current tmux frame, polled every 2s (real-time, what it does now)
+// 'history' = full session transcript from the JSONL, scrollable + searchable
+let consoleMode = 'live'
+// When true (history mode only), the search box queries ALL agents' transcripts
+// server-side (/api/transcript-search) instead of filtering the current one.
+let consoleSearchAll = false
+let consoleFleetDebounce = null
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Escape the raw text for HTML, then wrap case-insensitive matches of `term`
+// in <mark>. The term is HTML-escaped too so it matches the escaped text.
+function highlightConsoleHtml(text, term) {
+  const escaped = escapeHtml(text)
+  if (!term) return { html: escaped, count: 0 }
+  const re = new RegExp(escapeRegex(escapeHtml(term)), 'gi')
+  let count = 0
+  const html = escaped.replace(re, m =>
+    `<mark class="console-match" style="background:#665c00;color:#fff;border-radius:2px;">${m}</mark>`)
+  count = (escaped.match(re) || []).length
+  return { html, count }
+}
+
+// Render consoleLastRaw into the output panel, applying the search highlight if
+// a term is active. opts.scrollToMatch scrolls the current match into view.
+function renderConsoleOutput(opts = {}) {
+  const outputDiv = document.getElementById('consoleOutput')
+  if (!outputDiv) return
+  const countEl = document.getElementById('consoleSearchCount')
+  const prevBtn = document.getElementById('consoleSearchPrev')
+  const nextBtn = document.getElementById('consoleSearchNext')
+  const term = consoleSearchTerm.trim()
+
+  if (!term) {
+    outputDiv.textContent = consoleLastRaw
+    if (countEl) countEl.textContent = ''
+    if (prevBtn) prevBtn.disabled = true
+    if (nextBtn) nextBtn.disabled = true
+    return
+  }
+
+  const { html, count } = highlightConsoleHtml(consoleLastRaw, term)
+  outputDiv.innerHTML = html
+
+  if (count === 0) {
+    consoleMatchIndex = 0
+    if (countEl) countEl.textContent = '0 találat'
+    if (prevBtn) prevBtn.disabled = true
+    if (nextBtn) nextBtn.disabled = true
+    return
+  }
+
+  if (consoleMatchIndex >= count) consoleMatchIndex = count - 1
+  if (consoleMatchIndex < 0) consoleMatchIndex = 0
+  const marks = outputDiv.querySelectorAll('mark.console-match')
+  const cur = marks[consoleMatchIndex]
+  if (cur) {
+    cur.style.background = '#ffcc00'
+    cur.style.color = '#000'
+    if (opts.scrollToMatch) cur.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
+  if (countEl) countEl.textContent = `${consoleMatchIndex + 1}/${count}`
+  if (prevBtn) prevBtn.disabled = false
+  if (nextBtn) nextBtn.disabled = false
+}
+
+function stepConsoleMatch(delta) {
+  const outputDiv = document.getElementById('consoleOutput')
+  if (!outputDiv) return
+  const count = outputDiv.querySelectorAll('mark.console-match').length
+  if (count === 0) return
+  consoleMatchIndex = (consoleMatchIndex + delta + count) % count
+  renderConsoleOutput({ scrollToMatch: true })
+}
+
+function initConsoleSearch() {
+  if (consoleSearchBound) return
+  const input = document.getElementById('consoleSearch')
+  const prevBtn = document.getElementById('consoleSearchPrev')
+  const nextBtn = document.getElementById('consoleSearchNext')
+  if (!input || !prevBtn || !nextBtn) return
+  input.addEventListener('input', () => {
+    consoleSearchTerm = input.value
+    consoleMatchIndex = 0
+    if (consoleSearchAll && consoleMode === 'history') {
+      // Fleet search hits the server -- debounce so we don't fire per keystroke.
+      if (consoleFleetDebounce) clearTimeout(consoleFleetDebounce)
+      consoleFleetDebounce = setTimeout(loadConsoleFleetSearch, 400)
+    } else {
+      renderConsoleOutput({ scrollToMatch: true })
+    }
+  })
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); stepConsoleMatch(e.shiftKey ? -1 : 1) }
+  })
+  prevBtn.addEventListener('click', () => stepConsoleMatch(-1))
+  nextBtn.addEventListener('click', () => stepConsoleMatch(1))
+
+  const allBox = document.getElementById('consoleSearchAll')
+  if (allBox) allBox.addEventListener('change', () => setConsoleSearchAll(allBox.checked))
+
+  consoleSearchBound = true
+}
 
 function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*[mGKHFJA-Za-z]/g, '')
@@ -8210,8 +8356,23 @@ async function loadAgentActivityWidget() {
 }
 
 async function loadConsolePage() {
+  consoleForceScroll = true
+  initConsoleSearch()
+  initConsoleModeToggle()
   await loadAgentConsoleList()
   startConsolePolling()
+}
+
+let consoleModeBound = false
+function initConsoleModeToggle() {
+  styleConsoleModeButtons()
+  if (consoleModeBound) return
+  const live = document.getElementById('consoleModeLive')
+  const hist = document.getElementById('consoleModeHistory')
+  if (!live || !hist) return
+  live.addEventListener('click', () => setConsoleMode('live'))
+  hist.addEventListener('click', () => setConsoleMode('history'))
+  consoleModeBound = true
 }
 
 async function loadAgentConsoleList() {
@@ -8235,43 +8396,140 @@ async function loadAgentConsoleList() {
         const t = e.currentTarget
         currentConsoleAgentId = t.dataset.agent
         currentConsoleSession = t.dataset.session
+        consoleForceScroll = true
         tabsDiv.querySelectorAll('.console-tab').forEach(b => b.classList.remove('active'))
         t.classList.add('active')
-        loadConsoleOutput()
+        consoleTick()
       })
     })
 
-    await loadConsoleOutput()
+    await consoleTick()
   } catch (err) {
     console.error('Agent console list error:', err)
+  }
+}
+
+// Shared scroll policy for both live and history renders: follow the tail only
+// when forced (tab/mode switch) or already at the bottom; otherwise keep the
+// user's position so reading history / a search match isn't yanked away.
+function applyConsoleScroll(container, atBottom, prevScrollTop) {
+  if (consoleSearchTerm.trim()) {
+    container.scrollTop = prevScrollTop
+  } else if (consoleForceScroll || atBottom) {
+    container.scrollTop = container.scrollHeight
+    consoleForceScroll = false
+  } else {
+    container.scrollTop = prevScrollTop
   }
 }
 
 async function loadConsoleOutput() {
   try {
     const res = await fetch(`/api/agent-console/${encodeURIComponent(currentConsoleSession)}`)
-    if (!res.ok) {
-      document.getElementById('consoleOutput').textContent = '[error]'
-      return
-    }
-    const data = await res.json()
-
     const outputDiv = document.getElementById('consoleOutput')
+    if (!res.ok) { outputDiv.textContent = '[error]'; return }
+    const data = await res.json()
     const statusDiv = document.getElementById('consoleStatus')
-
-    outputDiv.textContent = stripAnsi(data.output || '[no output]')
-    statusDiv.textContent = data.isRunning ? '🟢 Futó' : '🔴 Leállított'
-
     const container = outputDiv.parentElement
-    container.scrollTop = container.scrollHeight
+    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40
+    const prevScrollTop = container.scrollTop
+
+    consoleLastRaw = stripAnsi(data.output || '[no output]')
+    statusDiv.textContent = data.isRunning ? '🟢 Futó' : '🔴 Leállított'
+    renderConsoleOutput()
+    applyConsoleScroll(container, atBottom, prevScrollTop)
   } catch (err) {
     console.error('Agent console output error:', err)
   }
 }
 
+async function loadConsoleTranscript() {
+  try {
+    const res = await fetch(`/api/agent-console/${encodeURIComponent(currentConsoleSession)}/transcript`)
+    const outputDiv = document.getElementById('consoleOutput')
+    if (!res.ok) { outputDiv.textContent = '[error]'; return }
+    const data = await res.json()
+    const statusDiv = document.getElementById('consoleStatus')
+    const container = outputDiv.parentElement
+    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40
+    const prevScrollTop = container.scrollTop
+
+    consoleLastRaw = data.output || '[nincs transcript]'
+    statusDiv.textContent = data.found ? `📜 Előzmény • ${data.lineCount} sor` : '📜 Nincs transcript'
+    renderConsoleOutput()
+    applyConsoleScroll(container, atBottom, prevScrollTop)
+  } catch (err) {
+    console.error('Agent console transcript error:', err)
+  }
+}
+
+async function loadConsoleFleetSearch() {
+  const outputDiv = document.getElementById('consoleOutput')
+  const statusDiv = document.getElementById('consoleStatus')
+  const term = consoleSearchTerm.trim()
+  if (!term) {
+    consoleLastRaw = '[írj be keresőszót a flotta-kereséshez]'
+    statusDiv.textContent = '🔎 Flotta-keresés'
+    renderConsoleOutput()
+    return
+  }
+  try {
+    const res = await fetch(`/api/transcript-search?q=${encodeURIComponent(term)}&limit=400`)
+    if (!res.ok) { outputDiv.textContent = '[error]'; return }
+    const data = await res.json()
+    const container = outputDiv.parentElement
+    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40
+    const prevScrollTop = container.scrollTop
+
+    consoleLastRaw = data.output || '[nincs találat]'
+    statusDiv.textContent = `🔎 Flotta-keresés • ${data.count} találat${data.truncated ? '+' : ''}`
+    renderConsoleOutput()
+    applyConsoleScroll(container, atBottom, prevScrollTop)
+  } catch (err) {
+    console.error('Fleet search error:', err)
+  }
+}
+
+// Fetch the right source for the current mode. Used by the poll timer, tab
+// switches, and mode switches.
+function consoleTick() {
+  if (consoleMode !== 'history') return loadConsoleOutput()
+  return consoleSearchAll ? loadConsoleFleetSearch() : loadConsoleTranscript()
+}
+
+function setConsoleSearchAll(on) {
+  consoleSearchAll = on
+  consoleForceScroll = true
+  // Fleet search only makes sense over transcripts, so flip to history mode.
+  if (on && consoleMode !== 'history') setConsoleMode('history')
+  else { startConsolePolling(); consoleTick() }
+}
+
+function setConsoleMode(mode) {
+  if (mode === consoleMode) return
+  consoleMode = mode
+  consoleForceScroll = true
+  styleConsoleModeButtons()
+  startConsolePolling()
+  consoleTick()
+}
+
+function styleConsoleModeButtons() {
+  const live = document.getElementById('consoleModeLive')
+  const hist = document.getElementById('consoleModeHistory')
+  if (!live || !hist) return
+  const base = 'padding:6px 14px;border:1px solid var(--border-color);border-radius:4px;cursor:pointer;font-size:13px;'
+  const on = 'background:#4CAF50;color:#fff;'
+  const off = 'background:var(--bg-code);color:var(--text-color);'
+  live.style.cssText = base + (consoleMode === 'live' ? on : off)
+  hist.style.cssText = base + (consoleMode === 'history' ? on : off)
+}
+
 function startConsolePolling() {
   if (consoleRefreshTimer) clearInterval(consoleRefreshTimer)
-  consoleRefreshTimer = setInterval(loadConsoleOutput, 2000)
+  // History re-parses the JSONL server-side, so poll it gently; the live frame
+  // changes every tick, so keep its 2s cadence.
+  consoleRefreshTimer = setInterval(consoleTick, consoleMode === 'history' ? 6000 : 2000)
 }
 
 function stopConsolePolling() {
