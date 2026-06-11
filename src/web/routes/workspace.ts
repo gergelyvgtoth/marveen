@@ -1,7 +1,11 @@
 import { execFile, execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
-import { getDb } from '../../db.js'
+import {
+  getDb,
+  saveWorkspaceSession, finishWorkspaceSession, deleteWorkspaceSession, getAllWorkspaceSessions,
+  type WorkspaceSessionRow,
+} from '../../db.js'
 import { json, readBody } from '../http-helpers.js'
 import { resolveFromPath } from '../../platform.js'
 import type { RouteContext } from './types.js'
@@ -10,10 +14,32 @@ const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude') ?? 'claude'
 
 type SessionInfo = { session: string; started: number; prompt: string; model: string; promptFile: string; outputFile: string }
-// Active (running) sessions
+// In-memory cache for currently-active sessions (synced to SQLite)
 const activeSessions = new Map<string, SessionInfo>()
-// Finished sessions kept until manually deleted or backend restart
+// Finished sessions (still viewable until manually deleted)
 const finishedSessions = new Map<string, { outputFile: string; promptFile: string; finishedAt: number }>()
+
+// On startup: restore sessions from SQLite
+function loadSessionsFromDb(): void {
+  const rows = getAllWorkspaceSessions()
+  for (const row of rows) {
+    if (row.status === 'active') {
+      if (tmuxAlive(row.session_name)) {
+        activeSessions.set(row.id, {
+          session: row.session_name, started: row.started_at, prompt: row.prompt,
+          model: row.model, promptFile: row.prompt_file, outputFile: row.output_file,
+        })
+      } else {
+        // Was active but tmux session gone -- mark as finished
+        finishWorkspaceSession(row.id)
+        finishedSessions.set(row.id, { outputFile: row.output_file, promptFile: row.prompt_file, finishedAt: row.finished_at ?? Date.now() })
+      }
+    } else {
+      finishedSessions.set(row.id, { outputFile: row.output_file, promptFile: row.prompt_file, finishedAt: row.finished_at ?? 0 })
+    }
+  }
+}
+loadSessionsFromDb()
 
 function tmuxAlive(session: string): boolean {
   try { execFileSync(TMUX, ['has-session', '-t', session], { timeout: 3000, stdio: 'ignore' }); return true }
@@ -66,19 +92,31 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
-  // GET /api/workspace/sessions -- aktív session-ök
+  // GET /api/workspace/sessions -- aktív + kész session-ök
   if (path === '/api/workspace/sessions' && method === 'GET') {
     const sessions = []
+    // Active sessions: check tmux liveness
     for (const [id, s] of activeSessions.entries()) {
       const alive = tmuxAlive(s.session)
       if (!alive) {
-        // Move to finished so output is still viewable
-        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: Date.now() })
+        const now = Date.now()
+        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: now })
+        finishWorkspaceSession(id)
         activeSessions.delete(id)
+        sessions.push({ id, prompt: s.prompt.slice(0, 80), model: s.model, started: s.started, alive: false })
         continue
       }
-      sessions.push({ id, session: s.session, started: s.started, prompt: s.prompt.slice(0, 80), model: s.model })
+      sessions.push({ id, session: s.session, started: s.started, prompt: s.prompt.slice(0, 80), model: s.model, alive: true })
     }
+    // Finished sessions
+    for (const [id, f] of finishedSessions.entries()) {
+      if (sessions.find(s => s.id === id)) continue
+      // Rebuild prompt from DB for finished sessions
+      const dbRow = getAllWorkspaceSessions().find(r => r.id === id)
+      sessions.push({ id, prompt: (dbRow?.prompt ?? '').slice(0, 80), model: dbRow?.model ?? '', started: dbRow?.started_at ?? 0, alive: false })
+    }
+    // Sort by started desc
+    sessions.sort((a, b) => b.started - a.started)
     json(res, { sessions })
     return true
   }
@@ -114,7 +152,9 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
       const alive = tmuxAlive(s.session)
       if (!alive) {
         activeSessions.delete(id)
-        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: Date.now() })
+        const now = Date.now()
+        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: now })
+        finishWorkspaceSession(id)
       }
       try {
         res.write(`data: ${JSON.stringify({ pane, alive })}\n\n`)
@@ -158,6 +198,7 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
       try { unlinkSync(fin.promptFile) } catch {}
       finishedSessions.delete(id)
     }
+    deleteWorkspaceSession(id)
     json(res, { ok: true })
     return true
   }
@@ -216,7 +257,9 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
 
     try {
       execFileSync(TMUX, args, { timeout: 10000 })
-      activeSessions.set(id, { session: sessionName, started: Date.now(), prompt: body.prompt, model, promptFile, outputFile })
+      const startedAt = Date.now()
+      activeSessions.set(id, { session: sessionName, started: startedAt, prompt: body.prompt, model, promptFile, outputFile })
+      saveWorkspaceSession(id, sessionName, body.prompt, model, promptFile, outputFile, startedAt)
       json(res, { ok: true, id, session: sessionName })
     } catch (err) {
       try { unlinkSync(promptFile) } catch {}

@@ -534,6 +534,21 @@ export function initDatabase(dbPathOverride?: string): void {
   `)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tgh_msg ON telegram_history(chat_id, message_id, direction)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tgh_chat_ts ON telegram_history(chat_id, ts)`)
+
+  // --- Workspace Sessions ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workspace_sessions (
+      id TEXT PRIMARY KEY,
+      session_name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      model TEXT NOT NULL,
+      prompt_file TEXT NOT NULL,
+      output_file TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'active'
+    )
+  `)
   // Thread reconstruction: the inbound Telegram channel block does not surface
   // reply_to, so a terse follow-up ("részletezd ki") can attach to the wrong
   // thread. We persist reply_to when known (mostly on outbound threaded replies)
@@ -2751,4 +2766,34 @@ export function getInboxStats(): { open: number; urgent_open: number; bySource: 
   const bySource: Record<string, number> = {}
   for (const r of rows) bySource[r.source] = r.c
   return { open, urgent_open: urgentOpen, bySource }
+}
+
+// === Workspace Sessions ===
+
+export interface WorkspaceSessionRow {
+  id: string
+  session_name: string
+  prompt: string
+  model: string
+  prompt_file: string
+  output_file: string
+  started_at: number
+  finished_at: number | null
+  status: 'active' | 'finished'
+}
+
+export function saveWorkspaceSession(id: string, sessionName: string, prompt: string, model: string, promptFile: string, outputFile: string, startedAt: number): void {
+  db.prepare('INSERT OR REPLACE INTO workspace_sessions (id, session_name, prompt, model, prompt_file, output_file, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, sessionName, prompt, model, promptFile, outputFile, startedAt, 'active')
+}
+
+export function finishWorkspaceSession(id: string): void {
+  db.prepare("UPDATE workspace_sessions SET status = 'finished', finished_at = ? WHERE id = ?").run(Date.now(), id)
+}
+
+export function deleteWorkspaceSession(id: string): void {
+  db.prepare('DELETE FROM workspace_sessions WHERE id = ?').run(id)
+}
+
+export function getAllWorkspaceSessions(): WorkspaceSessionRow[] {
+  return db.prepare('SELECT * FROM workspace_sessions ORDER BY started_at DESC').all() as WorkspaceSessionRow[]
 }

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events'
 import {
   createAgentMessage, getPendingMessages, listAgentMessages,
   getAgentConversation, getAgentConversationThreads,
@@ -9,6 +10,10 @@ import { COORDINATOR_AGENT_ID } from '../../channel-coordinator/ingest.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
+
+// In-process event bus for RPC-style message completion notifications
+const messageEvents = new EventEmitter()
+messageEvents.setMaxListeners(200)
 
 export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method, url } = ctx
@@ -77,6 +82,27 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
+  // GET /api/messages/:id/stream -- SSE stream for RPC-style result polling
+  const msgStreamMatch = path.match(/^\/api\/messages\/(\d+)\/stream$/)
+  if (msgStreamMatch && method === 'GET') {
+    const id = parseInt(msgStreamMatch[1], 10)
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    })
+    res.write(`data: ${JSON.stringify({ type: 'subscribed', id })}\n\n`)
+
+    const handler = (event: { type: string; id: number; result?: string }) => {
+      try { res.write(`data: ${JSON.stringify(event)}\n\n`) } catch {}
+      try { res.end() } catch {}
+    }
+    messageEvents.once(`msg:${id}`, handler)
+    req.on('close', () => { messageEvents.removeListener(`msg:${id}`, handler) })
+    return true
+  }
+
   const msgUpdateMatch = path.match(/^\/api\/messages\/(\d+)$/)
   if (msgUpdateMatch && method === 'PUT') {
     const id = parseInt(msgUpdateMatch[1], 10)
@@ -87,7 +113,11 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     if (newStatus === 'done') ok = markMessageDone(id, result)
     else if (newStatus === 'failed') ok = markMessageFailed(id, result)
 
-    if (ok) { json(res, { ok: true }); return true }
+    if (ok) {
+      messageEvents.emit(`msg:${id}`, { type: newStatus, id, result })
+      json(res, { ok: true })
+      return true
+    }
     json(res, { error: 'Message not found or invalid status' }, 404)
     return true
   }
