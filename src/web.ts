@@ -128,7 +128,10 @@ export function startWebServer(port = 3420): http.Server {
     // Authorization header -- accept the token via ?token= for this one GET
     // path, validated with the same constant-time check. Everything else stays
     // header-only.
-    const isSseStream = method === 'GET' && /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path)
+    const isSseStream = method === 'GET' && (
+      /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path) ||
+      /^\/api\/workspace\/sessions\/[^/]+\/stream$/.test(path)
+    )
     if (path.startsWith('/api/') && !isPublicApi) {
       const headerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       const queryOk = isSseStream && checkBearerToken(`Bearer ${url.searchParams.get('token') ?? ''}`, DASHBOARD_TOKEN)

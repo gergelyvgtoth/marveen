@@ -10910,11 +10910,10 @@ let wsCtxData = { memories: [], skills: [] }
 const wsSelMem = new Set()
 const wsSelSkills = new Set()
 let wsOutputSession = null
-let wsOutputTimer = null
+let wsOutputSSE = null
 
 function wsStopOutputPoll() {
-  clearInterval(wsOutputTimer)
-  wsOutputTimer = null
+  if (wsOutputSSE) { wsOutputSSE.close(); wsOutputSSE = null }
 }
 
 async function loadWorkspace() {
@@ -11011,7 +11010,7 @@ function renderWsSessions(sessions) {
   })
 }
 
-async function wsViewOutput(id) {
+function wsViewOutput(id) {
   const area = document.getElementById('wsOutputArea')
   const label = document.getElementById('wsOutputLabel')
   if (!area) return
@@ -11019,25 +11018,23 @@ async function wsViewOutput(id) {
   if (label) label.textContent = `Session #${id} -- kimenet`
   wsOutputSession = id
   wsStopOutputPoll()
-  await wsPollOutput(id)
-  wsOutputTimer = setInterval(() => wsPollOutput(id), 2000)
-  area.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-}
 
-async function wsPollOutput(id) {
-  try {
-    const res = await fetch(`/api/workspace/sessions/${id}/output`)
-    if (!res.ok) { wsStopOutputPoll(); return }
-    const data = await res.json()
+  const token = localStorage.getItem('marveen-dashboard-token') ?? ''
+  wsOutputSSE = new EventSource(`/api/workspace/sessions/${id}/stream?token=${encodeURIComponent(token)}`)
+  wsOutputSSE.onmessage = (e) => {
+    const data = JSON.parse(e.data)
     const pre = document.getElementById('wsOutputPre')
-    if (pre) pre.textContent = data.output || '(üres kimenet)'
+    if (pre) pre.textContent = data.pane || '(üres kimenet)'
     if (!data.alive) {
       wsStopOutputPoll()
-      const label = document.getElementById('wsOutputLabel')
-      if (label && !label.textContent.includes('befejezett')) label.textContent += ' (befejezett)'
+      const lbl = document.getElementById('wsOutputLabel')
+      if (lbl && !lbl.textContent.includes('befejezett')) lbl.textContent += ' (befejezett)'
       refreshWsSessions()
     }
-  } catch { wsStopOutputPoll() }
+  }
+  wsOutputSSE.onerror = () => { wsStopOutputPoll() }
+
+  area.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
 }
 
 async function wsKillSession(id) {

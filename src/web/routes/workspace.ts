@@ -75,6 +75,46 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
+  // GET /api/workspace/sessions/:id/stream -- SSE live output
+  const streamMatch = path.match(/^\/api\/workspace\/sessions\/([^/]+)\/stream$/)
+  if (streamMatch && method === 'GET') {
+    const id = streamMatch[1]
+    const s = activeSessions.get(id)
+    if (!s) { res.writeHead(404); res.end(JSON.stringify({ error: 'not found' })); return true }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    })
+
+    let closed = false
+    let inFlight = false
+    const tick = (): void => {
+      if (closed || inFlight) return
+      inFlight = true
+      execFile(TMUX, ['capture-pane', '-t', s.session, '-p'], { timeout: 3000, encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+        inFlight = false
+        if (closed) return
+        const pane = err ? '' : (stdout ?? '')
+        const alive = err ? tmuxAlive(s.session) : true
+        if (!alive) activeSessions.delete(id)
+        try {
+          res.write(`data: ${JSON.stringify({ pane, alive })}\n\n`)
+        } catch { closed = true }
+        if (!alive) { closed = true; try { res.end() } catch {} }
+      })
+    }
+
+    tick()
+    const interval = setInterval(tick, 700)
+    const stop = (): void => { closed = true; clearInterval(interval) }
+    ctx.req.on('close', stop)
+    ctx.req.on('error', stop)
+    return true
+  }
+
   // GET /api/workspace/sessions/:id/output -- snapshot output
   const outputMatch = path.match(/^\/api\/workspace\/sessions\/([^/]+)\/output$/)
   if (outputMatch && method === 'GET') {
@@ -101,7 +141,7 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
 
   // POST /api/workspace/launch
   if (path === '/api/workspace/launch' && method === 'POST') {
-    const body = await readBody(req) as unknown as {
+    const body = JSON.parse((await readBody(req)).toString()) as {
       prompt: string
       model?: string
       plan?: boolean
