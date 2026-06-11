@@ -10995,18 +10995,27 @@ function renderWsSessions(sessions) {
   }
   el.innerHTML = ''
   sessions.forEach(s => {
-    const row = document.createElement('div')
-    row.className = 'ws-session-row'
-    row.innerHTML = `
-      <span class="ws-session-id">#${escHtml(s.id)}</span>
-      <span class="ws-session-prompt">${escHtml(s.prompt)}</span>
-      <span class="ws-session-model">${escHtml(s.model)}</span>
-      <button class="btn-secondary btn-compact ws-view-btn">Kimenet</button>
-      <button class="btn-danger btn-compact ws-kill-btn">Stop</button>
+    const isActive = wsOutputSession === s.id
+    const statusClass = s.alive === false ? 'ws-dot-done' : 'ws-dot-active'
+    const statusLabel = s.alive === false ? 'kész' : 'fut'
+    const modelShort = (s.model || '').replace('claude-', '').replace('-20251001', '')
+    const card = document.createElement('div')
+    card.className = 'ws-session-card' + (isActive ? ' ws-card-active' : '')
+    card.innerHTML = `
+      <span class="ws-status-dot ${statusClass}"></span>
+      <div class="ws-session-info">
+        <div class="ws-session-prompt-text">${escHtml((s.prompt || '').slice(0, 80))}</div>
+        <div class="ws-session-meta">#${escHtml(String(s.id))} &middot; ${escHtml(modelShort)} &middot; ${statusLabel}</div>
+      </div>
+      <div class="ws-session-actions">
+        <button class="btn-secondary btn-compact ws-view-btn">Kimenet</button>
+        <button class="btn-danger btn-compact ws-kill-btn">Stop</button>
+      </div>
     `
-    row.querySelector('.ws-view-btn').addEventListener('click', () => wsViewOutput(s.id))
-    row.querySelector('.ws-kill-btn').addEventListener('click', () => wsKillSession(s.id))
-    el.appendChild(row)
+    card.querySelector('.ws-view-btn').addEventListener('click', (e) => { e.stopPropagation(); wsViewOutput(s.id) })
+    card.querySelector('.ws-kill-btn').addEventListener('click', (e) => { e.stopPropagation(); wsKillSession(s.id) })
+    card.addEventListener('click', () => wsViewOutput(s.id))
+    el.appendChild(card)
   })
 }
 
@@ -11029,6 +11038,8 @@ function wsViewOutput(id) {
       wsStopOutputPoll()
       const lbl = document.getElementById('wsOutputLabel')
       if (lbl && !lbl.textContent.includes('befejezett')) lbl.textContent += ' (befejezett)'
+      const dot = document.querySelector('#wsOutputArea .ws-status-dot')
+      if (dot) { dot.classList.remove('ws-dot-active'); dot.classList.add('ws-dot-done') }
       refreshWsSessions()
     }
   }
@@ -11067,7 +11078,7 @@ document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
   const plan = document.getElementById('wsPlan')?.checked ?? false
   const btn = document.getElementById('wsLaunchBtn')
   btn.disabled = true
-  btn.innerHTML = '<span class="spinner" style="width:12px;height:12px;margin-right:4px"></span>Indítás…'
+  btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span>Indítás…'
   try {
     const res = await fetch('/api/workspace/launch', {
       method: 'POST',
@@ -11092,7 +11103,7 @@ document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
     alert('Hálózati hiba: ' + e)
   } finally {
     btn.disabled = false
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Indítás'
+    btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>Indítás'
   }
 })
 

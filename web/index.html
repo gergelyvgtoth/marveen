@@ -1382,24 +1382,17 @@
     </div>
 
     <!-- === Workspace Page === -->
-    <div class="page" id="workspacePage" hidden>
-      <div class="page-header">
-        <div class="page-header-row">
-          <div>
-            <h1>Workspace</h1>
-            <p class="subtitle">Claude Code session indítása memória + skill kontextussal</p>
-          </div>
-          <button class="btn-secondary btn-compact" id="wsRefreshCtx">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
-            Kontextus
-          </button>
-        </div>
-      </div>
-      <div class="ws-layout">
+    <div class="page ws-page" id="workspacePage" hidden>
+      <div class="ws-studio-layout">
         <!-- Left: context picker -->
         <div class="ws-context-panel">
+          <div class="ws-panel-head">
+            <span class="ws-panel-title">Kontextus</span>
+            <button class="ws-icon-btn" id="wsRefreshCtx" title="Frissítés">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div class="ws-context-sections">
           <div class="ws-context-section">
             <div class="ws-section-head">
               <span>Memória</span>
@@ -1415,37 +1408,54 @@
             </div>
             <div class="ws-checklist" id="wsSkillList"><div class="ws-empty">Betöltés…</div></div>
           </div>
+          </div>
         </div>
-        <!-- Right: prompt + controls + sessions -->
-        <div class="ws-main-panel">
-          <div class="ws-prompt-area">
+
+        <!-- Center: sessions + output -->
+        <div class="ws-conv-panel">
+          <div class="ws-panel-head">
+            <span class="ws-panel-title">Sessionök</span>
+            <button class="ws-icon-btn" id="wsRefreshSessions" title="Frissítés">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div class="ws-conv-list" id="wsSessionsList">
+            <div class="ws-empty">Nincs aktív session</div>
+          </div>
+          <div class="ws-output-area" id="wsOutputArea" hidden>
+            <div class="ws-output-head">
+              <div class="ws-output-title">
+                <span class="ws-status-dot ws-dot-active"></span>
+                <span id="wsOutputLabel">Kimenet</span>
+              </div>
+              <button class="ws-icon-btn" id="wsOutputClose" title="Bezárás">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <pre class="ws-output-pre" id="wsOutputPre"></pre>
+          </div>
+        </div>
+
+        <!-- Right: compose panel -->
+        <div class="ws-compose-panel">
+          <div class="ws-panel-head">
+            <span class="ws-panel-title">Prompt</span>
+          </div>
+          <div class="ws-compose-body">
             <textarea id="wsPrompt" class="ws-prompt" placeholder="Mi legyen a Claude feladata? A kiválasztott memóriák és skillek automatikusan bekerülnek a kontextusba."></textarea>
-            <div class="ws-controls">
-              <select id="wsModel" class="ws-model">
+            <div class="ws-compose-footer">
+              <select id="wsModel" class="ws-model-pill">
                 <option value="claude-sonnet-4-6">Sonnet 4.6</option>
                 <option value="claude-opus-4-8">Opus 4.8</option>
                 <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
               </select>
-              <label class="ws-checkbox-label"><input type="checkbox" id="wsPlan"> Plan mód</label>
-              <button class="btn-primary" id="wsLaunchBtn">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <label class="ws-plan-pill"><input type="checkbox" id="wsPlan"> Plan</label>
+              <div style="flex:1"></div>
+              <button class="ws-send-btn" id="wsLaunchBtn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 Indítás
               </button>
             </div>
-          </div>
-          <div class="ws-sessions-area">
-            <div class="ws-sessions-head">
-              <span>Aktív sessionök</span>
-              <button class="btn-secondary btn-compact" id="wsRefreshSessions">Frissítés</button>
-            </div>
-            <div id="wsSessionsList"><div class="ws-empty">Nincs aktív session</div></div>
-          </div>
-          <div class="ws-output-area" id="wsOutputArea" hidden>
-            <div class="ws-output-head">
-              <span id="wsOutputLabel">Kimenet</span>
-              <button class="btn-icon" id="wsOutputClose" title="Bezárás">&times;</button>
-            </div>
-            <pre class="ws-output-pre" id="wsOutputPre"></pre>
           </div>
         </div>
       </div>
