@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 import { getDb } from '../../db.js'
 import { json, readBody } from '../http-helpers.js'
 import { resolveFromPath } from '../../platform.js'
@@ -9,8 +9,8 @@ import type { RouteContext } from './types.js'
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude') ?? 'claude'
 
-// Active workspace sessions: id -> { session, started, prompt, model }
-const activeSessions = new Map<string, { session: string; started: number; prompt: string; model: string }>()
+// Active workspace sessions: id -> { session, started, prompt, model, promptFile, outputFile }
+const activeSessions = new Map<string, { session: string; started: number; prompt: string; model: string; promptFile: string; outputFile: string }>()
 
 function tmuxAlive(session: string): boolean {
   try { execFileSync(TMUX, ['has-session', '-t', session], { timeout: 3000, stdio: 'ignore' }); return true }
@@ -90,21 +90,15 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
     })
 
     let closed = false
-    let inFlight = false
     const tick = (): void => {
-      if (closed || inFlight) return
-      inFlight = true
-      execFile(TMUX, ['capture-pane', '-t', s.session, '-p'], { timeout: 3000, encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-        inFlight = false
-        if (closed) return
-        const pane = err ? '' : (stdout ?? '')
-        const alive = err ? tmuxAlive(s.session) : true
-        if (!alive) activeSessions.delete(id)
-        try {
-          res.write(`data: ${JSON.stringify({ pane, alive })}\n\n`)
-        } catch { closed = true }
-        if (!alive) { closed = true; try { res.end() } catch {} }
-      })
+      if (closed) return
+      const pane = existsSync(s.outputFile) ? readFileSync(s.outputFile, 'utf8') : ''
+      const alive = tmuxAlive(s.session)
+      if (!alive) activeSessions.delete(id)
+      try {
+        res.write(`data: ${JSON.stringify({ pane, alive })}\n\n`)
+      } catch { closed = true }
+      if (!alive) { closed = true; try { res.end() } catch {} }
     }
 
     tick()
@@ -121,7 +115,7 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
     const id = outputMatch[1]
     const s = activeSessions.get(id)
     if (!s) { res.writeHead(404); res.end(JSON.stringify({ error: 'not found' })); return true }
-    const output = tmuxCapture(s.session)
+    const output = existsSync(s.outputFile) ? readFileSync(s.outputFile, 'utf8') : ''
     json(res, { id, output, alive: tmuxAlive(s.session) })
     return true
   }
@@ -133,6 +127,8 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
     const s = activeSessions.get(id)
     if (s) {
       try { execFileSync(TMUX, ['kill-session', '-t', s.session]) } catch {}
+      try { unlinkSync(s.promptFile) } catch {}
+      try { unlinkSync(s.outputFile) } catch {}
       activeSessions.delete(id)
     }
     json(res, { ok: true })
@@ -179,18 +175,24 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
 
     const id = randomUUID().slice(0, 8)
     const sessionName = `workspace-${id}`
+    const promptFile = `/tmp/ws-prompt-${id}.txt`
+    const outputFile = `/tmp/ws-out-${id}.txt`
 
-    // Build claude CLI args
-    const args = ['new-session', '-d', '-s', sessionName, CLAUDE, '--model', model]
-    if (plan) args.push('--plan')
-    // Pass prompt via -p (non-interactive print mode)
-    args.push('-p', fullPrompt)
+    // Write prompt to file to avoid shell quoting issues with complex prompts
+    writeFileSync(promptFile, fullPrompt)
+
+    // Run claude in tmux wrapping output to file; -p flag = non-interactive print mode
+    // Quotes around $(cat) are essential -- without them the shell word-splits the prompt
+    const planFlag = plan ? ' --plan' : ''
+    const shellCmd = `${CLAUDE} --model ${model}${planFlag} -p "$(cat ${promptFile})" > ${outputFile} 2>&1`
+    const args = ['new-session', '-d', '-s', sessionName, 'sh', '-c', shellCmd]
 
     try {
       execFileSync(TMUX, args, { timeout: 10000 })
-      activeSessions.set(id, { session: sessionName, started: Date.now(), prompt: body.prompt, model })
+      activeSessions.set(id, { session: sessionName, started: Date.now(), prompt: body.prompt, model, promptFile, outputFile })
       json(res, { ok: true, id, session: sessionName })
     } catch (err) {
+      try { unlinkSync(promptFile) } catch {}
       res.writeHead(500)
       res.end(JSON.stringify({ error: String(err) }))
     }
