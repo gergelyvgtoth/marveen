@@ -10919,10 +10919,8 @@ function wsStopOutputPoll() {
 async function loadWorkspace() {
   wsSelMem.clear()
   wsSelSkills.clear()
-  document.getElementById('wsMemCount').textContent = '0 kiv.'
-  document.getElementById('wsSkillCount').textContent = '0 kiv.'
-  const area = document.getElementById('wsOutputArea')
-  if (area) area.hidden = true
+  const mc = document.getElementById('wsMemCount'); if (mc) mc.textContent = '0 kiv.'
+  const sc = document.getElementById('wsSkillCount'); if (sc) sc.textContent = '0 kiv.'
   wsStopOutputPoll()
   await refreshWsCtx()
   await refreshWsSessions()
@@ -10953,7 +10951,7 @@ function renderWsMem() {
     div.innerHTML = `<label><input type="checkbox" data-id="${m.id}"${wsSelMem.has(m.id) ? ' checked' : ''}> <span class="ws-item-badge ws-badge-${escHtml(m.category)}">${escHtml(m.category)}</span> ${escHtml(label)}</label>`
     div.querySelector('input').addEventListener('change', e => {
       if (e.target.checked) wsSelMem.add(m.id); else wsSelMem.delete(m.id)
-      document.getElementById('wsMemCount').textContent = wsSelMem.size + ' kiv.'
+      const el = document.getElementById('wsMemCount'); if (el) el.textContent = wsSelMem.size + ' kiv.'
     })
     list.appendChild(div)
   })
@@ -10972,7 +10970,7 @@ function renderWsSkills() {
     div.innerHTML = `<label><input type="checkbox" data-name="${escHtml(s.name)}"${wsSelSkills.has(s.name) ? ' checked' : ''}> <strong>${escHtml(s.name)}</strong>${desc ? ' <span class="ws-skill-desc">' + escHtml(desc) + '</span>' : ''}</label>`
     div.querySelector('input').addEventListener('change', e => {
       if (e.target.checked) wsSelSkills.add(s.name); else wsSelSkills.delete(s.name)
-      document.getElementById('wsSkillCount').textContent = wsSelSkills.size + ' kiv.'
+      const el = document.getElementById('wsSkillCount'); if (el) el.textContent = wsSelSkills.size + ' kiv.'
     })
     list.appendChild(div)
   })
@@ -10990,7 +10988,7 @@ function renderWsSessions(sessions) {
   const el = document.getElementById('wsSessionsList')
   if (!el) return
   if (!sessions.length) {
-    el.innerHTML = '<div class="ws-empty">Nincs aktív session</div>'
+    el.innerHTML = '<div class="ws-empty">Nincs session</div>'
     return
   }
   el.innerHTML = ''
@@ -11004,15 +11002,13 @@ function renderWsSessions(sessions) {
     card.innerHTML = `
       <span class="ws-status-dot ${statusClass}"></span>
       <div class="ws-session-info">
-        <div class="ws-session-prompt-text">${escHtml((s.prompt || '').slice(0, 80))}</div>
-        <div class="ws-session-meta">#${escHtml(String(s.id))} &middot; ${escHtml(modelShort)} &middot; ${statusLabel}</div>
+        <div class="ws-session-prompt-text">${escHtml((s.prompt || '').slice(0, 60))}</div>
+        <div class="ws-session-meta">#${escHtml(String(s.id))} · ${escHtml(modelShort)} · ${statusLabel}</div>
       </div>
       <div class="ws-session-actions">
-        <button class="btn-secondary btn-compact ws-view-btn">Kimenet</button>
-        <button class="btn-danger btn-compact ws-kill-btn">Stop</button>
+        <button class="btn-danger btn-compact ws-kill-btn" title="Stop" style="padding:2px 7px;font-size:11px">✕</button>
       </div>
     `
-    card.querySelector('.ws-view-btn').addEventListener('click', (e) => { e.stopPropagation(); wsViewOutput(s.id) })
     card.querySelector('.ws-kill-btn').addEventListener('click', (e) => { e.stopPropagation(); wsKillSession(s.id) })
     card.addEventListener('click', () => wsViewOutput(s.id))
     el.appendChild(card)
@@ -11020,54 +11016,192 @@ function renderWsSessions(sessions) {
 }
 
 function wsViewOutput(id) {
-  const area = document.getElementById('wsOutputArea')
-  const label = document.getElementById('wsOutputLabel')
-  if (!area) return
-  area.hidden = false
-  if (label) label.textContent = `Session #${id} -- kimenet`
+  const dot = document.getElementById('wsChatStatusDot')
+  const title = document.getElementById('wsChatTitle')
   wsOutputSession = id
   wsStopOutputPoll()
+  if (title) title.textContent = `Session #${id}`
+  if (dot) { dot.className = 'ws-status-dot ws-dot-active' }
+  const pre = document.getElementById('wsOutputPre')
+  if (pre) pre.textContent = '(betöltés…)'
+  wsResetCodeViewer()
 
   const token = localStorage.getItem('marveen-dashboard-token') ?? ''
   wsOutputSSE = new EventSource(`/api/workspace/sessions/${id}/stream?token=${encodeURIComponent(token)}`)
   wsOutputSSE.onmessage = (e) => {
     const data = JSON.parse(e.data)
-    const pre = document.getElementById('wsOutputPre')
     if (pre) pre.textContent = data.pane || '(üres kimenet)'
+    wsExtractDiffs(data.pane || '')
     if (!data.alive) {
       wsStopOutputPoll()
-      const lbl = document.getElementById('wsOutputLabel')
-      if (lbl && !lbl.textContent.includes('befejezett')) lbl.textContent += ' (befejezett)'
-      const dot = document.querySelector('#wsOutputArea .ws-status-dot')
-      if (dot) { dot.classList.remove('ws-dot-active'); dot.classList.add('ws-dot-done') }
+      if (dot) dot.className = 'ws-status-dot ws-dot-done'
+      if (title && !title.textContent.includes('kész')) title.textContent += ' (kész)'
       refreshWsSessions()
     }
   }
   wsOutputSSE.onerror = () => { wsStopOutputPoll() }
-
-  area.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  refreshWsSessions()
 }
 
 async function wsKillSession(id) {
   try { await fetch(`/api/workspace/sessions/${id}`, { method: 'DELETE' }) } catch {}
   if (wsOutputSession === id) {
     wsStopOutputPoll()
-    const area = document.getElementById('wsOutputArea')
-    if (area) area.hidden = true
     wsOutputSession = null
+    const pre = document.getElementById('wsOutputPre')
+    if (pre) pre.textContent = 'Session leállítva.'
+    const dot = document.getElementById('wsChatStatusDot')
+    const title = document.getElementById('wsChatTitle')
+    if (dot) dot.className = 'ws-status-dot ws-dot-done'
+    if (title) title.textContent = 'Nincs aktív session'
   }
   refreshWsSessions()
+}
+
+function wsResetCodeViewer() {
+  const viewer = document.getElementById('wsCodeViewer')
+  const actions = document.getElementById('wsCodeActions')
+  const count = document.getElementById('wsChangeCount')
+  if (viewer) viewer.innerHTML = '<div class="ws-code-empty"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:.3"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg><div>Nincs kód változás</div></div>'
+  if (actions) actions.hidden = true
+  if (count) count.textContent = ''
+}
+
+function wsExtractDiffs(text) {
+  const viewer = document.getElementById('wsCodeViewer')
+  const actions = document.getElementById('wsCodeActions')
+  const countEl = document.getElementById('wsChangeCount')
+  if (!viewer) return
+
+  const lines = text.split('\n')
+  const diffBlocks = []
+  let currentFile = null
+  let currentBlock = []
+  let inDiff = false
+
+  lines.forEach(line => {
+    // Detect file being edited/created (tool output patterns)
+    const toolMatch = line.match(/^(?:Edit|Write|Read):\s*(.+)$/)
+    const diffHeaderMatch = !line.startsWith('---') && line.match(/^\+\+\+ b\/(.+)$/)
+    if (toolMatch || diffHeaderMatch) {
+      if (currentFile && currentBlock.length > 0) diffBlocks.push({ file: currentFile, lines: [...currentBlock] })
+      currentFile = toolMatch ? toolMatch[1].trim() : diffHeaderMatch[1].trim()
+      currentBlock = []
+      inDiff = true
+      return
+    }
+    if (inDiff) {
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        currentBlock.push({ type: 'add', text: line.slice(1) })
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        currentBlock.push({ type: 'del', text: line.slice(1) })
+      } else if (line.startsWith('@@')) {
+        currentBlock.push({ type: 'hunk', text: line })
+      } else if (line.match(/^[ \t]/) || line === '') {
+        currentBlock.push({ type: 'ctx', text: line.length > 0 ? line.slice(1) : '' })
+      } else {
+        inDiff = false
+      }
+    }
+  })
+  if (currentFile && currentBlock.length > 0) diffBlocks.push({ file: currentFile, lines: [...currentBlock] })
+
+  if (!diffBlocks.length) return
+
+  viewer.innerHTML = ''
+  let totalAdd = 0, totalDel = 0
+  diffBlocks.forEach(block => {
+    const adds = block.lines.filter(l => l.type === 'add').length
+    const dels = block.lines.filter(l => l.type === 'del').length
+    totalAdd += adds; totalDel += dels
+    const fileDiv = document.createElement('div')
+    fileDiv.className = 'ws-code-file'
+    const linesHtml = block.lines.map(l => {
+      const cls = l.type === 'add' ? 'ws-diff-add' : l.type === 'del' ? 'ws-diff-del' : l.type === 'hunk' ? 'ws-diff-hunk' : 'ws-diff-ctx'
+      const sign = l.type === 'add' ? '+' : l.type === 'del' ? '-' : l.type === 'hunk' ? '@' : ' '
+      return `<div class="ws-diff-line ${cls}"><span class="ws-diff-sign">${sign}</span><span class="ws-diff-code">${escHtml(l.text)}</span></div>`
+    }).join('')
+    fileDiv.innerHTML = `<div class="ws-code-file-header"><span class="ws-code-file-name">${escHtml(block.file)}</span>${adds > 0 ? `<span class="ws-code-additions">+${adds}</span>` : ''}${dels > 0 ? `<span class="ws-code-deletions">-${dels}</span>` : ''}</div><div class="ws-diff-block">${linesHtml}</div>`
+    viewer.appendChild(fileDiv)
+  })
+  if (countEl) countEl.textContent = `+${totalAdd} -${totalDel}`
+  if (actions) actions.hidden = false
 }
 
 document.getElementById('wsMemSearch')?.addEventListener('input', renderWsMem)
 document.getElementById('wsRefreshCtx')?.addEventListener('click', refreshWsCtx)
 document.getElementById('wsRefreshSessions')?.addEventListener('click', refreshWsSessions)
 
-document.getElementById('wsOutputClose')?.addEventListener('click', () => {
+document.getElementById('wsNewBtn')?.addEventListener('click', () => {
   wsStopOutputPoll()
   wsOutputSession = null
-  const area = document.getElementById('wsOutputArea')
-  if (area) area.hidden = true
+  const pre = document.getElementById('wsOutputPre')
+  const dot = document.getElementById('wsChatStatusDot')
+  const title = document.getElementById('wsChatTitle')
+  if (pre) pre.textContent = 'Nincs aktív session -- indíts egyet.'
+  if (dot) dot.className = 'ws-status-dot ws-dot-done'
+  if (title) title.textContent = 'Nincs aktív session'
+  wsResetCodeViewer()
+  const promptEl = document.getElementById('wsPrompt')
+  if (promptEl) { promptEl.value = ''; promptEl.focus() }
+  refreshWsSessions()
+})
+
+document.getElementById('wsAttachBtn')?.addEventListener('click', () => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.txt,.md,.js,.ts,.py,.json,.yaml,.yml,.sh,.css,.html'
+  input.onchange = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    const text = await file.text()
+    const promptEl = document.getElementById('wsPrompt')
+    if (promptEl) {
+      const sep = promptEl.value ? '\n\n' : ''
+      promptEl.value += `${sep}## ${file.name}\n\`\`\`\n${text}\n\`\`\``
+      promptEl.focus()
+    }
+  }
+  input.click()
+})
+
+document.getElementById('wsVoiceBtn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('wsVoiceBtn')
+  if (!navigator.mediaDevices) { alert('Hangfelvétel nem elérhető (HTTPS szükséges)'); return }
+  if (btn._recording) {
+    btn._recorder?.stop()
+    btn._recording = false
+    btn.style.color = ''
+    return
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const recorder = new MediaRecorder(stream)
+    const chunks = []
+    recorder.ondataavailable = e => chunks.push(e.data)
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop())
+      const blob = new Blob(chunks, { type: 'audio/webm' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = 'hangfelvétel.webm'; a.click()
+      URL.revokeObjectURL(url)
+    }
+    recorder.start()
+    btn._recorder = recorder
+    btn._recording = true
+    btn.style.color = '#ef4444'
+  } catch (e) { alert('Mikrofon hozzáférés megtagadva') }
+})
+
+document.getElementById('wsApproveBtn')?.addEventListener('click', () => {
+  const promptEl = document.getElementById('wsPrompt')
+  if (promptEl) { promptEl.value = 'Jóváhagyom a változtatásokat.'; promptEl.focus() }
+})
+
+document.getElementById('wsRejectBtn')?.addEventListener('click', () => {
+  const promptEl = document.getElementById('wsPrompt')
+  if (promptEl) { promptEl.value = 'Módosítást kérek: '; promptEl.focus() }
 })
 
 document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
@@ -11076,6 +11210,8 @@ document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
   if (!prompt) { promptEl?.focus(); return }
   const model = document.getElementById('wsModel')?.value || 'claude-sonnet-4-6'
   const plan = document.getElementById('wsPlan')?.checked ?? false
+  const effort = document.getElementById('wsEffort')?.value || ''
+  const githubRepo = document.getElementById('wsGithubRepo')?.value?.trim() || ''
   const btn = document.getElementById('wsLaunchBtn')
   btn.disabled = true
   btn.innerHTML = '<span class="spinner" style="width:12px;height:12px"></span>Indítás…'
@@ -11083,13 +11219,7 @@ document.getElementById('wsLaunchBtn')?.addEventListener('click', async () => {
     const res = await fetch('/api/workspace/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt,
-        model,
-        plan,
-        memories: [...wsSelMem],
-        skills: [...wsSelSkills]
-      })
+      body: JSON.stringify({ prompt, model, plan, effort, githubRepo, memories: [...wsSelMem], skills: [...wsSelSkills] })
     })
     const data = await res.json()
     if (data.ok) {

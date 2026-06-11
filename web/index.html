@@ -1384,70 +1384,80 @@
     <!-- === Workspace Page === -->
     <div class="page ws-page" id="workspacePage" hidden>
       <div class="ws-studio-layout">
-        <!-- Left: context picker -->
-        <div class="ws-context-panel">
-          <div class="ws-panel-head">
-            <span class="ws-panel-title">Kontextus</span>
+
+        <!-- Left: sidebar -->
+        <div class="ws-sidebar">
+          <div class="ws-sidebar-head">
+            <span class="ws-panel-title">Studio</span>
+            <button class="ws-new-btn" id="wsNewBtn" title="Új session">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Új
+            </button>
             <button class="ws-icon-btn" id="wsRefreshCtx" title="Frissítés">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
             </button>
           </div>
-          <div class="ws-context-sections">
-          <div class="ws-context-section">
-            <div class="ws-section-head">
-              <span>Memória</span>
-              <span class="ws-count-badge" id="wsMemCount">0 kiv.</span>
+          <div class="ws-sidebar-body">
+            <!-- Today's sessions -->
+            <div class="ws-sidebar-section">
+              <div class="ws-sidebar-label">Mai munka</div>
+              <div id="wsSessionsList"><div class="ws-empty">Nincs session</div></div>
             </div>
-            <input type="text" id="wsMemSearch" class="ws-search" placeholder="Szűrés...">
-            <div class="ws-checklist" id="wsMemList"><div class="ws-empty">Betöltés…</div></div>
-          </div>
-          <div class="ws-context-section">
-            <div class="ws-section-head">
-              <span>Skillek</span>
-              <span class="ws-count-badge" id="wsSkillCount">0 kiv.</span>
+            <!-- Context -->
+            <div class="ws-sidebar-label ws-sidebar-label-sep">Kontextus</div>
+            <div class="ws-context-section">
+              <div class="ws-section-head"><span>GitHub repo</span></div>
+              <input type="text" id="wsGithubRepo" class="ws-search" placeholder="owner/repo vagy URL" style="margin-bottom:0">
             </div>
-            <div class="ws-checklist" id="wsSkillList"><div class="ws-empty">Betöltés…</div></div>
-          </div>
+            <div class="ws-context-section">
+              <div class="ws-section-head">
+                <span>Memória</span>
+                <span class="ws-count-badge" id="wsMemCount">0 kiv.</span>
+              </div>
+              <input type="text" id="wsMemSearch" class="ws-search" placeholder="Szűrés...">
+              <div class="ws-checklist" id="wsMemList"><div class="ws-empty">Betöltés…</div></div>
+            </div>
+            <div class="ws-context-section">
+              <div class="ws-section-head">
+                <span>Skillek</span>
+                <span class="ws-count-badge" id="wsSkillCount">0 kiv.</span>
+              </div>
+              <div class="ws-checklist" id="wsSkillList"><div class="ws-empty">Betöltés…</div></div>
+            </div>
           </div>
         </div>
 
-        <!-- Center: sessions + output -->
-        <div class="ws-conv-panel">
+        <!-- Center: chat panel (1B) -->
+        <div class="ws-chat-panel">
           <div class="ws-panel-head">
-            <span class="ws-panel-title">Sessionök</span>
+            <span class="ws-status-dot ws-dot-done" id="wsChatStatusDot"></span>
+            <span class="ws-panel-title" id="wsChatTitle">Nincs aktív session</span>
             <button class="ws-icon-btn" id="wsRefreshSessions" title="Frissítés">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
             </button>
           </div>
-          <div class="ws-conv-list" id="wsSessionsList">
-            <div class="ws-empty">Nincs aktív session</div>
+          <div class="ws-chat-output" id="wsOutputArea">
+            <pre class="ws-output-pre" id="wsOutputPre">Nincs aktív session -- indíts egyet.</pre>
           </div>
-          <div class="ws-output-area" id="wsOutputArea" hidden>
-            <div class="ws-output-head">
-              <div class="ws-output-title">
-                <span class="ws-status-dot ws-dot-active"></span>
-                <span id="wsOutputLabel">Kimenet</span>
-              </div>
-              <button class="ws-icon-btn" id="wsOutputClose" title="Bezárás">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-              </button>
-            </div>
-            <pre class="ws-output-pre" id="wsOutputPre"></pre>
-          </div>
-        </div>
-
-        <!-- Right: compose panel -->
-        <div class="ws-compose-panel">
-          <div class="ws-panel-head">
-            <span class="ws-panel-title">Prompt</span>
-          </div>
-          <div class="ws-compose-body">
-            <textarea id="wsPrompt" class="ws-prompt" placeholder="Mi legyen a Claude feladata? A kiválasztott memóriák és skillek automatikusan bekerülnek a kontextusba."></textarea>
+          <div class="ws-chat-compose">
+            <textarea id="wsPrompt" class="ws-chat-input" placeholder="Mi legyen a Claude feladata? A kiválasztott memóriák és skillek automatikusan bekerülnek a kontextusba."></textarea>
             <div class="ws-compose-footer">
+              <button class="ws-icon-btn" id="wsAttachBtn" title="Csatolás">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              </button>
+              <button class="ws-icon-btn" id="wsVoiceBtn" title="Hangfelvétel">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+              </button>
               <select id="wsModel" class="ws-model-pill">
                 <option value="claude-sonnet-4-6">Sonnet 4.6</option>
                 <option value="claude-opus-4-8">Opus 4.8</option>
                 <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+              </select>
+              <select id="wsEffort" class="ws-model-pill">
+                <option value="">effort: auto</option>
+                <option value="low">effort: low</option>
+                <option value="medium">effort: med</option>
+                <option value="high">effort: high</option>
               </select>
               <label class="ws-plan-pill"><input type="checkbox" id="wsPlan"> Plan</label>
               <div style="flex:1"></div>
@@ -1458,6 +1468,31 @@
             </div>
           </div>
         </div>
+
+        <!-- Right: code viewer (1A) -->
+        <div class="ws-code-panel">
+          <div class="ws-panel-head">
+            <span class="ws-panel-title">Változások</span>
+            <span class="ws-count-badge" id="wsChangeCount"></span>
+          </div>
+          <div class="ws-code-viewer" id="wsCodeViewer">
+            <div class="ws-code-empty">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:.3"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+              <div>Nincs kód változás</div>
+            </div>
+          </div>
+          <div class="ws-code-actions" id="wsCodeActions" hidden>
+            <button class="ws-reject-btn" id="wsRejectBtn">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              Módosítást kérek
+            </button>
+            <button class="ws-approve-btn" id="wsApproveBtn">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              Jóváhagyom
+            </button>
+          </div>
+        </div>
+
       </div>
     </div>
 
