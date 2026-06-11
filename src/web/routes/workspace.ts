@@ -9,8 +9,11 @@ import type { RouteContext } from './types.js'
 const TMUX = resolveFromPath('tmux')
 const CLAUDE = resolveFromPath('claude') ?? 'claude'
 
-// Active workspace sessions: id -> { session, started, prompt, model, promptFile, outputFile }
-const activeSessions = new Map<string, { session: string; started: number; prompt: string; model: string; promptFile: string; outputFile: string }>()
+type SessionInfo = { session: string; started: number; prompt: string; model: string; promptFile: string; outputFile: string }
+// Active (running) sessions
+const activeSessions = new Map<string, SessionInfo>()
+// Finished sessions kept for output viewing (TTL ~30min)
+const finishedSessions = new Map<string, { outputFile: string; promptFile: string; finishedAt: number }>()
 
 function tmuxAlive(session: string): boolean {
   try { execFileSync(TMUX, ['has-session', '-t', session], { timeout: 3000, stdio: 'ignore' }); return true }
@@ -65,10 +68,24 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
 
   // GET /api/workspace/sessions -- aktív session-ök
   if (path === '/api/workspace/sessions' && method === 'GET') {
+    // Prune expired finished sessions (30 min TTL)
+    const now = Date.now()
+    for (const [id, f] of finishedSessions.entries()) {
+      if (now - f.finishedAt > 30 * 60 * 1000) {
+        try { unlinkSync(f.outputFile) } catch {}
+        try { unlinkSync(f.promptFile) } catch {}
+        finishedSessions.delete(id)
+      }
+    }
     const sessions = []
     for (const [id, s] of activeSessions.entries()) {
       const alive = tmuxAlive(s.session)
-      if (!alive) { activeSessions.delete(id); continue }
+      if (!alive) {
+        // Move to finished so output is still viewable
+        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: now })
+        activeSessions.delete(id)
+        continue
+      }
       sessions.push({ id, session: s.session, started: s.started, prompt: s.prompt.slice(0, 80), model: s.model })
     }
     json(res, { sessions })
@@ -80,7 +97,17 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
   if (streamMatch && method === 'GET') {
     const id = streamMatch[1]
     const s = activeSessions.get(id)
-    if (!s) { res.writeHead(404); res.end(JSON.stringify({ error: 'not found' })); return true }
+    // Also serve completed sessions from finishedSessions
+    if (!s) {
+      const fin = finishedSessions.get(id)
+      if (!fin) { res.writeHead(404); res.end(JSON.stringify({ error: 'not found' })); return true }
+      // One-shot: serve the final output and close
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' })
+      const pane = existsSync(fin.outputFile) ? readFileSync(fin.outputFile, 'utf8') : ''
+      res.write(`data: ${JSON.stringify({ pane, alive: false })}\n\n`)
+      res.end()
+      return true
+    }
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -94,7 +121,10 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
       if (closed) return
       const pane = existsSync(s.outputFile) ? readFileSync(s.outputFile, 'utf8') : ''
       const alive = tmuxAlive(s.session)
-      if (!alive) activeSessions.delete(id)
+      if (!alive) {
+        activeSessions.delete(id)
+        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: Date.now() })
+      }
       try {
         res.write(`data: ${JSON.stringify({ pane, alive })}\n\n`)
       } catch { closed = true }
@@ -130,6 +160,12 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
       try { unlinkSync(s.promptFile) } catch {}
       try { unlinkSync(s.outputFile) } catch {}
       activeSessions.delete(id)
+    }
+    const fin = finishedSessions.get(id)
+    if (fin) {
+      try { unlinkSync(fin.outputFile) } catch {}
+      try { unlinkSync(fin.promptFile) } catch {}
+      finishedSessions.delete(id)
     }
     json(res, { ok: true })
     return true
