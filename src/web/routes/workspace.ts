@@ -12,7 +12,7 @@ const CLAUDE = resolveFromPath('claude') ?? 'claude'
 type SessionInfo = { session: string; started: number; prompt: string; model: string; promptFile: string; outputFile: string }
 // Active (running) sessions
 const activeSessions = new Map<string, SessionInfo>()
-// Finished sessions kept for output viewing (TTL ~30min)
+// Finished sessions kept until manually deleted or backend restart
 const finishedSessions = new Map<string, { outputFile: string; promptFile: string; finishedAt: number }>()
 
 function tmuxAlive(session: string): boolean {
@@ -68,21 +68,12 @@ export async function tryHandleWorkspace(ctx: RouteContext): Promise<boolean> {
 
   // GET /api/workspace/sessions -- aktív session-ök
   if (path === '/api/workspace/sessions' && method === 'GET') {
-    // Prune expired finished sessions (30 min TTL)
-    const now = Date.now()
-    for (const [id, f] of finishedSessions.entries()) {
-      if (now - f.finishedAt > 30 * 60 * 1000) {
-        try { unlinkSync(f.outputFile) } catch {}
-        try { unlinkSync(f.promptFile) } catch {}
-        finishedSessions.delete(id)
-      }
-    }
     const sessions = []
     for (const [id, s] of activeSessions.entries()) {
       const alive = tmuxAlive(s.session)
       if (!alive) {
         // Move to finished so output is still viewable
-        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: now })
+        finishedSessions.set(id, { outputFile: s.outputFile, promptFile: s.promptFile, finishedAt: Date.now() })
         activeSessions.delete(id)
         continue
       }
