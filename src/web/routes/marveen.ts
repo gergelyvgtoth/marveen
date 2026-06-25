@@ -1,7 +1,11 @@
 import { existsSync, unlinkSync, copyFileSync, writeFileSync } from 'node:fs'
 import { join, extname } from 'node:path'
-import { PROJECT_ROOT, OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER } from '../../config.js'
-import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, sendMarveenAvatarChange } from '../telegram.js'
+import {
+  PROJECT_ROOT, OWNER_NAME, BOT_NAME, BRAND_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER,
+  KANBAN_LABEL_COLORS,
+} from '../../config.js'
+import { getEffectiveSettingValue } from '../../settings-store.js'
+import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, readMarveenGooglechatConfig, sendMarveenAvatarChange } from '../telegram.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
 import { readFileOr } from '../agent-config.js'
 import { parseMultipart } from '../multipart.js'
@@ -13,6 +17,31 @@ import type { RouteContext } from './types.js'
 
 function getActiveMarveenModel(): string {
   return readActiveModelFromProjectDir(PROJECT_ROOT) ?? 'unknown'
+}
+
+// Pure identity-core of the /api/marveen payload: the brand-relevant fields the
+// dashboard chrome + agent routing depend on. Extracted so the mapping (display
+// name -> name, product brand -> brandName, canonical id -> agentId) is provable
+// for any non-default identity, independent of the route's file I/O.
+export interface MarveenIdentityCore {
+  name: string
+  brandName: string
+  agentId: string
+  autoRestartId: string
+  role: 'main'
+}
+export function buildMarveenIdentityCore(
+  botName: string,
+  brandName: string,
+  mainAgentId: string,
+): MarveenIdentityCore {
+  return {
+    name: botName,
+    brandName,
+    agentId: mainAgentId,
+    autoRestartId: mainAgentId,
+    role: 'main',
+  }
 }
 
 export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promise<boolean> {
@@ -31,26 +60,33 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
     const tg = readMarveenTelegramConfig()
     const dc = readMarveenDiscordConfig()
     const sl = readMarveenSlackConfig()
+    const gc = readMarveenGooglechatConfig()
+    // Brand-relevant identity core. `name` = main agent display name (BOT_NAME),
+    // `brandName` = product brand for the dashboard chrome (defaults to BOT_NAME;
+    // the client falls back to its own HTML default "Marveen" if absent on a
+    // legacy backend), `agentId` = canonical MAIN_AGENT_ID so the dashboard can
+    // hit /api/agents/<id>/skills for the main agent.
+    const idCore = buildMarveenIdentityCore(BOT_NAME, BRAND_NAME, MAIN_AGENT_ID)
     json(res, {
-      name: BOT_NAME,
-      // Canonical agent id (MAIN_AGENT_ID, e.g. "gorcsevivan") so the dashboard
-      // can hit /api/agents/<id>/skills for the main agent -- the display name
-      // (BOT_NAME) is not a valid agent-dir id.
-      agentId: MAIN_AGENT_ID,
+      ...idCore,
+      // Configured owner display name (OWNER_NAME). The dashboard chat view uses
+      // this to pin/label the owner's own message thread instead of a hardcoded
+      // literal, so a renamed install recognizes its real owner.
+      ownerName: OWNER_NAME,
       description,
       model: getActiveMarveenModel(),
       tmuxSession: MAIN_CHANNELS_SESSION,
       running: true,
       // Auto-restart applies to the main channels session too; key it by the
-      // orchestrator id (autoRestartId) so the UI PUTs to the right store entry.
+      // orchestrator id (autoRestartId, part of idCore) so the UI PUTs to the
+      // right store entry.
       autoRestart: readAutoRestartConfig(MAIN_AGENT_ID),
-      autoRestartId: MAIN_AGENT_ID,
       contextTokens: readContextTokensFromProjectDir(PROJECT_ROOT),
       hasTelegram: tg.hasTelegram,
       hasDiscord: dc.hasDiscord,
       hasSlack: sl.hasSlack,
+      hasGooglechat: gc.hasGooglechat,
       telegramBotUsername: tg.botUsername,
-      role: 'main',
       personality: soulSection,
       claudeMd,
       soulMd,
@@ -60,6 +96,39 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       // CHANNEL_PROVIDER env-jébe pinneljük, hogy a UI ne hardcode-olt
       // 'telegram'-mal induljon.
       channelProvider: CHANNEL_PROVIDER,
+      // Resolved through the settings overrides layer so the UI hot-reloads.
+      kanbanAging: {
+        warnH: getEffectiveSettingValue('KANBAN_AGING_WARN_H'),
+        cautionH: getEffectiveSettingValue('KANBAN_AGING_CAUTION_H'),
+        criticalH: getEffectiveSettingValue('KANBAN_AGING_CRITICAL_H'),
+        warnColor: getEffectiveSettingValue('KANBAN_AGING_WARN_COLOR'),
+        cautionColor: getEffectiveSettingValue('KANBAN_AGING_CAUTION_COLOR'),
+        criticalColor: getEffectiveSettingValue('KANBAN_AGING_CRITICAL_COLOR'),
+      },
+      // Resolved through the settings overrides layer (override > .env >
+      // registry default) instead of the boot-time config.ts constants, so a
+      // value saved on the Settings page takes effect immediately -- no
+      // process restart needed for these 9 keys.
+      kanbanWip: {
+        limits: {
+          planned: getEffectiveSettingValue('KANBAN_WIP_PLANNED'),
+          in_progress: getEffectiveSettingValue('KANBAN_WIP_IN_PROGRESS'),
+          waiting: getEffectiveSettingValue('KANBAN_WIP_WAITING'),
+          done: getEffectiveSettingValue('KANBAN_WIP_DONE'),
+        },
+        warnPct: getEffectiveSettingValue('KANBAN_WIP_WARN_PCT'),
+        okColor: getEffectiveSettingValue('KANBAN_WIP_OK_COLOR'),
+        warnColor: getEffectiveSettingValue('KANBAN_WIP_WARN_COLOR'),
+        fullColor: getEffectiveSettingValue('KANBAN_WIP_FULL_COLOR'),
+        overColor: getEffectiveSettingValue('KANBAN_WIP_OVER_COLOR'),
+      },
+      kanbanSwimlanes: {
+        defaultGroup: getEffectiveSettingValue('KANBAN_SWIMLANE_DEFAULT_GROUP'),
+        separatorColor: getEffectiveSettingValue('KANBAN_SWIMLANE_SEPARATOR_COLOR') || null,
+      },
+      kanbanLabels: {
+        colors: KANBAN_LABEL_COLORS,
+      },
     })
     return true
   }

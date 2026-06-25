@@ -2,9 +2,11 @@ import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
+import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
+import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
 import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
@@ -18,10 +20,12 @@ import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
 import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
+import { tryHandleAgentConversation } from './web/routes/agent-conversation.js'
 import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
 import { sweepOrphanTaskStates } from './web/agent-taskstate.js'
 import { tryHandleDailyLog } from './web/routes/daily-log.js'
@@ -31,6 +35,7 @@ import { tryHandleKanban } from './web/routes/kanban.js'
 import { tryHandleCalendar } from './web/routes/calendar.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
+import { tryHandleDocs } from './web/routes/docs.js'
 import { tryHandleConnectorsHu } from './web/routes/connectors-hu.js'
 import { tryHandleAgentsSkills } from './web/routes/agents-skills.js'
 import { tryHandleSkills } from './web/routes/skills.js'
@@ -62,6 +67,8 @@ import { tryHandleOutboundQueue } from './web/routes/outbound-queue.js'
 import { tryHandleSalesOpportunities } from './web/routes/sales-opportunities.js'
 import { tryHandleVersion } from './web/routes/version.js'
 import { tryHandleWorkspace } from './web/routes/workspace.js'
+import { tryHandleSettings } from './web/routes/settings.js'
+import { tryHandleAuditLog } from './web/routes/audit-log.js'
 import { tryHandleStatic } from './web/routes/static.js'
 import type { RouteContext } from './web/routes/types.js'
 
@@ -83,8 +90,8 @@ export function startWebServer(port = 3420): http.Server {
     `http://127.0.0.1:${port}`,
     ...( WEB_HOST !== 'localhost' && WEB_HOST !== '127.0.0.1' ? [`http://${WEB_HOST}:${port}`] : []),
     ...(DASHBOARD_PUBLIC_URL ? [DASHBOARD_PUBLIC_URL.replace(/\/$/, '')] : []),
+    ...DASHBOARD_ALLOWED_ORIGINS.split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean),
   ])
-  const isSafeMethod = (m: string) => m === 'GET' || m === 'HEAD' || m === 'OPTIONS'
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://localhost:${port}`)
@@ -101,10 +108,11 @@ export function startWebServer(port = 3420): http.Server {
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
     // Block state-changing requests from browsers running on foreign origins.
-    // Same-origin fetches from the dashboard don't set Origin on some browsers, so we
-    // accept requests where Origin is absent OR whitelisted. Requests carrying a foreign
-    // Origin are rejected outright (this is the primary CSRF defence).
-    if (!isSafeMethod(method) && origin && !allowedOrigins.has(origin)) {
+    // Same-origin fetches (Origin absent, allowlisted, or matching the host the
+    // server was actually reached on -- e.g. a Tailscale Serve / reverse-proxy
+    // hostname) are accepted; a foreign Origin is rejected (the CSRF defence).
+    if (isBlockedCrossOriginWrite(method, origin, req.headers.host, req.headers['x-forwarded-host'] as string | undefined, allowedOrigins)) {
+      logger.warn({ method, path, origin, host: req.headers.host, xForwardedHost: req.headers['x-forwarded-host'] }, 'CSRF: blocked write from foreign origin')
       res.writeHead(403, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Origin not allowed' }))
       return
@@ -142,6 +150,15 @@ export function startWebServer(port = 3420): http.Server {
       }
     }
 
+    // The mobile-login QR needs a URL the phone can actually reach. When the
+    // desktop opens the dashboard on localhost, window.location.origin is
+    // useless (the phone would hit its OWN localhost), so the client asks the
+    // server for its LAN IP and builds the QR from that. Auth is already
+    // enforced by the /api/* gate above.
+    if (path === '/api/network-info' && method === 'GET') {
+      return json(res, { lan_ip: detectLanIp(), port })
+    }
+
     try {
       const routeCtx: RouteContext = { req, res, path, method, url }
 
@@ -155,9 +172,11 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleSchedules(routeCtx)) return
       if (await tryHandleConnectorsHu(routeCtx)) return
       if (await tryHandleConnectors(routeCtx)) return
+      if (await tryHandleDocs(routeCtx)) return
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
       if (await tryHandleAgentTerminal(routeCtx)) return
+      if (await tryHandleAgentConversation(routeCtx)) return
       if (await tryHandleAgentTaskState(routeCtx)) return
       if (await tryHandleAgents(routeCtx, WEB_DIR)) return
       if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
@@ -187,6 +206,8 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleSalesOpportunities(routeCtx)) return
       if (await tryHandleWorkspace(routeCtx)) return
       if (await tryHandleVersion(routeCtx, WEB_DIR)) return
+      if (await tryHandleSettings(routeCtx)) return
+      if (await tryHandleAuditLog(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)
@@ -310,6 +331,14 @@ export function startWebServer(port = 3420): http.Server {
   const updateCheckerInterval = startUpdateChecker()
   logger.info('Update checker started (15min poll)')
 
+  // Collect token usage from JSONL transcripts every hour so the run-history
+  // token estimates stay fresh without requiring a manual dashboard visit.
+  const tokenCollectInterval = setInterval(() => {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
+  }, 60 * 60 * 1000)
+  collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
+  logger.info('Token usage auto-collect started (1h poll + startup)')
+
   // NOTE: startMcpListChecker() is intentionally NOT called here.
   //
   // Root cause: calling `claude mcp list` at boot time (30s delay) spawns the
@@ -374,6 +403,7 @@ export function startWebServer(port = 3420): http.Server {
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
     clearInterval(updateCheckerInterval)
+    clearInterval(tokenCollectInterval)
     return origClose(cb)
   }
 

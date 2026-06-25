@@ -1,6 +1,6 @@
 {
   "name": "marveen",
-  "version": "1.7.0",
+  "version": "1.13.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -12,7 +12,8 @@
     "schedule": "tsx src/schedule-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/frontend-smoke.mjs",
+    "syntax-check": "node --check web/app.js web/sw.js",
+    "smoke": "playwright test --config=playwright.config.ts",
     "merge-check": "node scripts/merge-check.mjs",
     "fork-diff": "node scripts/fork-diff.mjs",
     "behavior-gate": "node scripts/behavior-gate.mjs",
@@ -29,6 +30,7 @@
     "pino-pretty": "^13.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "jsdom": "^29.1.1",

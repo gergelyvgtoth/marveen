@@ -129,3 +129,29 @@ describe('channel-monitor: post-respawn cold-start guard (2026-06-01 480s outage
     expect(guardIdx).toBeLessThan(downStateIdx)
   })
 })
+
+describe('channel-monitor: periodic detached-claude reap (CB6CF755 durable fix)', () => {
+  const src = readFileSync(MONITOR_PATH, 'utf-8')
+
+  it('shouldRunPeriodicReap fires only once the interval has elapsed', async () => {
+    const { shouldRunPeriodicReap } = await import('../web/channel-monitor.js')
+    const interval = 600_000
+    expect(shouldRunPeriodicReap(1_000_000, 1_000_000, interval)).toBe(false) // just ran
+    expect(shouldRunPeriodicReap(1_000_000, 1_000_000 + interval - 1, interval)).toBe(false)
+    expect(shouldRunPeriodicReap(1_000_000, 1_000_000 + interval, interval)).toBe(true)
+    expect(shouldRunPeriodicReap(1_000_000, 1_000_000 + interval + 5_000, interval)).toBe(true)
+  })
+
+  it('the periodic reap reuses the existing pane-attribution reaper (no duplicate logic)', () => {
+    // Durable fix is wired by calling the SAME reapDetachedChannelClaudes on a
+    // throttle inside check() -- NOT a second/parallel reaper implementation.
+    expect(src).toMatch(/shouldRunPeriodicReap\(\s*lastDetachedReapAt/)
+    expect(src).toMatch(/reapDetachedChannelClaudes\(\s*{\s*tmuxPath:\s*TMUX\s*}\s*\)/)
+    // throttle interval is a sane slow cadence (minutes, not every 60s tick).
+    const m = src.match(/const\s+DETACHED_REAP_INTERVAL_MS\s*=\s*([\d*\s_]+)/)
+    expect(m, 'DETACHED_REAP_INTERVAL_MS not found').not.toBeNull()
+    // eslint-disable-next-line no-eval
+    const ms = Function(`return (${m![1]})`)() as number
+    expect(ms).toBeGreaterThanOrEqual(5 * 60 * 1000)
+  })
+})

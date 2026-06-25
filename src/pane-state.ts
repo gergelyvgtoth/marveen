@@ -101,21 +101,95 @@ const BUSY_INDICATORS: RegExp[] = [
 const BUSY_ESC_TO_INTERRUPT_RX = /\besc to interrupt\b/
 const LIVE_FOOTER_REGION_LINES = 5
 
-// Pasted-text placeholder. Claude Code lifts bursts of input keys into
-// `[Pasted text #N +X chars]` stubs, which sit in the input buffer and
-// never auto-submit on Enter. Treat as busy so the scheduler doesn't pile
-// a second prompt on top.
-const PENDING_PASTE_RX = /\[Pasted text #\d+/
+// Pasted-text placeholder. Claude Code lifts a single large input write
+// (empirically a tmux send-keys -l of more than ~700 chars) into a
+// `[Pasted text #N]` / `[Pasted text #N +X chars]` stub that sits in the
+// LIVE INPUT BOX and never auto-submits. Treat as busy so the scheduler
+// doesn't pile a second prompt on top.
+//
+// Wrap tolerance (real-capture finding): when the input is long the stub
+// renders wrapped across a terminal line break -- `...[Pasted text` at the
+// end of one line and `  #3]...` at the start of the next (the digits
+// themselves can also straddle the break). The opening token, the `#`, and
+// the digit are therefore separated by `\s*` (which includes newlines and
+// the leading indent of the wrapped continuation) rather than a single
+// literal space. This still matches the unwrapped `[Pasted text #N` and
+// `[Pasted text #N +X chars]` shapes.
+const PENDING_PASTE_RX = /\[Pasted text\s*#\s*\d/
+
+// How many trailing lines to inspect for the stub when no input-box
+// separators are visible (a malformed / partial capture, or the older
+// `paste again to expand` render with separators scrolled off). Kept tight
+// so a stub quoted higher up in scrollback cannot reach the bottom region.
+const PASTE_REGION_FALLBACK_LINES = 8
+
+// Scope the placeholder match to the live input box, not the whole pane.
+// The box is the region between the two most recent U+2500 separators found
+// from the BOTTOM of the pane -- footer-INDEPENDENT, because the placeholder
+// render is version-dependent: the current build keeps the normal
+// `bypass permissions ...` idle footer below the box, while an older build
+// replaced it with a `paste again to expand` hint. Anchoring on the
+// separators (always present around the box) covers both. When two
+// separators are not found we fall back to the last few lines.
+//
+// Whole-pane matching was a confirmed false-POSITIVE source: these agents
+// routinely quote tmux captures and discuss this very bug, so a literal
+// `[Pasted text #N` in a reply line or deep scrollback would trigger a
+// destructive Ctrl-C + resend on a perfectly healthy session. Scoping to
+// the box (same discipline as BUSY_ESC_TO_INTERRUPT_RX / the footer checks)
+// confines the match to where a genuine parked stub actually lives.
+function pastePlaceholderRegion(pane: string): string {
+  const lines = pane.split('\n')
+  let bottomSep = -1
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (BOX_SEP_RX.test(lines[i])) { bottomSep = i; break }
+  }
+  if (bottomSep > 0) {
+    let topSep = -1
+    for (let i = bottomSep - 1; i >= 0; i--) {
+      if (BOX_SEP_RX.test(lines[i])) { topSep = i; break }
+    }
+    if (topSep >= 0) return lines.slice(topSep + 1, bottomSep).join('\n')
+  }
+  return lines.slice(-PASTE_REGION_FALLBACK_LINES).join('\n')
+}
+
+// A placeholder pane is identified by the `[Pasted text #N]` stub IN THE LIVE
+// INPUT BOX. The accompanying `paste again to expand` footer hint is
+// deliberately NOT used: it is version-dependent (the current build keeps the
+// normal idle footer instead) AND it empirically LINGERS for a beat after the
+// message submits (the box is already empty, the stub gone, yet the hint line
+// is still rendered), so keying on it would false-positive a freshly-submitted
+// pane as still stuck and trigger a needless clear-and-resend. The stub itself
+// appears iff a real placeholder is parked (verified across real captures:
+// present in every placeholder render, absent the instant it submits). Pure +
+// dependency-free so callers (detectPaneState, shouldRetrySubmit, the recovery
+// decision) share ONE definition instead of re-inlining the regex.
+export function detectsPastePlaceholder(pane: string): boolean {
+  if (!pane) return false
+  return PENDING_PASTE_RX.test(pastePlaceholderRegion(pane))
+}
 
 // Input-box separator lines are made of U+2500 BOX DRAWINGS LIGHT
 // HORIZONTAL. At least 10 in a run to ignore stray `-` glyphs.
 const BOX_SEP_RX = /^─{10,}/
 
-// Prompt line inside the input box. `❯` followed by at least one tab/
-// space and then a non-whitespace character means the user (or a
-// send-keys that didn't submit) parked text there. Single-line match
-// ([ \t] not \s) to avoid crossing into the next line.
-const PARKED_INPUT_RX = /❯[ \t]+\S/
+// Prompt line inside the input box. `❯` followed by at least one
+// horizontal whitespace and then a non-whitespace character means the
+// user (or a send-keys that didn't submit) parked text there.
+//
+// The class is `[^\S\r\n]` (any whitespace EXCEPT a line break), not
+// `[ \t]`: a live Claude Code pane renders the gap after the ❯ prompt
+// glyph as a NON-BREAKING SPACE (U+00A0), not an ASCII space, while a
+// message sits parked (delivered but not yet submitted). The ASCII-space
+// form only appears in scrollback for already-submitted lines. `[ \t]`
+// missed that NBSP, so an NBSP-rendered parked box read as 'idle' and the
+// whole stuck-input recovery chain (stuckInputSignature, parkedChannelInput,
+// parkedInputText all gate on detectPaneState === 'typing') never fired --
+// the message stranded forever. Excluding only \r\n keeps the original
+// single-line intent (the match must not cross into the next line) while
+// admitting the NBSP and any other horizontal Unicode space the TUI emits.
+const PARKED_INPUT_RX = /❯[^\S\r\n]+\S/
 
 // Persistent Anthropic thinking-block API error. When an assistant turn
 // ends with a 400 about thinking/redacted_thinking blocks that "cannot
@@ -199,6 +273,54 @@ export function detectsThinkingBlockError(pane: string): boolean {
   return false
 }
 
+// Claude Code modal/overlay surfaces -- the /mcp server manager, the model/
+// config/theme pickers, and permission dialogs -- replace the input box with a
+// navigable list whose footer reads e.g.
+//   "↑/↓ to navigate · Enter to confirm · Esc to cancel".
+// A headless service session (the main --channels session, a sub-agent) parked
+// in such a modal silently stops processing inbound work: it is not 'busy' (no
+// spinner / token counter) and not 'idle' (the input box is gone), so
+// detectPaneState classifies it 'unknown' and the scheduler/router just skip
+// it. Observed 2026-06-12: the main channels session sat in /mcp for ~6h, deaf
+// on Telegram, with nothing alerting. detectsBlockingMenu recognises the modal
+// so the monitor can pop back to the prompt with a single Escape.
+//
+// Guards against a healthy session that merely quotes menu chrome in a reply
+// or a log line:
+//   (a) Not busy: a live turn (spinner / token counter / esc-to-interrupt) is
+//       never a parked menu.
+//   (b) No idle footer: a real modal hides the permission/shortcuts footer.
+//       capturePane uses `capture-pane -p` (visible screen only, no
+//       scrollback), so a quoted footer cannot linger from a past turn -- an
+//       idle footer present means the normal prompt is live, not a menu.
+//   (c) The dismiss/navigation hint must sit in the live footer region (the
+//       bottom few lines), not anywhere in the pane, so a message body that
+//       quotes "Esc to cancel" does not trigger it.
+// `esc to interrupt` (the busy footer) is deliberately excluded from
+// MENU_ESC_RX, and guard (a) rejects it anyway.
+const MENU_NAV_RX = /(?:↑\/↓|↑↓)\s+to\s+(?:navigate|select|choose)/
+const MENU_ESC_RX = /\besc to (?:cancel|exit|close|go back|quit)\b/i
+const MENU_FOOTER_REGION_LINES = 8
+
+/**
+ * True when the pane is parked in a blocking Claude Code interactive menu /
+ * modal (not busy, not at the idle prompt). Pure + dependency-free for unit
+ * testing. The monitor uses this to send a recovery Escape; detectPaneState
+ * intentionally still returns 'unknown' for these panes so the hot-path
+ * scheduler/router behaviour is unchanged.
+ */
+export function detectsBlockingMenu(pane: string): boolean {
+  if (!pane || !pane.trim()) return false
+  for (const rx of BUSY_INDICATORS) {
+    if (rx.test(pane)) return false
+  }
+  const lines = pane.split('\n')
+  const footerRegion = lines.slice(-MENU_FOOTER_REGION_LINES).join('\n')
+  if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
+  if (IDLE_FOOTER_RX.test(pane)) return false
+  return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
+}
+
 export interface DetectPaneStateOptions {
   /** If true, the 'typing' state (text parked in input box) is
    * merged into 'busy'. Default false -- callers that care about
@@ -241,11 +363,20 @@ export function detectPaneState(
   const footerRegion = paneLines.slice(-LIVE_FOOTER_REGION_LINES).join('\n')
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return 'busy'
 
+  // Pending-paste placeholder check runs BEFORE the idle-footer gate. The
+  // stub sits in the live input box; the footer below it is version-dependent
+  // (the current build keeps the normal `bypass permissions ...` idle footer,
+  // an older build showed `paste again to expand` instead and so failed
+  // IDLE_FOOTER_RX). Running the box-scoped placeholder check first classifies
+  // BOTH shapes as 'busy' -- and on the older `paste again to expand` shape it
+  // also rescues the pane from being mis-read 'unknown' at the idle-footer gate
+  // below. A placeholder must read 'busy' so the scheduler/router/keepalive
+  // defer rather than pile a second prompt on.
+  if (detectsPastePlaceholder(pane)) return 'busy'
+
   if (!IDLE_FOOTER_RX.test(pane)) return 'unknown'
 
   if (detectsThinkingBlockError(pane)) return 'error'
-
-  if (PENDING_PASTE_RX.test(pane)) return 'busy'
 
   // Find the input box: two BOX_SEP_RX lines framing the current prompt.
   // Scan UPWARDS from the footer so we stay inside the live box and
@@ -275,12 +406,27 @@ export function detectPaneState(
 }
 
 /**
+ * Canonical pure idle predicate: true iff the capture classifies as the
+ * 'idle' pane state (input box live and empty, not busy / typing / menu /
+ * error / unknown). This is the SINGLE place the "is this pane idle" rule
+ * lives, so every caller -- the readiness check (isReadyForPrompt), the
+ * auto-restart idle-guard (auto-restart-runner.paneIsIdle) and the
+ * sendPromptToSession pre-flight wait-until-idle gate -- shares one
+ * definition rather than re-inlining `detectPaneState(...) === 'idle'`
+ * (and, worse, the busy regex) in several files.
+ */
+export function paneLooksIdle(capture: string): boolean {
+  return detectPaneState(capture) === 'idle'
+}
+
+/**
  * True when the pane is in the specific "accepting a new prompt" state.
  * 'typing' counts as not-ready because the user has unsubmitted text
- * in the input box and a new prompt would concatenate into it.
+ * in the input box and a new prompt would concatenate into it. Thin alias
+ * over paneLooksIdle kept for its existing call sites / tests.
  */
 export function isReadyForPrompt(pane: string): boolean {
-  return detectPaneState(pane) === 'idle'
+  return paneLooksIdle(pane)
 }
 
 // Locate the live Claude Code input box and return its inner content as
@@ -390,15 +536,23 @@ export function shouldRetrySubmit(
   const retryPaneLines = pane.split('\n')
   const retryFooterRegion = retryPaneLines.slice(-LIVE_FOOTER_REGION_LINES).join('\n')
   if (BUSY_ESC_TO_INTERRUPT_RX.test(retryFooterRegion)) return false
+
+  // Path 1: placeholder is unambiguous, retry regardless of hint -- and it is
+  // checked BEFORE the idle-footer gate below. The footer beneath a placeholder
+  // is version-dependent: the current build keeps the normal idle footer, an
+  // older build showed `paste again to expand` (failing IDLE_FOOTER_RX). The
+  // old ordering (footer gate first) therefore returned false on the older
+  // shape -- the very state the recovery exists to catch. detectsPastePlaceholder
+  // scopes the match to the live input box, so a `[Pasted text #N]` quoted in a
+  // reply line or scrollback cannot trigger a spurious clear-and-resend.
+  if (detectsPastePlaceholder(pane)) return true
+
   // Without an idle footer the pane is either not Claude Code or in an
   // unknown render state. Be conservative and skip.
   if (!IDLE_FOOTER_RX.test(pane)) return false
 
   const inputBox = liveInputBox(pane)
   if (inputBox == null) return false
-
-  // Path 1: placeholder is unambiguous, retry regardless of hint.
-  if (PENDING_PASTE_RX.test(inputBox)) return true
 
   // Path 2: verbatim payload parked in the input box.
   // Clamp the minimum hint length to >= 1. minHintChars=0 paired with
@@ -457,7 +611,7 @@ export function shouldClearTruncatedPreamble(pane: string): boolean {
   return true
 }
 
-export type SubmitFollowupAction = 'retry-enter' | 'done' | 'give-up'
+export type SubmitFollowupAction = 'retry-enter' | 'clear-and-resend' | 'done' | 'give-up'
 
 /**
  * Decide what the post-send-keys loop should do next, given the
@@ -465,13 +619,20 @@ export type SubmitFollowupAction = 'retry-enter' | 'done' | 'give-up'
  * been made. Returns one of three discrete actions so the caller can
  * branch without re-running the detection logic itself.
  *
- *   - 'done'        -- the prompt landed (or the pane is busy
- *                      processing); no further action.
- *   - 'retry-enter' -- the pane shows a stuck send; send another Enter
- *                      and re-sample.
- *   - 'give-up'     -- the retry budget is spent, or the capture failed
- *                      and we cannot tell whether retry would help.
- *                      Caller should log a warning and move on.
+ *   - 'done'             -- the prompt landed (or the pane is busy
+ *                           processing); no further action.
+ *   - 'retry-enter'      -- the pane shows a VERBATIM stuck send; send
+ *                           another Enter and re-sample. (A plain Enter
+ *                           submits verbatim parked text.)
+ *   - 'clear-and-resend' -- the pane shows a `[Pasted text #N]`
+ *                           placeholder. A plain Enter is PROVEN not to
+ *                           submit it (it merely expands the stub to
+ *                           parked verbatim text, still unsubmitted), so
+ *                           the caller must clear the buffer and re-send
+ *                           the payload defensively instead.
+ *   - 'give-up'          -- the retry budget is spent, or the capture
+ *                           failed and we cannot tell whether retry would
+ *                           help. Caller should log a warning and move on.
  *
  * Splitting the decision out as pure logic keeps the I/O-bound loop in
  * src/web/agent-process.ts trivially testable without mocking tmux or
@@ -499,6 +660,10 @@ export function decideSubmitFollowup(
   if (pane == null) return 'give-up'
   if (!shouldRetrySubmit(pane, payloadHint)) return 'done'
   if (attempt >= maxAttempts) return 'give-up'
+  // A placeholder will NOT submit on a plain Enter (proven empirically: Enter
+  // only expands the stub to still-parked verbatim text). Route it to the
+  // clear-and-resend recovery instead of wasting a retry-Enter on it.
+  if (detectsPastePlaceholder(pane)) return 'clear-and-resend'
   return 'retry-enter'
 }
 
@@ -657,6 +822,24 @@ export function parkedChannelInput(pane: string): ParkedChannelInput | null {
   // rather than re-inject to a wrong chat_id.
   if (!cm || /\s/.test(cm[1])) return { complete: false, block, chatId: null }
   return { complete: true, block, chatId: cm[1] }
+}
+
+// The whitespace-collapsed text currently parked in the live input box when
+// the pane is 'typing', or null when nothing is parked. Used by SUB-AGENT
+// stuck-input recovery to re-inject a delivered message that the TUI failed to
+// submit and that is NOT a <channel> block (e.g. an inter-agent notification).
+// A sub-agent's input box never holds a human-typed draft -- only router- or
+// plugin-delivered messages -- so re-injecting its parked text is safe there.
+// The collapse mirrors parkedChannelInput(): terminal wrap is folded into
+// single spaces, yielding a single-line, reliably submittable message.
+export function parkedInputText(pane: string): string | null {
+  if (detectPaneState(pane) !== 'typing') return null
+  const box = liveInputBox(pane)
+  if (box == null) return null
+  // Collapse terminal wrap, then strip the leading ❯ prompt marker so the
+  // re-injected text is the message itself, not the prompt glyph.
+  const flat = box.replace(/\s+/g, ' ').trim().replace(/^❯\s*/, '').trim()
+  return flat.length > 0 ? flat : null
 }
 
 // Per-session bookkeeping for the stuck-input recovery watcher. A "spell"

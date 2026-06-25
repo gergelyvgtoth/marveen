@@ -48,6 +48,15 @@
 
 /* === Reset === */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* Page-level horizontal clip. `overflow-x: clip` (not `hidden`) is deliberate:
+   `hidden` would compute overflow-y to `auto` and make body a scroll container,
+   which breaks the dashboard's many `position: sticky` elements. `clip` clips
+   without establishing a scroll container, so sticky keeps working. This stops
+   an installed (standalone) PWA from being draggable sideways when something
+   overflows by a hair: Safari's rubber-band hides it, standalone does not. */
+html, body { max-width: 100%; overflow-x: clip; }
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
   background: var(--bg);
@@ -544,6 +553,11 @@ main {
   gap: 12px;
   min-height: calc(100vh - 160px);
 }
+/* Both the flat board and the swimlane board carry .kanban-board; an
+   explicit [hidden] override is required because the unconditional
+   `display: grid` above otherwise wins the cascade over the UA [hidden]
+   default (equal specificity, later source order). */
+.kanban-board[hidden] { display: none; }
 
 .kanban-col {
   background: var(--bg-input);
@@ -577,6 +591,22 @@ main {
   padding: 1px 7px;
   min-width: 20px;
   text-align: center;
+  border: 1px solid transparent;
+  transition: color 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+/* WIP limit badge states — colour applied via inline style from JS */
+.kanban-col-count[data-wip="warn"] { background: color-mix(in oklch, currentColor 10%, var(--bg-card)); }
+.kanban-col-count[data-wip="full"] { background: color-mix(in oklch, currentColor 10%, var(--bg-card)); animation: wip-pulse-mild 2.4s ease-in-out infinite; }
+.kanban-col-count[data-wip="over"] { background: color-mix(in oklch, currentColor 12%, var(--bg-card)); animation: wip-pulse-strong 1.6s ease-in-out infinite; transform: scale(1.1); }
+
+@keyframes wip-pulse-mild {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+@keyframes wip-pulse-strong {
+  0%, 100% { opacity: 1; transform: scale(1.1); }
+  50% { opacity: 0.4; transform: scale(1.1); }
 }
 .kanban-add-btn {
   margin-left: auto;
@@ -663,6 +693,45 @@ main {
 .kanban-subtask-badge:hover {
   background: color-mix(in oklch, var(--accent) 20%, transparent);
 }
+
+/* Embedded subtasks — rendered inside the parent card when same column */
+.kanban-embedded-subtasks {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.kanban-embedded-subtask {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1.3;
+}
+.kanban-embedded-subtask:hover {
+  border-color: var(--accent);
+  background: var(--bg-input);
+}
+.kanban-embedded-seq {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.kanban-embedded-assignee {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
 .kanban-card:hover {
   border-color: var(--accent);
   box-shadow: var(--shadow-sm);
@@ -728,6 +797,103 @@ main {
 }
 .kanban-card-due.overdue { color: var(--danger); font-weight: 600; }
 
+.kanban-card-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.kanban-card-label-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  color: var(--label-color);
+  background: color-mix(in srgb, var(--label-color) 16%, transparent);
+  cursor: pointer;
+  line-height: 1.5;
+}
+.kanban-card-label-pill:hover { filter: brightness(1.15); }
+.kanban-card-label-overflow {
+  color: var(--text-muted);
+  background: var(--bg);
+  cursor: default;
+}
+.kanban-card-label-overflow:hover { filter: none; }
+
+/* Archived cards: same card look as the board, laid out in a responsive grid */
+.archived-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.archived-card {
+  cursor: pointer;
+}
+.archived-card:active { cursor: pointer; }
+.archived-prio-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 8px;
+  color: var(--prio-color);
+  background: color-mix(in srgb, var(--prio-color) 16%, transparent);
+  line-height: 1.5;
+}
+.archived-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.archived-date {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.kanban-quick-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  /* Inactive chips already carry their label's own colour (border + text +
+     faint tint), so the header filter row visually matches the per-card label
+     pills on the board; the active state below fills solid. */
+  border: 1px solid var(--chip-color);
+  color: var(--chip-color);
+  background: color-mix(in srgb, var(--chip-color) 12%, var(--bg-card));
+  cursor: pointer;
+  user-select: none;
+}
+.kanban-quick-filter-chip:hover { border-color: var(--chip-color); }
+.kanban-quick-filter-chip.active {
+  color: white;
+  background: var(--chip-color);
+  border-color: var(--chip-color);
+}
+.kanban-quick-filter-count {
+  font-size: 10px;
+  opacity: 0.85;
+}
+.kanban-quick-filter-clear {
+  margin-left: 2px;
+  font-weight: 700;
+}
+.kanban-quick-filter-clear-all {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
 .priority-bar {
   width: 3px;
   height: 100%;
@@ -745,6 +911,136 @@ main {
 .kanban-card[data-priority="normal"] { border-left: 3px solid transparent; }
 .kanban-card[data-priority="low"] { border-left: 3px solid var(--border); }
 
+/* Card aging: left stripe overrides priority border when card is stale.
+   Colour is set as --card-aging-color via inline style by JS. */
+.kanban-card[data-aging] { border-left: 3px solid var(--card-aging-color); }
+
+/* Aging badge: hourglass + day/hour counter, top-right (left of the ⚡ action) */
+.kanban-card-aging-badge {
+  position: absolute;
+  top: 6px;
+  right: 28px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+@keyframes aging-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.kanban-card-aging-badge.kanban-card-aging-critical {
+  animation: aging-pulse 2.2s ease-in-out infinite;
+}
+
+/* === Kanban Swimlanes === */
+.kanban-swimlane-board {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.kanban-swimlane {
+  border-bottom: 2px dashed var(--border);
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+}
+.kanban-swimlane:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+.kanban-swimlane-header {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 4px;
+  background: var(--bg);
+}
+.kanban-swimlane-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.kanban-swimlane-avatar.owner { background: var(--accent); }
+.kanban-swimlane-avatar.bot { background: var(--info); }
+.kanban-swimlane-avatar.agent { background: var(--success); }
+.kanban-swimlane-avatar.unknown { background: var(--text-muted); }
+.kanban-swimlane-avatar.priority-urgent { background: var(--danger); }
+.kanban-swimlane-avatar.priority-high { background: var(--accent); }
+.kanban-swimlane-avatar.priority-normal { background: var(--text-muted); }
+.kanban-swimlane-avatar.priority-low { background: var(--border); }
+.kanban-swimlane-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  margin-right: auto;
+}
+.kanban-swimlane-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border-radius: 10px;
+  padding: 1px 7px;
+  min-width: 20px;
+  text-align: center;
+}
+.kanban-swimlane-toggle {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+}
+.kanban-swimlane-toggle:hover { background: var(--accent-soft); color: var(--accent); }
+.kanban-swimlane-body {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 4px;
+}
+.kanban-swimlane.collapsed .kanban-swimlane-body { display: none; }
+.kanban-swimlane-col {
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 60px;
+}
+.kanban-swimlane-col-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  padding: 8px 12px 4px;
+}
+.kanban-swimlane-col-body {
+  flex: 1;
+  min-height: 40px;
+}
+
 /* === Card detail === */
 .card-detail-meta {
   display: flex;
@@ -761,6 +1057,54 @@ main {
 }
 .card-detail-desc:empty { display: none; }
 
+.card-detail-labels { margin-bottom: 20px; }
+.card-detail-labels h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 10px;
+}
+.label-pill-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 22px;
+}
+.label-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--label-color);
+  background: color-mix(in srgb, var(--label-color) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--label-color) 40%, transparent);
+}
+.label-pill-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+  opacity: 0.7;
+}
+.label-pill-remove:hover { opacity: 1; }
+.label-color-swatches { display: flex; gap: 4px; }
+.label-color-swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid transparent;
+}
+.label-color-swatch.selected { border-color: var(--text); }
+
 .card-detail-comments { margin-bottom: 20px; }
 .card-detail-comments h4 {
   font-size: 12px;
@@ -774,7 +1118,7 @@ main {
 .comments-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   margin-bottom: 12px;
   max-height: 300px;
   overflow-y: auto;
@@ -784,6 +1128,7 @@ main {
   padding: 10px 12px;
   background: var(--bg-input);
   border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent-soft, #3b82f633);
 }
 .comment-author {
   font-size: 12px;
@@ -839,6 +1184,8 @@ main {
 /* === Page switching === */
 .page[hidden] { display: none; }
 #kanbanPage { max-width: none; }
+/* Full-width layout for the kanban board (overrides main's 1200px cap) */
+main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
 
 .page-header-row {
   display: flex;
@@ -1778,6 +2125,17 @@ main {
   color: var(--text);
   transition: all var(--transition);
   outline: none;
+}
+/* Checkbox/radio inputs must not inherit the width:100% + padding meant for
+   text fields -- inside a flex label that stretches the box to full width and
+   shoves the adjacent label text out past the modal's right edge ("content
+   sticking out of the modal" bug, e.g. the agent-detail Csapat tab). */
+.form-group input[type="checkbox"],
+.form-group input[type="radio"] {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 0;
+  margin: 0;
 }
 .form-group input:focus,
 .form-group textarea:focus,
@@ -2721,6 +3079,27 @@ main {
   flex-wrap: wrap;
 }
 
+.schedule-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 18px 4px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+.schedule-section:first-child { margin-top: 4px; }
+.schedule-section-icon { font-size: 13px; }
+.schedule-section-count {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
 .schedule-row {
   display: flex;
   align-items: center;
@@ -4696,6 +5075,10 @@ main {
     gap: 16px;
   }
   .kanban-col { min-height: auto; }
+  .kanban-swimlane-body {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -4860,6 +5243,87 @@ main {
   margin-top: 16px;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* === Settings page === */
+.settings-group { margin-bottom: 28px; }
+.settings-group:last-child { margin-bottom: 0; }
+.settings-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+}
+.settings-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  transition: border-color var(--transition);
+}
+.settings-row:hover { border-color: var(--accent); }
+.settings-row-info { flex: 1; min-width: 240px; }
+.settings-row-key {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.settings-restart-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--warning, #c9a000);
+  border: 1px solid var(--warning, #c9a000);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.settings-row-desc {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 4px;
+}
+.settings-row-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.settings-row-editor {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.settings-row-editor .input {
+  width: 140px;
+  font-size: 13px;
+}
+.settings-color-input {
+  width: 72px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  cursor: pointer;
+}
+.settings-row-error {
+  font-size: 12px;
+  color: var(--danger);
+  flex-basis: 100%;
 }
 
 /* === connectors.hu cross-promo banner === */
@@ -5376,10 +5840,17 @@ main {
   width: 98vw;
   display: flex;
   flex-direction: column;
-  max-height: 90vh;
+  /* Fixed height (not max-height): with a content-driven height the xterm
+     FitAddon grows the modal as the pane repaints, which re-runs fit() and
+     makes the modal oscillate ("vibrating terminal"). A fixed height gives the
+     flex:1 container a stable size, so fit() settles and xterm scrolls
+     internally instead of resizing the modal. */
+  height: 90vh;
 }
 .terminal-modal .modal-header { flex-shrink: 0; }
-#terminalContainer { flex: 1; min-height: 360px; }
+/* min-height:0 lets the flex child actually shrink to the container; overflow
+   hidden stops the xterm screen from pushing the modal taller. */
+#terminalContainer { flex: 1; min-height: 0; overflow: hidden; }
 .xterm { height: 100% !important; }
 
 /* === Calendar === */
@@ -5749,3 +6220,178 @@ main {
   .ws-code-panel { width: 100%; }
   .ws-output-pre { max-height: 360px; }
 }
+
+/* === Docs viewer === */
+.docs-layout {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+.docs-list {
+  flex: 0 0 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: sticky;
+  top: 16px;
+}
+.docs-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--text, #222);
+  text-decoration: none;
+  font-size: 14px;
+  border: 1px solid transparent;
+}
+.docs-list-title { line-height: 1.3; }
+.docs-list-date {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  font-variant-numeric: tabular-nums;
+}
+.docs-list-item:hover { background: var(--surface-2, rgba(127,127,127,0.08)); }
+.docs-list-item.active {
+  background: var(--surface-2, rgba(127,127,127,0.12));
+  border-color: var(--border, rgba(127,127,127,0.25));
+  font-weight: 600;
+}
+.docs-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 4px 40px;
+  line-height: 1.65;
+}
+.markdown-body h1 { font-size: 1.7em; margin: 0.2em 0 0.6em; }
+.markdown-body h2 { font-size: 1.35em; margin: 1.4em 0 0.5em; border-bottom: 1px solid var(--border, rgba(127,127,127,0.2)); padding-bottom: 0.2em; }
+.markdown-body h3 { font-size: 1.12em; margin: 1.2em 0 0.4em; }
+.markdown-body p { margin: 0.6em 0; }
+.markdown-body ul, .markdown-body ol { margin: 0.5em 0; padding-left: 1.6em; }
+.markdown-body li { margin: 0.25em 0; }
+.markdown-body code {
+  background: var(--surface-2, rgba(127,127,127,0.12));
+  padding: 0.12em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.markdown-body pre {
+  background: var(--surface-2, rgba(127,127,127,0.12));
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.markdown-body pre code { background: none; padding: 0; }
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  width: 100%;
+}
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--border, rgba(127,127,127,0.3));
+  padding: 7px 11px;
+  text-align: left;
+}
+.markdown-body th { background: var(--surface-2, rgba(127,127,127,0.1)); }
+.markdown-body blockquote {
+  margin: 0.8em 0;
+  padding: 0.4em 1em;
+  border-left: 3px solid var(--border, rgba(127,127,127,0.4));
+  color: var(--text-muted, #666);
+}
+.markdown-body hr { border: none; border-top: 1px solid var(--border, rgba(127,127,127,0.25)); margin: 1.4em 0; }
+.markdown-body a { color: var(--accent, #3b82f6); }
+@media (max-width: 760px) {
+  .docs-layout { flex-direction: column; }
+  .docs-list { flex-basis: auto; width: 100%; position: static; }
+}
+
+/* === Agent conversation (readable transcript) modal === */
+.conversation-modal { width: min(820px, 94vw); max-height: 88vh; display: flex; flex-direction: column; }
+.conversation-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border, #2a2a2a); flex-wrap: wrap; }
+.conversation-toolbar #conversationSearch { flex: 1; min-width: 160px; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border, #333); background: var(--bg-input, #1c1c1c); color: inherit; }
+.conversation-filter { display: flex; align-items: center; gap: 5px; font-size: 12px; opacity: .85; white-space: nowrap; }
+.conversation-container { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; background: #141414; border-radius: 0 0 8px 8px; min-height: 320px; }
+.conversation-empty { opacity: .6; text-align: center; padding: 30px; }
+.conv-load-older {
+  display: block;
+  margin: 0 auto 10px;
+  padding: 6px 16px;
+  background: var(--bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.conv-load-older:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.conv-load-older:disabled { opacity: .5; cursor: default; }
+.conv-row { display: flex; }
+.conv-row.conv-in { justify-content: flex-start; }
+.conv-row.conv-out { justify-content: flex-end; }
+.conv-bubble { max-width: 78%; padding: 8px 12px; border-radius: 12px; font-size: 13.5px; line-height: 1.45; }
+.conv-in .conv-bubble { background: #26323d; border-bottom-left-radius: 3px; }
+.conv-out .conv-bubble { background: #1f4030; border-bottom-right-radius: 3px; }
+.conv-meta { font-size: 10.5px; opacity: .6; margin-bottom: 3px; }
+.conv-text { white-space: normal; word-break: break-word; }
+.conv-row.conv-note { justify-content: center; }
+.conv-note-text { font-size: 12px; opacity: .55; font-style: italic; max-width: 88%; }
+.conv-row.conv-action { justify-content: flex-start; }
+.conv-action-text { font-size: 11.5px; opacity: .5; font-family: 'JetBrains Mono', monospace; display: flex; gap: 8px; align-items: baseline; }
+.conv-action-ts { opacity: .6; font-size: 10px; }
+/* === Mobile login QR modal === */
+.mobile-login-qr {
+  width: 240px;
+  height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border-radius: 10px;
+  padding: 10px;
+  box-sizing: border-box;
+}
+.mobile-login-qr svg { width: 100%; height: 100%; display: block; }
+.mobile-login-qr .muted { color: var(--muted, #888); text-align: center; font-size: 13px; }
+.mobile-login-warn {
+  font-size: 12px;
+  color: var(--muted, #888);
+  text-align: center;
+  margin: 0;
+  line-height: 1.4;
+}
+
+/* === Docs viewer: content toolbar (.md download) === */
+.docs-content-toolbar { display: flex; justify-content: flex-end; margin: 0 0 12px; }
+.docs-content-toolbar .btn-compact { font-size: 12px; }
+
+/* === Idea box: score chip + clickable title === */
+.idea-score-chip { font-size: 11px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--text-muted); white-space: nowrap; }
+.idea-title-link { color: inherit; text-decoration: none; cursor: pointer; }
+.idea-title-link:hover { text-decoration: underline; }
+
+/* === Naplo (Audit Timeline) === */
+.naplo-toolbar { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.naplo-source-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.naplo-tab { padding: 5px 14px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text); cursor: pointer; font-size: 13px; transition: background 0.15s, color 0.15s; }
+.naplo-tab.active { background: var(--accent, #2563eb); color: #fff; border-color: transparent; }
+.naplo-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.naplo-date { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text); font-size: 13px; }
+.naplo-date-sep { color: var(--text-muted); font-size: 13px; }
+.naplo-search { flex: 1; min-width: 160px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text); font-size: 13px; }
+.naplo-summary { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; }
+.naplo-empty { color: var(--text-muted); font-size: 14px; text-align: center; margin-top: 40px; }
+.naplo-empty.error { color: var(--danger, #ef4444); }
+.naplo-timeline { display: flex; flex-direction: column; gap: 1px; }
+.naplo-entry { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 6px; background: var(--bg-card); border: 1px solid var(--border); font-size: 13px; }
+.naplo-entry-meta { display: flex; align-items: center; gap: 8px; }
+.naplo-ts { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+.naplo-badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; color: #fff; white-space: nowrap; }
+.naplo-entry-detail { color: var(--text); line-height: 1.5; }
+.naplo-entry-detail code { background: var(--bg, #f5f5f5); padding: 1px 5px; border-radius: 3px; font-family: monospace; font-size: 12px; }
+.naplo-actor { color: var(--text-muted); font-size: 12px; }
+.naplo-note { font-style: italic; color: var(--text-muted); }
+.naplo-event-type { font-size: 11px; background: var(--bg); border-radius: 3px; padding: 1px 5px; color: var(--text-muted); }
+.naplo-sensitive { font-size: 11px; color: var(--danger, #ef4444); font-weight: 600; }

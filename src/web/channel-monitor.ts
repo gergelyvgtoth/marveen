@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { execSync, execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
+import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
 import {
   agentHasChannel,
@@ -22,8 +22,9 @@ import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import {
-  detectPaneState, decidePaneErrorAlert, type PaneErrorAlertState, type PaneState,
+  detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, type PaneErrorAlertState, type PaneState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
+  parkedInputText, shouldClearTruncatedPreamble,
   type StuckInputState, type StuckInputThresholds,
 } from '../pane-state.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
@@ -66,7 +67,16 @@ function resolveAgentProvider(name: string): ChannelProviderType {
 
 const agentDownSince: Map<string, number> = new Map()
 const agentLastRestart: Map<string, number> = new Map()
+// Consecutive watchdog restarts (keyed by agent name) that did NOT bring the
+// plugin back up. Drives exponential back-off so a plugin that crashes on every
+// launch (e.g. a broken third-party channel plugin) is not restarted on a fixed
+// short cadence forever -- which restarts the WHOLE agent every few minutes and
+// renders it unusable. Reset to 0 the moment the plugin is seen alive again.
+const agentRestartFailures: Map<string, number> = new Map()
 const AGENT_RESTART_GRACE_MS = 90_000
+// Floor frequency for the backed-off restart: even a long-down plugin is still
+// retried at least this often, in case an external fix brings it back.
+const AGENT_MAX_RESTART_GRACE_MS = 60 * 60 * 1000 // 1h
 // A freshly started agent can take well over the first-probe window to bring
 // its channel plugin up (a large-context model launched with --continue spawns
 // the plugin only after a slow session load). Never restart a process younger
@@ -81,6 +91,11 @@ const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
 // the message. The parked text already carries the full
 // <channel ... chat_id=...> block, so recovery only needs to get it SUBMITTED.
 let mainStuckInput: StuckInputState = { parkedSig: null, firstSeenAt: null, lastRecoverAt: null, attempts: 0 }
+// Same recovery, per sub-agent session (keyed by tmux session name). A channel
+// message can be parked at a sub-agent's ❯ prompt exactly like the main one --
+// the sub-agent then "doesn't respond" until manually restarted. Entries are
+// dropped once the spell ends so this never grows unbounded.
+const agentStuckInput: Map<string, StuckInputState> = new Map()
 // Raw Enters tried before escalating to clear+re-inject. Enter is faithful
 // (it submits the REAL buffer, no capture-truncation risk); re-inject is the
 // fallback for a TUI that swallows the Enter in raw-mode.
@@ -94,6 +109,131 @@ const MAIN_STUCK_THRESHOLDS: StuckInputThresholds = {
   dedupMs: 45_000,
   // 2 Enters + up to 2 re-injects, then hold (logged).
   maxAttempts: 4,
+}
+
+// --- Stuck-input hard-restart escalation (reliable backstop) ---
+// When the soft recovery above (Enter + clear+re-inject) is EXHAUSTED but the
+// main channel input is STILL parked, the TUI is hard-wedged: a paste
+// placeholder that Enter only expands (never submits), or a state where
+// keystrokes no longer register. Soft recovery cannot win there; the only fix
+// is a fresh claude process. Escalate to hardRestartMarveenChannels()
+// (respawn-pane on Linux -- replaces ONLY the main pane's claude, the tmux
+// server + every other agent session stay intact). Rate-limited + capped so a
+// wedge a restart cannot clear never becomes a restart loop.
+const STUCK_RESTART_MIN_INTERVAL_MS = 5 * 60 * 1000
+const STUCK_RESTART_MAX_CONSECUTIVE = 3
+let stuckRestartCount = 0
+let lastStuckRestartAt = 0
+
+// Pure decision for the stuck-input restart escalation.
+//   'restart' -> soft recovery exhausted + input still parked + rate-limit ok
+//   'alert'   -> restarts are not clearing the wedge (cap reached) -> surface once
+//   'skip'    -> not wedged past soft recovery, rate-limited, or already alerted
+export function decideStuckInputRestart(
+  parked: boolean,
+  attempts: number,
+  maxAttempts: number,
+  now: number,
+  lastRestartAt: number,
+  restartCount: number,
+  minIntervalMs: number,
+  maxConsecutive: number,
+): 'restart' | 'alert' | 'skip' {
+  if (!parked || attempts < maxAttempts) return 'skip'
+  if (now - lastRestartAt < minIntervalMs) return 'skip'
+  if (restartCount >= maxConsecutive) return restartCount === maxConsecutive ? 'alert' : 'skip'
+  return 'restart'
+}
+
+// Session-agnostic stuck-input recovery: capture the pane, and if a channel
+// notification is parked at the ❯ prompt, get it SUBMITTED (Enter-first, then
+// clear + verbatim re-inject of the COMPLETE block). The gate fires ONLY for a
+// parked <channel> block, so a human's own draft is never touched. Returns the
+// next StuckInputState. Used for the main session AND every sub-agent session.
+// Recover a channel/inter-agent message stranded at the ❯ prompt by getting it
+// SUBMITTED. Tracks ANY parked input (stuckInputSignature), Enter-first, then
+// escalates after MAIN_STUCK_ENTER_ATTEMPTS. Escalation has three safe paths:
+//   1. a COMPLETE <channel> block -> clear + verbatim re-inject (chat_id-safe);
+//   2. a truncated/stale safety preamble (no real opening tag) -> clear only,
+//      NEVER re-inject (re-injecting it could let a later payload inherit a
+//      stale trust preamble -- see shouldClearTruncatedPreamble);
+//   3. SUB-AGENTS ONLY (allowPlainReinject): any other complete parked text
+//      (e.g. an inter-agent notification) -> clear + re-inject the collapsed
+//      text. A sub-agent's input box never holds a human draft, so this is
+//      safe; the main session stays conservative (Enter / <channel>-only).
+export function recoverStuckInputForSession(
+  session: string,
+  prev: StuckInputState,
+  thresholds: StuckInputThresholds,
+  allowPlainReinject: boolean,
+): StuckInputState {
+  const pane = capturePane(session)
+  const sig = pane != null ? stuckInputSignature(pane) : null
+  const decision = decideStuckInputRecovery(sig, prev, Date.now(), thresholds)
+  if (decision.recover && pane != null) {
+    const attempt = decision.next.attempts
+    const escalate = attempt > MAIN_STUCK_ENTER_ATTEMPTS
+    const block = parkedChannelInput(pane)
+    if (escalate && block != null && block.complete && block.block != null) {
+      logger.warn({ session, chatId: block.chatId, attempt }, 'Stuck channel input -- escalating to clear + verbatim re-inject')
+      try {
+        clearInputBuffer(session)
+        sendPromptToSession(session, block.block)
+      } catch (err) {
+        logger.warn({ err, session }, 'Stuck-input re-inject failed')
+      }
+    } else if (escalate && shouldClearTruncatedPreamble(pane)) {
+      logger.warn({ session, attempt }, 'Stuck input -- truncated safety preamble, clearing buffer (no re-inject)')
+      try {
+        clearInputBuffer(session)
+      } catch (err) {
+        logger.warn({ err, session }, 'Stuck-input preamble clear failed')
+      }
+    } else if (escalate && allowPlainReinject && block == null) {
+      const text = parkedInputText(pane)
+      if (text != null) {
+        logger.warn({ session, attempt }, 'Stuck input (non-channel) -- escalating to clear + re-inject parked text')
+        try {
+          clearInputBuffer(session)
+          sendPromptToSession(session, text)
+        } catch (err) {
+          logger.warn({ err, session }, 'Stuck-input plain re-inject failed')
+        }
+      } else {
+        try { execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 }) } catch { /* no-op */ }
+      }
+    } else {
+      // Enter-first, and the truncation-guard fallback: if escalation was due
+      // but the <channel> block looks incomplete, hold on Enter instead.
+      const heldForTruncation = escalate && block != null && !block.complete
+      logger.warn({ session, attempt, heldForTruncation }, 'Stuck input -- recovery Enter')
+      try {
+        execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+      } catch (err) {
+        logger.warn({ err, session }, 'Stuck-input recovery Enter failed')
+      }
+    }
+  }
+  return decision.next
+}
+
+// Periodic detached-channel-claude reap (CB6CF755 durable fix). The pane-
+// attribution reaper (reapDetachedChannelClaudes) already runs at RESPAWN time
+// (resumeMarveenSession + agent (re)start), but orphans that accumulate BETWEEN
+// respawns -- a --continue respawn that failed to tear down its predecessor --
+// linger until the next respawn happens to fire (the "5 orphans over 13 days"
+// leak). Running the same reaper on a slow cadence here closes that gap. The
+// reaper is fail-safe (no live panes resolved -> reaps nothing) and pane-
+// guarded, so a live agent/main session can never be hit. Throttled so the
+// ps/tmux snapshot is not taken on every 60s tick.
+const DETACHED_REAP_INTERVAL_MS = 10 * 60 * 1000
+// Initialised to load time so the first periodic reap fires ~10min after boot,
+// letting startup settle (the respawn-time reap already covers boot itself).
+let lastDetachedReapAt = Date.now()
+
+// Pure: is it time to run the periodic reap again? Exported for test.
+export function shouldRunPeriodicReap(lastAt: number, now: number, intervalMs: number): boolean {
+  return now - lastAt >= intervalMs
 }
 
 // Per-session tracking for the wedged thinking-block error (a Claude
@@ -111,6 +251,19 @@ const paneErrorState: Map<string, PaneErrorAlertState> = new Map()
 const PANE_ERROR_CONFIRM_MS = 120_000
 const PANE_ERROR_DEDUP_MS = 30 * 60 * 1000
 const PANE_ERROR_CLEAR_MS = 5 * 60 * 1000
+
+// Per-session tracking for a session parked in a blocking interactive menu
+// (the /mcp manager, a model/config picker, a permission dialog). Unlike the
+// thinking-block error this IS auto-recovered: a single Escape pops the modal
+// without touching the conversation, so it is non-destructive. Reuses the
+// decidePaneErrorAlert state machine (treat its `alert` as "recover now") so a
+// one-tick transient never fires and the Escape is not re-sent every tick.
+// confirmMs keeps it to ~2 ticks (~1-2 min) before recovering; dedupMs throttles
+// retries if the Escape did not take; clearMs survives brief capture blips.
+const paneMenuState: Map<string, PaneErrorAlertState> = new Map()
+const MENU_RECOVER_CONFIRM_MS = 45_000
+const MENU_RECOVER_DEDUP_MS = 5 * 60 * 1000
+const MENU_RECOVER_CLEAR_MS = 2 * 60 * 1000
 
 type MarveenRecoveryStage = 'soft' | 'save' | 'resume' | 'hard' | 'gave_up'
 interface MarveenDownState {
@@ -451,7 +604,7 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
       execFileSync('/bin/launchctl', ['unload', MAIN_CHANNELS_PLIST], { timeout: 5000 })
       execFileSync('/bin/sleep', ['2'], { timeout: 4000 })
       execFileSync('/bin/launchctl', ['load', MAIN_CHANNELS_PLIST], { timeout: 5000 })
-      logger.warn(`Hard restart: launchctl reload of com.${MAIN_AGENT_ID}.channels`)
+      logger.warn(`Hard restart: launchctl reload of com.${SERVICE_ID}.channels`)
       marveenLastHardRestart = Date.now()
       writeRespawnStamp() // coordinate with the systemd-timer watchdog
       return { ok: true }
@@ -472,6 +625,39 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
     return { ok: true }
   }
   return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
+}
+
+// Escalate a main channel input that survived the full soft recovery to a hard
+// restart (respawn-pane). Driven by the pure decideStuckInputRestart; this
+// wrapper owns the I/O + counters. Called once per monitor tick right after the
+// main stuck-input recovery.
+function maybeRestartWedgedMainChannel(state: StuckInputState): void {
+  const parked = state.parkedSig !== null
+  // A cleared input box ends the spell -> reset the escalation counter so the
+  // next genuine wedge starts fresh (and a successful restart is not penalised).
+  if (!parked) { stuckRestartCount = 0; return }
+  const action = decideStuckInputRestart(
+    parked, state.attempts, MAIN_STUCK_THRESHOLDS.maxAttempts,
+    Date.now(), lastStuckRestartAt, stuckRestartCount,
+    STUCK_RESTART_MIN_INTERVAL_MS, STUCK_RESTART_MAX_CONSECUTIVE,
+  )
+  if (action === 'skip') return
+  if (action === 'alert') {
+    logger.error({ session: MAIN_CHANNELS_SESSION }, 'Stuck main channel input survived max restart escalations -- manual intervention needed')
+    sendAlert(`⛔ A ${MAIN_CHANNELS_SESSION} bemenete beragadt es ${STUCK_RESTART_MAX_CONSECUTIVE} automatikus respawn-pane sem szabaditotta ki. Kezi beavatkozas kell (pl. systemctl --user restart ${SERVICE_ID}-channels).`)
+    stuckRestartCount++ // tick past the cap so the alert fires only once
+    return
+  }
+  logger.warn({ session: MAIN_CHANNELS_SESSION, attempts: state.attempts, restart: stuckRestartCount + 1 }, 'Stuck main channel input survived soft recovery -- escalating to hard restart (respawn-pane)')
+  const r = hardRestartMarveenChannels()
+  lastStuckRestartAt = Date.now()
+  if (r.ok) {
+    stuckRestartCount++
+    // Reset the tracker so the fresh post-restart pane is re-evaluated cleanly.
+    mainStuckInput = { parkedSig: null, firstSeenAt: null, lastRecoverAt: null, attempts: 0 }
+  } else {
+    logger.error({ session: MAIN_CHANNELS_SESSION, err: r.error }, 'Stuck-input hard restart failed')
+  }
 }
 
 // --- Keep-alive staleness watchdog (deafness safety net, decision #3) ---
@@ -635,7 +821,7 @@ function checkMainKeepaliveStaleness(): void {
   }
 }
 
-function sendAlert(text: string): void {
+export function sendAlert(text: string): void {
   notifyChannel(text).catch(() => {})
 }
 
@@ -728,8 +914,8 @@ function handleMarveenDown(): void {
     marveenDownState.lastAlertAt = now
     logger.error({ provider: providerLabel }, 'Marveen channel plugin still down after hard restart -- giving up auto-recovery')
     const serviceCmd = process.platform === 'linux'
-      ? `\`systemctl --user status ${MAIN_AGENT_ID}-channels\``
-      : `\`launchctl list | grep ${MAIN_AGENT_ID}\``
+      ? `\`systemctl --user status ${SERVICE_ID}-channels\``
+      : `\`launchctl list | grep ${SERVICE_ID}\``
     // Issue #189: a plain `tmux attach -t ...` may itself fail with "Permission
     // denied" when the operator is running it from another tmux session. Prefix
     // with `unset TMUX` so the hint works in both nested and non-nested cases.
@@ -816,42 +1002,63 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       }
     }
 
-    // Stuck channel-input recovery (MAIN session only). Recover a channel
+    // Blocking-menu recovery (main + sub-agents). A session parked in an
+    // interactive modal (/mcp manager, model/config picker, permission dialog)
+    // is neither busy nor idle, so detectPaneState reads 'unknown' and the
+    // scheduler/router silently skip it -- the session goes deaf with nothing
+    // alerting (observed: main session sat in /mcp ~6h). A single Escape pops
+    // the modal back to the prompt without touching the conversation, so unlike
+    // the thinking-block error this is safe to auto-recover. Same debounce
+    // machine as the error pass (alert == "recover now") so a one-tick frame
+    // never fires and the Escape is not re-sent every tick.
+    for (const t of targets) {
+      const pane = capturePane(t.session)
+      const inMenu = pane != null && detectsBlockingMenu(pane)
+      const prev = paneMenuState.get(t.session) ?? { firstSeenAt: null, lastAlertAt: null, lastErrorAt: null }
+      const decision = decidePaneErrorAlert(inMenu, prev, Date.now(), {
+        confirmMs: MENU_RECOVER_CONFIRM_MS,
+        dedupMs: MENU_RECOVER_DEDUP_MS,
+        clearMs: MENU_RECOVER_CLEAR_MS,
+      })
+      if (decision.next.firstSeenAt === null) {
+        paneMenuState.delete(t.session)
+      } else {
+        paneMenuState.set(t.session, decision.next)
+      }
+      if (decision.alert) {
+        const label = t.isMarveen ? BOT_NAME : (t.agentName ?? t.session)
+        logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
+        try {
+          execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
+        } catch (err) {
+          logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
+        }
+        sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
+      }
+    }
+
+    // Stuck channel-input recovery (main + sub-agents). Recover a channel
     // notification stranded at the ❯ prompt by getting it SUBMITTED. The gate
     // (parkedChannelInput != null) fires ONLY for a parked <channel> block, so
     // a human's own hand-typed draft is never touched. Enter-first (faithful);
     // escalate to clear+re-inject only after MAIN_STUCK_ENTER_ATTEMPTS, and
     // only when the captured block looks COMPLETE -- a truncated capture stays
     // on Enter rather than risk a partial re-inject to the wrong chat_id.
-    {
-      const mainPane = capturePane(MAIN_CHANNELS_SESSION)
-      const parked = mainPane != null ? parkedChannelInput(mainPane) : null
-      const sig = parked != null && mainPane != null ? stuckInputSignature(mainPane) : null
-      const decision = decideStuckInputRecovery(sig, mainStuckInput, Date.now(), MAIN_STUCK_THRESHOLDS)
-      mainStuckInput = decision.next
-      if (decision.recover && parked != null) {
-        const attempt = decision.next.attempts
-        const reinject = attempt > MAIN_STUCK_ENTER_ATTEMPTS && parked.complete && parked.block != null
-        if (reinject) {
-          logger.warn({ session: MAIN_CHANNELS_SESSION, chatId: parked.chatId, attempt }, 'Stuck channel input -- escalating to clear + verbatim re-inject')
-          try {
-            clearInputBuffer(MAIN_CHANNELS_SESSION)
-            sendPromptToSession(MAIN_CHANNELS_SESSION, parked.block!)
-          } catch (err) {
-            logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'Stuck-input re-inject failed')
-          }
-        } else {
-          // Enter-first, and the truncation-guard fallback: if escalation was
-          // due but the block looks incomplete, hold on Enter instead.
-          const heldForTruncation = attempt > MAIN_STUCK_ENTER_ATTEMPTS && !parked.complete
-          logger.warn({ session: MAIN_CHANNELS_SESSION, attempt, heldForTruncation }, 'Stuck channel input -- recovery Enter')
-          try {
-            execFileSync(TMUX, ['send-keys', '-t', MAIN_CHANNELS_SESSION, 'Enter'], { timeout: 5000 })
-          } catch (err) {
-            logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'Stuck-input recovery Enter failed')
-          }
-        }
-      }
+    mainStuckInput = recoverStuckInputForSession(MAIN_CHANNELS_SESSION, mainStuckInput, MAIN_STUCK_THRESHOLDS, false)
+    // Reliable backstop: if the soft recovery is exhausted and the input is
+    // STILL parked, the TUI is hard-wedged -- escalate to a respawn-pane (the
+    // automated form of the manual `systemctl restart channels`). Rate-limited.
+    maybeRestartWedgedMainChannel(mainStuckInput)
+    // Same recovery for every running sub-agent session: a parked channel
+    // message wedges a sub-agent ("nem válaszol") exactly as it would the main
+    // session. Per-session state lives in agentStuckInput; drop it once the
+    // spell ends so the map never grows unbounded.
+    for (const t of targets) {
+      if (t.isMarveen) continue
+      const prev = agentStuckInput.get(t.session) ?? { parkedSig: null, firstSeenAt: null, lastRecoverAt: null, attempts: 0 }
+      const next = recoverStuckInputForSession(t.session, prev, MAIN_STUCK_THRESHOLDS, true)
+      if (next.parkedSig === null) agentStuckInput.delete(t.session)
+      else agentStuckInput.set(t.session, next)
     }
 
     for (const t of targets) {
@@ -888,9 +1095,14 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // Process-alive does NOT prove the inbound MCP pipe is healthy (the
           // deafness blind spot). Cross-check the keep-alive freshness.
           checkMainKeepaliveStaleness()
-        } else if (agentDownSince.has(t.session)) {
-          logger.info({ session: t.session, provider: t.provider }, 'Agent channel plugin recovered')
-          agentDownSince.delete(t.session)
+        } else {
+          if (agentDownSince.has(t.session)) {
+            logger.info({ session: t.session, provider: t.provider }, 'Agent channel plugin recovered')
+            agentDownSince.delete(t.session)
+          }
+          // Healthy observation clears the exponential back-off so the next
+          // down-spell starts again at the base grace.
+          agentRestartFailures.delete(t.agentName!)
         }
         continue
       }
@@ -899,14 +1111,17 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       } else {
         if (!agentDownSince.has(t.session)) agentDownSince.set(t.session, Date.now())
         const lastRestart = agentLastRestart.get(t.agentName!)
+        const failures = agentRestartFailures.get(t.agentName!) ?? 0
         const restart = shouldAutoRestartDownAgent({
           processAgeMs: getProcessAgeMs(claudePid),
           msSinceLastRestart: lastRestart != null ? Date.now() - lastRestart : null,
           startupGraceMs: AGENT_STARTUP_GRACE_MS,
           restartGraceMs: AGENT_RESTART_GRACE_MS,
+          consecutiveFailures: failures,
+          maxRestartGraceMs: AGENT_MAX_RESTART_GRACE_MS,
         })
         if (!restart) {
-          logger.debug({ agent: t.agentName, provider: t.provider }, 'Channel plugin probe reports down but agent is within startup/restart grace -- deferring')
+          logger.debug({ agent: t.agentName, provider: t.provider, failures }, 'Channel plugin probe reports down but agent is within startup/restart back-off -- deferring')
           continue
         }
         const agentProvider = resolveAgentProvider(t.agentName!)
@@ -916,13 +1131,17 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           logger.warn({ agent: t.agentName, provider: agentProvider }, 'Agent has no channel token in state dir -- skipping restart to avoid token conflict')
           continue
         }
-        logger.warn({ agent: t.agentName, provider: t.provider }, 'Agent channel plugin down -- auto-restarting')
+        logger.warn({ agent: t.agentName, provider: t.provider, failures }, 'Agent channel plugin down -- auto-restarting')
         try {
           stopAgentProcess(t.agentName!)
           execSync('sleep 2', { timeout: 4000 })
           startAgentProcess(t.agentName!)
           agentLastRestart.set(t.agentName!, Date.now())
           agentDownSince.delete(t.session)
+          // Count this restart as failed until a later sweep sees the plugin
+          // alive (which resets the counter). Repeated failures back off the
+          // next restart exponentially instead of churning every base-grace.
+          agentRestartFailures.set(t.agentName!, failures + 1)
         } catch (err) {
           logger.error({ err, agent: t.agentName }, 'Failed to auto-restart agent after channel plugin down')
         }
@@ -935,6 +1154,21 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     // loop above only handles sessions that still exist with a dead plugin.
     // Staggered to avoid the simultaneous-start race that kills agents.
     void reconcileDesiredAgents()
+
+    // Periodic detached-channel-claude reap (CB6CF755). Throttled; reuses the
+    // respawn-time reaper so orphans accumulating between respawns are cleaned
+    // up on a slow cadence too. Fail-safe + pane-guarded inside the reaper.
+    if (shouldRunPeriodicReap(lastDetachedReapAt, Date.now(), DETACHED_REAP_INTERVAL_MS)) {
+      lastDetachedReapAt = Date.now()
+      try {
+        const reaped = reapDetachedChannelClaudes({ tmuxPath: TMUX })
+        if (reaped.length > 0) {
+          logger.warn({ reaped }, 'channel-monitor: periodic reap removed detached channel-claude orphans')
+        }
+      } catch (err) {
+        logger.warn({ err }, 'channel-monitor: periodic detached-claude reap failed')
+      }
+    }
   }
   setTimeout(check, 30000)
   return setInterval(check, 60000)

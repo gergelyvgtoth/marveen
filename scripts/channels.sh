@@ -40,6 +40,7 @@ SESSION="${MAIN_AGENT_ID:-marveen}-channels"
 # Resolve plugin ID from provider
 case "$CHANNEL_PROVIDER" in
   slack)    PLUGIN_ID="slack-channel@marveen-marketplace" ;;
+  whatsapp) PLUGIN_ID="whatsapp@marveen-marketplace" ;;
   discord)  PLUGIN_ID="discord@claude-plugins-official" ;;
   *)        PLUGIN_ID="telegram@claude-plugins-official" ;;
 esac
@@ -115,6 +116,7 @@ $TMUX kill-session -t "$SESSION" 2>/dev/null
 MAIN_CHAN_DIR="$INSTALL_DIR/.claude/channels/$CHANNEL_PROVIDER"
 case "$CHANNEL_PROVIDER" in
   slack)    STATE_ENV_VAR="SLACK_STATE_DIR" ;;
+  whatsapp) STATE_ENV_VAR="WHATSAPP_STATE_DIR" ;;
   discord)  STATE_ENV_VAR="DISCORD_STATE_DIR" ;;
   *)        STATE_ENV_VAR="TELEGRAM_STATE_DIR" ;;
 esac
@@ -125,6 +127,33 @@ if [ -n "$ORPHAN_PIDS" ]; then
   /bin/sleep 0.3
   # shellcheck disable=SC2086
   /bin/kill -KILL $ORPHAN_PIDS 2>/dev/null || true
+fi
+
+# Second reap pass for plugin builds that DON'T set *_STATE_DIR in the poller
+# env (e.g. telegram@0.0.1). Those pollers carry CLAUDE_PLUGIN_ROOT=.../<provider>
+# instead, so the STATE_DIR grep above never matches and orphans accumulate
+# across restarts -> multiple getUpdates long-polls -> 409 Conflict -> the bot
+# goes silent/flaky.
+#
+# Scope to THIS (main) agent only. The tmux server is SHARED across the fleet,
+# and every sub-agent runs its OWN provider poller out of
+# $INSTALL_DIR/agents/<name>/. Those processes carry that agent dir in their
+# environment; the main agent's pollers do not. CLAUDE_PLUGIN_ROOT points at the
+# shared user-level plugin cache for every agent, so it cannot tell main from
+# sub on its own -- without the agents/ exclusion this pass SIGKILLs every live
+# sub-agent poller on a main restart (they would only recover on each
+# sub-agent's own next restart). A main orphan from an old build has no agent
+# dir, so it is still reaped. index() is a literal (non-regex) substring test so
+# an install path with regex metacharacters can't break the exclusion. The var
+# is named `subdir` (not `sub`) because `sub` is a reserved awk function name and
+# BSD/macOS awk syntax-errors on it.
+ORPHAN_PIDS2="$(/bin/ps eww -e 2>/dev/null | awk -v needle="CLAUDE_PLUGIN_ROOT=" -v prov="/${CHANNEL_PROVIDER}" -v subdir="${INSTALL_DIR}/agents/" '$0 ~ needle && $0 ~ prov && index($0, subdir) == 0 { print $1 }')"
+if [ -n "$ORPHAN_PIDS2" ]; then
+  # shellcheck disable=SC2086
+  /bin/kill -TERM $ORPHAN_PIDS2 2>/dev/null || true
+  /bin/sleep 0.3
+  # shellcheck disable=SC2086
+  /bin/kill -KILL $ORPHAN_PIDS2 2>/dev/null || true
 fi
 
 # P1 FIX: put the Claude auth token into the tmux SERVER global env BEFORE
@@ -167,10 +196,42 @@ $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
 #  - "Do you trust the files in this folder?" / "trust" prompts (Y Enter)
 #  - "Welcome to Claude Code" / kezdo vezetes (Enter a folytatashoz)
 # 12 sec timeout ket retry-jal, mert WSL/tmux paint slow lehet first-run-on.
+#
+# EPERM fallback (Claude Code 2.1.183+ regression): launching --channels in a
+# trusted project directory throws EPERM before any dialog appears. Detected
+# below; one auto-restart from /tmp where the trust dialog fires instead.
+_eperm_restarted=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 1
   pane=$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)
   case "$pane" in
+    *"EPERM"*|*"Operation not permitted"*|*"operation not permitted"*)
+      if [ "$_eperm_restarted" = "0" ]; then
+        _eperm_restarted=1
+        $TMUX kill-session -t "$SESSION" 2>/dev/null
+        _CHANNELS_STARTDIR="$(mktemp -d /tmp/marveen-channels-XXXXXX)"
+        # Carry the project CLAUDE.md into the fallback cwd so the session keeps
+        # Marveen's instructions/personality instead of running as a generic,
+        # context-less assistant (the biggest degradation of the /tmp fallback).
+        # Best-effort: a symlink failure degrades to the prior behaviour and
+        # never blocks startup. The trust dialog for the fresh /tmp path still
+        # fires and is handled by the guard below; EPERM is keyed on the
+        # registered project path, not on file presence, so seeding CLAUDE.md
+        # does not re-trigger it.
+        #
+        # NOTE: the project-scoped MCP servers (gmail/calendar) are NOT restored
+        # here. Claude Code keys those by project PATH in ~/.claude.json, not in
+        # the project .mcp.json, so a random /tmp path has no entry and symlinking
+        # files cannot bring them back. Restoring them needs a separate, more
+        # invasive change (a stable fallback dir + a seeded ~/.claude.json project
+        # entry); see the PR description / card 7EB18437.
+        [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
+        $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
+          "$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+        unset _CHANNELS_STARTDIR
+      fi
+      continue
+      ;;
     *"Bypass Permissions mode"*"Yes, I accept"*)
       $TMUX send-keys -t "$SESSION" "2" Enter
       sleep 1
@@ -191,6 +252,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
       ;;
   esac
 done
+unset _eperm_restarted
 
 # Set agent name once the session is ready. (/remote-control dropped: the operator no
 # longer uses Remote Control.)
@@ -352,6 +414,17 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
     fi
   fi
   unset _bot_pid
+  # Fallback for plugin builds that never write bot.pid (e.g. telegram@0.0.1):
+  # treat a running plugin poller as alive. The poller is a bun process whose
+  # env CLAUDE_PLUGIN_ROOT points at the <provider> plugin dir. `ps eww -e`
+  # surfaces each process environment on macOS BSD ps (same technique the
+  # orphan-reaper above uses). Without this the watchdog false-restarts every
+  # ~10 min on plugin versions that don't emit a bot.pid.
+  if [ "$_plugin_alive" != "true" ]; then
+    if /bin/ps eww -e 2>/dev/null | grep -qE "CLAUDE_PLUGIN_ROOT=[^ ]*/${CHANNEL_PROVIDER}(/|@| |$)"; then
+      _plugin_alive=true
+    fi
+  fi
 
   if [ "$_plugin_alive" = "true" ]; then
     PLUGIN_SEEN_ONCE=true
