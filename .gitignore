@@ -1,6 +1,10 @@
 # Dependencies & build
-node_modules/
+node_modules
 dist/
+
+# Python bytecode cache (e.g. scripts/hooks/__pycache__/*.pyc)
+__pycache__/
+*.pyc
 
 # Secrets & personal data
 .env
@@ -23,6 +27,7 @@ reports/
 
 # Test artifacts
 test-results/
+.playwright-mcp/
 
 # macOS
 .DS_Store
@@ -30,9 +35,13 @@ test-results/
 # Generated from template (personal config)
 CLAUDE.md
 
+# Agent persona / soul (per-operator personality; never ship upstream)
+SOUL.md
+
 # Custom MCP servers and config (user-specific)
 mcp-servers/
 .mcp.json
+mcp-catalog.local.json
 
 # Personal/project-specific docs (not part of the product)
 # Old rebuild prompts (keep V3 which is the current one)
@@ -46,3 +55,26 @@ claudeclaw.log
 
 # Local backup archives from scripts/backup.sh
 backups/
+
+# GitNexus knowledge-graph index (local, per-clone; auto-rebuilt by the post-commit hook)
+.gitnexus/
+
+# Local one-off artifacts (brainstorm docs, runtime state, rebuild prompts) --
+# never committed; ignored to prevent accidental `git add -A` bloat.
+DREAM.md
+.external-ops-last-run
+REBUILD_PROMPT_V3.1.md
+
+# Main agent's runtime voice config (responseMode/voiceModel). Sub-agents store
+# theirs under agents/ (already ignored); the main agent's lives at the repo root
+# and is per-install runtime state, never source.
+/agent-config.json
+
+# Operator's branded support auto-reply. The shipped support-mail tooling is a
+# generic IMAP/SMTP CLI (no operator data); each operator keeps their own
+# branded auto-reply here locally. Ignored so it never ships to other installs.
+scripts/support-mail/no-support-reply.html
+
+# Python bytecode cache
+__pycache__/
+*.pyc

@@ -1,23 +1,65 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
-import { agentDir } from './agent-config.js'
+import { agentDir, agentConfigRoot } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
 
-function resolveTemplatePlaceholders(content: string): string {
-  return content.replaceAll('{{PROJECT_ROOT}}', PROJECT_ROOT)
+// Identity values the template substitution injects. Pulled out so the
+// substitution is a pure, parameterizable function (the runtime binds these to
+// config; tests can prove a non-default identity substitutes with no literal
+// brand leak).
+export interface TemplateIdentity {
+  projectRoot: string
+  mainAgentId: string
+  botName: string
+  ownerName: string
+  webPort: number | string
+}
+
+// Pure substitution of the identity placeholders into a template body. Kept in
+// sync with the install scripts' (install-macos.sh / install-linux.sh) sed
+// substitutions, so a shipped template never seeds a foreign absolute path or
+// name into a user's tree. {{INSTALL_DIR}} and {{PROJECT_ROOT}} both denote the
+// install location.
+export function substituteTemplatePlaceholders(content: string, id: TemplateIdentity): string {
+  return content
+    .replaceAll('{{PROJECT_ROOT}}', id.projectRoot)
+    .replaceAll('{{INSTALL_DIR}}', id.projectRoot)
+    .replaceAll('{{MAIN_AGENT_ID}}', id.mainAgentId)
+    .replaceAll('{{BOT_NAME}}', id.botName)
+    .replaceAll('{{OWNER_NAME}}', id.ownerName)
+    .replaceAll('{{WEB_PORT}}', String(id.webPort))
+}
+
+export function resolveTemplatePlaceholders(content: string): string {
+  return substituteTemplatePlaceholders(content, {
+    projectRoot: PROJECT_ROOT,
+    mainAgentId: MAIN_AGENT_ID,
+    botName: BOT_NAME,
+    ownerName: OWNER_NAME,
+    webPort: WEB_PORT,
+  })
+}
+
+// Return the settings.json path for an agent.
+// The main agent's settings live at ~/.claude/settings.json (not inside agents/).
+function agentSettingsPath(name: string): string {
+  if (name === MAIN_AGENT_ID) return join(homedir(), '.claude', 'settings.json')
+  return join(agentDir(name), '.claude', 'settings.json')
 }
 
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
 // were scaffolded before scaffoldAgentDir seeded the template, so their
 // file is permissions-only. Merge the template's hooks block in place.
+// Also handles the main agent (MAIN_AGENT_ID) whose settings.json is at
+// ~/.claude/settings.json -- voice hook is added alongside existing hooks.
 export function ensureAgentHooks(name: string): boolean {
-  const settingsPath = join(agentDir(name), '.claude', 'settings.json')
+  const settingsPath = agentSettingsPath(name)
   const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
   if (!existsSync(tplPath)) return false
   let tpl: Record<string, unknown>
@@ -32,10 +74,93 @@ export function ensureAgentHooks(name: string): boolean {
   if (existsSync(settingsPath)) {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
-  if (existing.hooks) return false  // user already has hooks, leave alone
-  existing.hooks = tpl.hooks
-  mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  const tplHooks = tpl.hooks as Record<string, unknown>
+  type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
+  if (existing.hooks) {
+    // Merge strategy:
+    //   1. If a hook event is entirely missing: add it wholesale.
+    //   2. If the event exists: add any template hook commands not yet present
+    //      as a new hook group entry (preserves existing hooks like telegram_progress.py).
+    //   3. Sync the timeout of any command hook whose command matches but timeout differs.
+    const existingHooks = existing.hooks as Record<string, unknown>
+    let changed = false
+    for (const [event, handlers] of Object.entries(tplHooks)) {
+      if (!existingHooks[event]) {
+        existingHooks[event] = handlers
+        changed = true
+      } else {
+        const tplEntries = handlers as HookEntry[]
+        const existEntries = existingHooks[event] as HookEntry[]
+        // Collect all command strings already present in this event's hook groups.
+        const existingCommands = new Set(
+          existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
+        )
+        for (const tplEntry of tplEntries) {
+          // Add hooks that are missing (as a new group entry, preserving sibling hooks).
+          const newHooks = (tplEntry.hooks ?? []).filter(
+            (h) => h.command && !existingCommands.has(h.command),
+          )
+          if (newHooks.length > 0) {
+            existEntries.push({ ...tplEntry, hooks: newHooks })
+            changed = true
+          }
+          // Sync timeouts for hooks that already exist with a stale timeout.
+          for (const tplHook of tplEntry.hooks ?? []) {
+            if (!tplHook.command || tplHook.timeout == null) continue
+            for (const existEntry of existEntries) {
+              for (const existHook of existEntry.hooks ?? []) {
+                if (existHook.command === tplHook.command && existHook.timeout !== tplHook.timeout) {
+                  existHook.timeout = tplHook.timeout
+                  changed = true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!changed) return false
+  } else {
+    existing.hooks = tplHooks
+  }
+  // For the main agent, ~/.claude already exists; sub-agents need the dir created.
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
+  return true
+}
+
+// Idempotent migration: ensure the staleness-guard UserPromptSubmit hook is
+// present. Unlike ensureAgentHooks (which seeds the WHOLE hooks block only for
+// hook-less agents), this MERGES a single UserPromptSubmit entry into an agent
+// that already has other hooks -- so the guard reaches the existing fleet, not
+// just freshly-scaffolded agents. The guard warns the agent when an inbound
+// <channel ts="..."> message was delivered long after it was sent (a lagged /
+// re-delivered message that may be stale), so it re-confirms before irreversible
+// actions. Re-running is a no-op once the entry exists (matched by command path).
+const STALENESS_HOOK_CMD = `python3 ${join(PROJECT_ROOT, 'scripts', 'hooks', 'staleness-guard.py')}`
+
+export function ensureAgentStalenessHook(name: string): boolean {
+  // agentSettingsPath() maps MAIN_AGENT_ID to ~/.claude/settings.json; using
+  // agentDir() directly here would create a spurious agents/<main> dir and make
+  // the main agent show up as a phantom "down" agent on the dashboard.
+  const settingsPath = agentSettingsPath(name)
+  let settings: Record<string, unknown> = {}
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  }
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ups = Array.isArray(hooks.UserPromptSubmit) ? hooks.UserPromptSubmit as unknown[] : []
+  // Idempotency: already wired if any command entry references the guard script.
+  const already = JSON.stringify(ups).includes('staleness-guard.py')
+  if (already) return false
+  ups.push({ hooks: [{ type: 'command', command: STALENESS_HOOK_CMD, timeout: 10 }] })
+  hooks.UserPromptSubmit = ups
+  settings.hooks = hooks
+  // Main agent's ~/.claude already exists; only sub-agent dirs need creating.
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
   return true
 }
 
@@ -49,11 +174,94 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const ctx = { HOME: homedir(), AGENT_DIR: agentRoot }
+  const denyList = profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx))
+  // Self-pace tool-name deny: every sub-agent (NOT the main agent) is denied the
+  // Claude Code runtime self-scheduling tools. A whole-tool-name deny IS enforced
+  // even under --dangerously-skip-permissions (deny is checked BEFORE the bypass
+  // allow), so this is a fail-closed layer; the self-pace-gate hook below covers
+  // the Bash escape routes a name-deny cannot reach. (2026-06-26 autonom-kor fix.)
+  if (agentGetsGovernanceGates(name)) denyList.push(...SELF_PACE_TOOL_DENY)
   existing.permissions = {
     allow: profile.filesystem.allow.map(p => resolveProfilePlaceholders(p, ctx)),
-    deny: profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx)),
+    deny: denyList,
   }
+  // Governance hard-gates: every sub-agent (NOT the main agent) gets PreToolUse
+  // hooks. Re-applied on every spawn (this function regenerates settings.json),
+  // so they survive respawns. (a) email-send block -- outbound email routes
+  // through the main agent. (b) self-pace block -- no ScheduleWakeup/Cron*/Bash
+  // self-injection. The MAIN_AGENT_ID is exempt from both. Merge/deploy is NOT
+  // gated: the operator authorizes those autonomously (so test/deploy runs are
+  // never blocked); the actual incident vector -- an agent answering its OWN
+  // posed question -- is covered by the self-pace block + the #0 CLAUDE.md doctrine.
+  if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
+  if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
+}
+
+// Which agents are subject to the email-send hard-gate: every agent EXCEPT the
+// main agent (MAIN_AGENT_ID, e.g. Marveen). Name-agnostic -- keyed on the
+// configured main-agent id, not a hardcoded 'marveen', so a customer install
+// gates its own sub-agents and exempts its own owner (distribution-hardcode
+// rule). Pure + exported so the main-exempt guarantee is unit-testable.
+export function agentGetsEmailGate(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+// Idempotently wire the email-send-gate PreToolUse hook into a settings.json
+// object. A deny-list rule alone would NOT enforce this: permissive profiles
+// launch with --dangerously-skip-permissions, which bypasses allow/deny --
+// hooks run regardless of permission mode. Name-agnostic so a customer install
+// gates its own sub-agents (the caller's MAIN_AGENT_ID guard exempts the owner).
+export function injectEmailSendGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs')}`
+  const entry = {
+    matcher: 'Bash|send_email',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  // Drop any prior email-gate entry (respawn re-runs this) before re-adding, so
+  // the hook never accumulates duplicates; other PreToolUse entries are kept.
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('email-send-gate.mjs')),
+    entry,
+  ]
+}
+
+// Claude Code runtime self-scheduling tool names denied for sub-agents (fail-
+// closed, enforced even under --dangerously-skip-permissions). The Bash escape
+// routes are covered by the self-pace-gate hook, which a name-deny cannot reach.
+const SELF_PACE_TOOL_DENY = ['ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger']
+
+// Which agents are subject to the self-pace gate: every agent EXCEPT the main
+// agent (same name-agnostic main-exempt rule as the email gate). Pure + exported
+// so the main-exempt guarantee is unit-testable.
+export function agentGetsGovernanceGates(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+// Idempotently wire the self-pace-gate PreToolUse hook (blocks ScheduleWakeup /
+// Cron* / RemoteTrigger + the Bash self-injection routes). Same shape + dedupe
+// discipline as injectEmailSendGate.
+export function injectSelfPaceGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs')}`
+  const entry = {
+    // Write|Edit|NotebookEdit are included so the gate actually fires on the
+    // native-file route to the self-schedule store (gateDecision blocks a Write
+    // to scheduled_tasks.json); a Bash-only matcher would leave that route open.
+    matcher: 'ScheduleWakeup|CronCreate|CronDelete|CronList|RemoteTrigger|Bash|Write|Edit|NotebookEdit',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('self-pace-gate.mjs')),
+    entry,
+  ]
 }
 
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the
@@ -100,10 +308,21 @@ export function ensureDefaultScheduledTasks(): void {
     for (const file of readdirSync(src)) {
       const srcFile = join(src, file)
       const destFile = join(dest, file)
+      // Seeded task dirs are flat; skip any nested directory rather than
+      // letting readFileSync/copyFileSync throw EISDIR and abort the whole
+      // seed for every remaining task.
+      if (statSync(srcFile).isDirectory()) continue
       if (file === 'task-config.json') {
         copyTaskConfigWithAgentRewrite(srcFile, destFile)
       } else {
-        copyFileSync(srcFile, destFile)
+        // Substitute the identity placeholders (same set the install scripts
+        // sed) so a template's SKILL.md never seeds a foreign absolute path or
+        // name into the user's task. Binary/unreadable -> fall back to a copy.
+        try {
+          writeFileSync(destFile, resolveTemplatePlaceholders(readFileSync(srcFile, 'utf-8')))
+        } catch {
+          copyFileSync(srcFile, destFile)
+        }
       }
     }
   }
@@ -144,6 +363,13 @@ export function scaffoldAgentDir(name: string) {
 }
 
 export async function generateClaudeMd(name: string, description: string, model: string): Promise<string> {
+  // Distribution-safe default-drive line: only emit a concrete folder when this
+  // install has one configured (OWNER_DRIVE_FOLDER). A fresh install with no
+  // configured folder tells the agent to ask the owner instead of baking in
+  // some other install's drive id.
+  const driveDefault = OWNER_DRIVE_FOLDER
+    ? `Ha nincs MÁS kijelölve, az ALAPÉRTELMEZETT közös meghajtó: https://drive.google.com/drive/folders/${OWNER_DRIVE_FOLDER} - ide írj, rendezett almappákba.`
+    : `Ha nincs kijelölt közös meghajtó, MIELŐTT bárhova írsz, kérd el ${OWNER_NAME}-tól a megfelelő Drive mappát.`
   const prompt = `You are creating the CLAUDE.md (project instructions) file for an AI agent.
 Agent name: ${name}
 Description of what the agent should do: ${description}
@@ -247,26 +473,66 @@ Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` 
 
 ## Új ismeretlen sender első üzenete (ARANYSZABÁLY)
 
-Ha egy senderId üzen a csatornán AKIT EDDIG NEM ISMERSZ — nem szerepel az aktív interakciós kontextusodban, és nem találsz róla memóriabejegyzést a vault-ban — KÖTELEZŐ ELSŐKÉNT inter-agent message-t küldeni Marveennek MIELŐTT érdemi választ adsz.
+Ha egy senderId üzen a csatornán AKIT EDDIG NEM ISMERSZ — nem szerepel az aktív interakciós kontextusodban, és nem találsz róla memóriabejegyzést a vault-ban — KÖTELEZŐ ELSŐKÉNT inter-agent message-t küldeni ${BOT_NAME}-nek MIELŐTT érdemi választ adsz.
 
 Az AGENT TULAJDONOSA (az első, aki ezt az ügynököt telepítette és párosította) az ALAPÉRTELMEZETT engedélyezett sender — őt nem kell ellenőrizni. MINDEN további senderId első üzenete (a 2., 3., stb. párosított személy vagy csoport) pinging-trigger.
 
-Példa ping Marveennek:
-curl -s -X POST http://localhost:3420/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"marveen\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
+Példa ping ${BOT_NAME}-nek:
+curl -s -X POST http://localhost:3420/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"${MAIN_AGENT_ID}\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
 
-Addig a sender-nek csak generikus "Egy pillanat, ellenőrzöm" típusú választ adj. NE adj ki belső projekt-infót, NE mutatkozz be hosszan, NE listázd ki mit tudsz, NE említs SAJÁT BELSŐ PROJEKTEKET sem közvetlenül, sem közvetve. Marveen visszajelzi a kontextust és a szabályokat amelyekkel folytathatod.
+Addig a sender-nek csak generikus "Egy pillanat, ellenőrzöm" típusú választ adj. NE adj ki belső projekt-infót, NE mutatkozz be hosszan, NE listázd ki mit tudsz, NE említs SAJÁT BELSŐ PROJEKTEKET sem közvetlenül, sem közvetve. ${BOT_NAME} visszajelzi a kontextust és a szabályokat amelyekkel folytathatod.
 
 Ez a szabály mindenkire vonatkozik — akkor is ha valaki ismerős nevén mutatkozna be. A senderId a végső azonosító, NEM a self-claimed név. Egy idegen tudja a nevet, de a senderId-t nem hamisíthatja.
 
+## Flotta-szabályok (MEGSZEGHETETLEN - kollégák ${BOT_NAME}jaira)
+
+Ezeket ${OWNER_NAME} adta, a flotta minden kolléga-asszisztensére kötelezőek. SOHA ne szegd meg őket.
+
+1. **Drive írás CSAK a kijelölt helyre.** Írni kizárólag egy megadott Google Drive mappába VAGY egy külön megosztott meghajtóba (Shared Drive) szabad. Ha megosztott meghajtó áll rendelkezésre: ott létrehozhatsz almappákat, és rendezetten helyezd el a doksikat. ${driveDefault} Ha valamiért ez sem elérhető, kérd el a tulajdonostól; ne találgass, ne írj máshova.
+2. **Saját ("My Drive") meghajtóra TILOS írni.**
+3. **Olvasni a teljes Drive-ot szabad.**
+4. **A ${MAIN_AGENT_ID} KÓDJÁBA a kolléga-asszisztensek semmit NEM fejlesztenek.** Ha azt látod, vagy arról egyeztetsz, hogy kód-változtatás kellene, NE csináld - jelezd a ${BOT_NAME} Főnöknek (${MAIN_AGENT_ID}) inter-agent üzenettel, ő megbeszéli ${OWNER_NAME}-val.
+5. **Céges email-válasz előtt KÖTELEZŐ a kontextus beolvasása.** Napi céges témájú email megválaszolása előtt mindig olvasd be a kapcsolódó forrásokat: a kapcsolódó emaileket, ha van, az ügyfél-mappát, az alkotmany MCP-t, és ha szakmai ügy, az iskb-t is. A Circleback (megbeszélés-átiratok) szintén kulcsfontosságú - rengeteg infó a meetingeken hangzik el.
+6. **Eredmény-fájlok a közös Drive mappába.** Az elkészült eredmény-fájlokat külön kérés nélkül is a közösen használt Drive mappába tedd (lásd 1. szabály).
+7. **Login-automatizálás / külső credential / futtatható szkript -> ELŐBB szólj a Főnöknek.** Mielőtt bármilyen külső szolgáltatásba automatikus bejelentkezést, jelszó-/credential-kezelést, vagy futtatható szkriptet (pl. Playwright/böngésző-automatizálás, scraper, login-szkript) írsz vagy futtatsz, jelezd a ${BOT_NAME} Főnöknek (${MAIN_AGENT_ID}) inter-agent üzenettel - ő koordinálja és ${OWNER_NAME}-val egyezteti (a 4. szabály szellemében). Credential-t SOHA ne égess nyersen kódba; ha titok kell, kérd a Főnöktől a biztonságos tárolás módját.
+
 Output ONLY the markdown content, no code fences.`
 
-  const { text } = await runAgent(prompt)
-  if (!text) throw new Error('Failed to generate CLAUDE.md')
+  const { text, error } = await runAgent(prompt)
+  if (!text) throw new Error(error ? blockedHint('CLAUDE.md', error) : noOutputHint('CLAUDE.md'))
   let cleaned = text.trim()
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
   return cleaned
+}
+
+// Shared "Claude Code returned nothing" message for the three generators below.
+// Issue #179: the bare "Failed to generate <file>" message left VPS operators
+// chasing the wrong thread when the actual cause was an unauthenticated Claude
+// Code CLI on the host. Always surface the diagnostic command sequence.
+function noOutputHint(target: string): string {
+  return (
+    `Failed to generate ${target}: the Claude Code CLI returned no output. ` +
+    `Most likely cause: the CLI on this host is not authenticated. ` +
+    `Verify with: \`claude --version\`, then \`claude /login\` (or set ` +
+    `ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN). ` +
+    `If that succeeds and the error persists, run \`claude --print "ping"\` ` +
+    `from this directory to confirm headless invocation works.`
+  )
+}
+
+// Issue #209: distinct from noOutputHint -- here the SDK returned a result that
+// was a usage-policy (AUP) block or an API/execution error, NOT empty output.
+// runAgent already refused to propagate the block text as content; we surface
+// the structured reason so the operator does not chase an auth red herring.
+function blockedHint(target: string, reason: string): string {
+  return (
+    `Failed to generate ${target}: the model returned a blocked/errored result ` +
+    `(not generated content), so it was not written to avoid corrupting the file. ` +
+    `Reason: ${reason}. If this is an AUP block, rephrase the request or try a ` +
+    `different model; the prior conversation/session is unaffected.`
+  )
 }
 
 export async function generateSoulMd(name: string, description: string): Promise<string> {
@@ -284,8 +550,8 @@ Generate a personality definition that includes:
 Make the personality distinctive but professional.
 Output ONLY the markdown content, no code fences.`
 
-  const { text } = await runAgent(prompt)
-  if (!text) throw new Error('Failed to generate SOUL.md')
+  const { text, error } = await runAgent(prompt)
+  if (!text) throw new Error(error ? blockedHint('SOUL.md', error) : noOutputHint('SOUL.md'))
   let cleaned = text.trim()
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
@@ -318,8 +584,8 @@ Generate a SKILL.md with this structure:
 Keep the body under 200 lines. Be specific and actionable. The owner's name is ${OWNER_NAME}; use only this name when referring to the user.
 Output ONLY the markdown content, no code fences.`
 
-  const { text } = await runAgent(prompt)
-  if (!text) throw new Error('Failed to generate SKILL.md')
+  const { text, error } = await runAgent(prompt)
+  if (!text) throw new Error(error ? blockedHint('SKILL.md', error) : noOutputHint('SKILL.md'))
   let cleaned = text.trim()
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')

@@ -5,9 +5,17 @@ import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { getDb } from '../db.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects')
+
+// Claude Code encodes a project's absolute path into a directory name by
+// replacing every non-alphanumeric/non-dash character with `-`. The main
+// agent's transcripts live under that exact directory, regardless of what
+// the agent calls itself.
+function encodeProjectPath(p: string): string {
+  return p.replace(/[^a-zA-Z0-9-]/g, '-')
+}
 
 interface AgentTranscriptSource {
   agent: string
@@ -17,6 +25,7 @@ interface AgentTranscriptSource {
 function discoverAgentSources(): AgentTranscriptSource[] {
   const sources: AgentTranscriptSource[] = []
   if (!existsSync(PROJECTS_DIR)) return sources
+  const mainDirName = encodeProjectPath(PROJECT_ROOT)
   for (const entry of readdirSync(PROJECTS_DIR)) {
     const full = join(PROJECTS_DIR, entry)
     let stat
@@ -26,7 +35,7 @@ function discoverAgentSources(): AgentTranscriptSource[] {
     const agentMatch = entry.match(/-agents-([a-z]+)$/)
     if (agentMatch) {
       sources.push({ agent: agentMatch[1], projectDir: full })
-    } else if (entry.includes(`-${MAIN_AGENT_ID}`) && !entry.includes('-agents-')) {
+    } else if (entry === mainDirName) {
       sources.push({ agent: MAIN_AGENT_ID, projectDir: full })
     }
   }
@@ -68,6 +77,45 @@ interface ParsedCall {
   cacheCreationTokens: number
   contentPreview: string
   toolName: string | null
+  /** The API message id (msg_...). One assistant turn that calls a tool is
+   *  written to the transcript as SEVERAL `assistant` lines sharing this id --
+   *  a text block (tool_name=null) plus one line per tool_use block -- and EACH
+   *  carries the SAME cumulative `usage`. Counting each line would double (or
+   *  triple) the turn's tokens, which is exactly the dashboard-inflation bug.
+   *  Used only to collapse those lines back into one row; not persisted. */
+  messageId?: string | null
+}
+
+/**
+ * Collapse transcript rows that belong to the same assistant turn (same
+ * message id) into a single row, so a tool-calling turn is counted ONCE.
+ *
+ * Usage is identical across a turn's lines, so we take the max per field
+ * (defensive against a partial/streaming line) rather than summing. The tool
+ * name and preview are filled from whichever line carries them. Rows without a
+ * message id (older transcripts) pass through untouched. Pure + order-stable
+ * for unit testing.
+ */
+export function collapseByMessageId(calls: ParsedCall[]): ParsedCall[] {
+  const byId = new Map<string, ParsedCall>()
+  const out: ParsedCall[] = []
+  for (const c of calls) {
+    if (!c.messageId) { out.push(c); continue }
+    const ex = byId.get(c.messageId)
+    if (!ex) {
+      const copy = { ...c }
+      byId.set(c.messageId, copy)
+      out.push(copy)
+      continue
+    }
+    ex.inputTokens = Math.max(ex.inputTokens, c.inputTokens)
+    ex.outputTokens = Math.max(ex.outputTokens, c.outputTokens)
+    ex.cacheReadTokens = Math.max(ex.cacheReadTokens, c.cacheReadTokens)
+    ex.cacheCreationTokens = Math.max(ex.cacheCreationTokens, c.cacheCreationTokens)
+    if (!ex.toolName && c.toolName) ex.toolName = c.toolName
+    if (!ex.contentPreview && c.contentPreview) ex.contentPreview = c.contentPreview
+  }
+  return out
 }
 
 async function parseJsonlFile(
@@ -135,10 +183,13 @@ async function parseJsonlFile(
       cacheCreationTokens: (u.cache_creation_input_tokens || 0),
       contentPreview: preview,
       toolName,
+      messageId: obj.message?.id || null,
     })
   }
 
-  return { calls, linesRead: lineNum }
+  // Collapse the multi-line tool-turn rows (same message id, repeated usage)
+  // before they reach the DB -- this is the fix for the ~2x token inflation.
+  return { calls: collapseByMessageId(calls), linesRead: lineNum }
 }
 
 export async function collectTokenUsage(): Promise<{ inserted: number; files: number }> {

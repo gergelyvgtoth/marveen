@@ -1,10 +1,11 @@
 import { existsSync, readFileSync, mkdirSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, copyFileSync, renameSync } from 'node:fs'
-import { join, extname } from 'node:path'
+import { join, extname, dirname } from 'node:path'
 import { homedir, platform } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
-import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus } from '../../db.js'
+import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
+import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent } from '../../db.js'
+import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
 import {
@@ -27,6 +28,15 @@ import {
   writeAgentChannelProvider,
   readAgentAuthMode,
   writeAgentAuthMode,
+  readAgentMemoryIsolation,
+  writeAgentMemoryIsolation,
+  readAgentClaudeConfigDir,
+  readAgentRemoteConfig,
+  readAgentRemoteHost,
+  writeAgentRemoteConfig,
+  readAgentVoiceConfig,
+  writeAgentVoiceConfig,
+  KNOWN_VOICE_MODELS,
   type AuthMode,
 } from '../agent-config.js'
 import {
@@ -39,6 +49,8 @@ import {
 import {
   readAgentTelegramConfig,
   readAgentDiscordConfig,
+  readAgentGooglechatConfig,
+  readAgentTeamsConfig,
   readMarveenTelegramConfig,
   sendAvatarChangeMessage,
   sendWelcomeMessage,
@@ -51,6 +63,8 @@ import {
   revokeInvite,
   agentChannelDir,
 } from '../channel-invites.js'
+import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import { isMainChannelsAgent, MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import {
   getProvider,
   channelStateDir,
@@ -67,13 +81,25 @@ import {
 } from '../agent-scaffold.js'
 import {
   isAgentRunning,
+  agentRunState,
   startAgentProcess,
   stopAgentProcess,
+  restartAgentProcess,
+  getAgentRunningSince,
   getAgentProcessInfo,
   agentSessionName,
   sendPromptToSession,
   capturePane,
 } from '../agent-process.js'
+import { addDesiredAgent, removeDesiredAgent } from '../agent-desired-state.js'
+import { RemoteStatusCache } from '../remote-status-cache.js'
+import type { AgentRunState } from '../ssh-tmux.js'
+import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
+import { detectPaneState } from '../../pane-state.js'
+import { detectReauthNeeded } from '../reauth-detect.js'
+import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
+import type { AutoRestartConfig } from '../../auto-restart.js'
+import { setStoreWriteActor } from '../../store-watcher.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
 import { getChannelHealth } from '../channel-health-monitor.js'
 import {
@@ -84,8 +110,38 @@ import { sanitizeAgentName } from '../sanitize.js'
 import { parseMultipart } from '../multipart.js'
 import { readBody, json, serveFile } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
+import { suggestForAgent, type AgentSignals } from '../model-suggest.js'
+import { getTokenSummary } from '../token-usage.js'
+import { listScheduledTasks } from '../scheduled-tasks-io.js'
 
-const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord'])
+const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord', 'googlechat', 'teams'])
+
+// Short-TTL caches so the synchronous, frequently-polled status endpoints
+// (`/api/agents` on load, `/api/agents/activity` every 3s) don't issue a fresh
+// blocking ssh call per remote agent per request. Only remote agents are cached;
+// local agents fetch fresh (sub-ms tmux). See remote-status-cache.ts.
+const remoteRunStateCache = new RemoteStatusCache<AgentRunState>(5000)
+const remotePaneCache = new RemoteStatusCache<string | null>(3000)
+
+// Resolve an agent's run state, cached for remote agents to avoid blocking on
+// ssh. `isRemote` is passed by the caller (it already read the remote config).
+function agentRunStateCached(name: string, isRemote: boolean): AgentRunState {
+  if (!isRemote) return agentRunState(name)
+  return remoteRunStateCache.getOrRefresh(name, Date.now(), () => agentRunState(name), 'unreachable')
+}
+
+// Discord channel ids are snowflakes — base-10 numeric ids, 17 to 20 digits
+// long in practice (current Discord scheme is 64-bit, with the leading bit
+// always 0). Rejects empty, whitespace-only, non-numeric, or wrong-length
+// values before any state write so a typo in the dashboard cannot bounce the
+// live Marveen session through hardRestartMarveenChannels().
+export function validateDiscordChannelId(cid: string | undefined): { ok: boolean; error?: string } {
+  const trimmed = cid?.trim()
+  if (!trimmed || !/^[0-9]{17,20}$/.test(trimmed)) {
+    return { ok: false, error: 'Discord channelId is required and must be a numeric snowflake (17-20 digits).' }
+  }
+  return { ok: true }
+}
 
 function parseChannelProvider(raw: string): ChannelProviderType | null {
   if (VALID_PROVIDERS.has(raw as ChannelProviderType)) return raw as ChannelProviderType
@@ -95,7 +151,7 @@ function parseChannelProvider(raw: string): ChannelProviderType | null {
 // Match both new /channels/:provider/ and legacy /telegram/ URL patterns.
 // Returns [agentName, provider] or null. Legacy routes always resolve to 'telegram'.
 function matchChannelRoute(path: string, suffix: string): [string, ChannelProviderType] | null {
-  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord)${suffix}$`)
+  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord|googlechat|teams)${suffix}$`)
   const newMatch = path.match(newPattern)
   if (newMatch) {
     const provider = parseChannelProvider(newMatch[2])
@@ -107,17 +163,27 @@ function matchChannelRoute(path: string, suffix: string): [string, ChannelProvid
   return null
 }
 
-const MANAGED_SETTINGS_PATH = platform() === 'darwin'
-  ? '/Library/Application Support/ClaudeCode/managed-settings.json'
-  : '/etc/claude-code/managed-settings.json'
+function managedSettingsPath(): string {
+  switch (platform()) {
+    case 'darwin':
+      return '/Library/Application Support/ClaudeCode/managed-settings.json'
+    case 'win32':
+      return join(process.env.ProgramData || 'C:\\ProgramData', 'ClaudeCode', 'managed-settings.json')
+    default:
+      return '/etc/claude-code/managed-settings.json'
+  }
+}
+const MANAGED_SETTINGS_PATH = managedSettingsPath()
 const SLACK_ALLOWLIST_ENTRY = { plugin: 'slack-channel', marketplace: 'marveen-marketplace' }
 
 export function isManagedSettingsReady(): boolean {
   if (!existsSync(MANAGED_SETTINGS_PATH)) return false
   try {
     const data = JSON.parse(readFileSync(MANAGED_SETTINGS_PATH, 'utf-8')) as {
+      channelsEnabled?: boolean
       allowedChannelPlugins?: Array<{ plugin: string; marketplace: string }>
     }
+    if (!data.channelsEnabled) return false
     const plugins = data.allowedChannelPlugins ?? []
     return plugins.some(
       p => p.plugin === SLACK_ALLOWLIST_ENTRY.plugin && p.marketplace === SLACK_ALLOWLIST_ENTRY.marketplace
@@ -130,24 +196,27 @@ export function isManagedSettingsReady(): boolean {
 export function getManagedSettingsSudoCommand(): string {
   const mergeScript = [
     'import json, sys',
-    'new_plugins = json.loads(sys.stdin.read())["allowedChannelPlugins"]',
-    'try:',
-    `  with open("${MANAGED_SETTINGS_PATH}") as f: data = json.load(f)`,
-    'except: data = {}',
+    'new_data = json.loads(sys.stdin.read())',
+    'try:\n  with open(' + JSON.stringify(MANAGED_SETTINGS_PATH) + ') as f: data = json.load(f)',
+    'except:\n  data = {}',
+    'data["channelsEnabled"] = True',
     'existing = data.get("allowedChannelPlugins", [])',
-    'for e in new_plugins:',
-    '  if not any(p.get("plugin")==e["plugin"] and p.get("marketplace")==e["marketplace"] for p in existing):',
-    '    existing.append(e)',
+    'for e in new_data["allowedChannelPlugins"]:\n  if not any(p.get("plugin")==e["plugin"] and p.get("marketplace")==e["marketplace"] for p in existing):\n    existing.append(e)',
     'data["allowedChannelPlugins"] = existing',
     'print(json.dumps(data, indent=2))',
-  ].join('; ')
+  ].join('\n')
   const payload = JSON.stringify({
     allowedChannelPlugins: [
       SLACK_ALLOWLIST_ENTRY,
       { plugin: 'telegram', marketplace: 'claude-plugins-official' },
     ],
   })
-  return `echo '${payload}' | sudo python3 -c '${mergeScript}' | sudo tee "${MANAGED_SETTINGS_PATH}" > /dev/null`
+  if (platform() === 'win32') {
+    const dir = dirname(MANAGED_SETTINGS_PATH)
+    return `New-Item -ItemType Directory -Force -Path '${dir}' | Out-Null; '${payload}' | python -c '${mergeScript}' | Set-Content -LiteralPath '${MANAGED_SETTINGS_PATH}' -Encoding utf8`
+  }
+  const escapedScript = mergeScript.replace(/'/g, "'\\''")
+  return `echo '${payload}' | sudo python3 -c '${escapedScript}' | sudo tee "${MANAGED_SETTINGS_PATH}" > /dev/null`
 }
 
 export function setAgentEnabledPlugins(name: string, provider: ChannelProviderType): void {
@@ -159,15 +228,15 @@ export function setAgentEnabledPlugins(name: string, provider: ChannelProviderTy
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const plugins = (existing.enabledPlugins ?? {}) as Record<string, boolean>
-  if (provider === 'discord') {
-    plugins['telegram@claude-plugins-official'] = false
-    plugins['slack-channel@marveen-marketplace'] = false
-  } else if (provider === 'slack') {
-    plugins['telegram@claude-plugins-official'] = false
-    plugins['discord@claude-plugins-official'] = false
-  } else {
-    plugins['slack-channel@marveen-marketplace'] = false
-    plugins['discord@claude-plugins-official'] = false
+  const allPlugins: Record<ChannelProviderType, string> = {
+    telegram: 'telegram@claude-plugins-official',
+    slack: 'slack-channel@marveen-marketplace',
+    discord: 'discord@claude-plugins-official',
+    googlechat: 'googlechat@claude-channel-googlechat',
+    teams: 'teams@marveen-marketplace',
+  }
+  for (const [p, pluginKey] of Object.entries(allPlugins)) {
+    plugins[pluginKey] = p === provider
   }
   existing.enabledPlugins = plugins
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
@@ -190,24 +259,82 @@ function resolveAccessPath(name: string, provider: ChannelProviderType): string 
   return join(dir, 'access.json')
 }
 
+function extractBotId(token: string): string | null {
+  const colon = token.indexOf(':')
+  if (colon < 1) return null
+  const id = token.slice(0, colon)
+  return /^\d+$/.test(id) ? id : null
+}
+
+function findBotTokenDuplicate(
+  provider: ChannelProviderType,
+  token: string,
+  excludeAgent: string,
+): string | null {
+  const botId = extractBotId(token)
+  if (!botId) return null
+
+  const candidates: Array<{ name: string; envPath: string }> = []
+
+  // Main agent's channel .env
+  if (excludeAgent !== MAIN_AGENT_ID) {
+    const mainEnv = join(channelStateDir(provider), '.env')
+    candidates.push({ name: MAIN_AGENT_ID, envPath: mainEnv })
+  }
+
+  // All sub-agents
+  for (const agentName of listAgentNames()) {
+    if (agentName === excludeAgent) continue
+    const envPath = join(channelStateDir(provider, agentDir(agentName)), '.env')
+    candidates.push({ name: agentName, envPath })
+  }
+
+  for (const { name, envPath } of candidates) {
+    const existing = readChannelToken(provider, envPath)
+    if (!existing) continue
+    const existingBotId = extractBotId(existing)
+    if (existingBotId === botId) return name
+  }
+
+  return null
+}
+
 interface AgentSummary {
   name: string
   displayName: string
   description: string
   model: string
+  activeModel: string | null
+  runningSince: number | null
   authMode: AuthMode
   securityProfile: string
   team: TeamConfig
   hasTelegram: boolean
   telegramBotUsername?: string
   hasDiscord: boolean
+  hasGooglechat: boolean
+  hasTeams: boolean
   status: 'configured' | 'draft'
   running: boolean
+  /** Tri-state: 'running' | 'stopped' | 'unreachable' (remote ssh failure). */
+  runState: AgentRunState
+  /** Remote ssh destination + workdir, or null for a local agent. */
+  remoteHost: string | null
+  remoteWorkdir: string | null
   session?: string
   hasAvatar: boolean
+  autoRestart: AutoRestartConfig
+  /** Live context size in tokens (input+cache_read+cache_creation of the last
+   *  turn), or null when not running / no transcript yet. */
+  contextTokens: number | null
+  /** True when the running session's pane shows a login/401 auth failure --
+   *  drives the dashboard "reauth needed" badge + one-click /login button. */
+  needsReauth: boolean
+  reauthReason?: string
 }
 
 interface AgentDetail extends AgentSummary {
+  memoryIsolation: boolean
   claudeMd: string
   soulMd: string
   mcpJson: string
@@ -223,26 +350,51 @@ function getAgentSummary(name: string): AgentSummary {
   const soulMd = readFileOr(join(dir, 'SOUL.md'), '')
   const tg = readAgentTelegramConfig(name)
   const dc = readAgentDiscordConfig(name)
+  const gc = readAgentGooglechatConfig(name)
+  const tc = readAgentTeamsConfig(name)
   const hasClaudeMd = claudeMd.trim().length > 0
   const hasSoulMd = soulMd.trim().length > 0
 
-  const proc = getAgentProcessInfo(name)
+  // Resolve run state through the cache (remote agents) so listing the fleet
+  // never blocks on a sleeping laptop's ssh timeout. `running` is derived from
+  // it; `unreachable` reads as not-running but is surfaced distinctly so the UI
+  // does not show a still-alive remote agent as "stopped".
+  const remote = readAgentRemoteConfig(name)
+  const runState = agentRunStateCached(name, remote.host != null)
+  const running = runState === 'running'
+  const session = running ? agentSessionName(name) : undefined
+  const runningSince = running ? getAgentRunningSince(name) : null
+
+  // Reauth badge: only meaningful for a running session (a stopped agent has
+  // no pane to inspect). One capture-pane per running agent on the list poll.
+  const reauth = running ? detectReauthNeeded(capturePane(agentSessionName(name))) : { needsReauth: false }
 
   return {
     name,
     displayName: readAgentDisplayName(name),
     description: extractDescriptionFromClaudeMd(claudeMd),
     model: readAgentModel(name),
+    activeModel: running ? readActiveModelFromProjectDir(dir, runningSince ?? undefined, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    runningSince,
     authMode: readAgentAuthMode(name),
     securityProfile: readAgentSecurityProfile(name),
     team: readAgentTeam(name),
     hasTelegram: tg.hasTelegram,
     telegramBotUsername: tg.botUsername,
     hasDiscord: dc.hasDiscord,
+    hasGooglechat: gc.hasGooglechat,
+    hasTeams: tc.hasTeams,
     status: hasClaudeMd && hasSoulMd ? 'configured' : 'draft',
-    running: proc.running,
-    session: proc.session,
+    running,
+    runState,
+    remoteHost: remote.host,
+    remoteWorkdir: remote.workdir,
+    session,
     hasAvatar: findAvatarForAgent(name) !== null,
+    autoRestart: readAutoRestartConfig(name),
+    contextTokens: running ? readContextTokensFromProjectDir(dir, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    needsReauth: reauth.needsReauth,
+    reauthReason: reauth.reason,
   }
 }
 
@@ -269,6 +421,7 @@ function getAgentDetail(name: string): AgentDetail {
 
   return {
     ...summary,
+    memoryIsolation: readAgentMemoryIsolation(name),
     claudeMd,
     soulMd,
     mcpJson,
@@ -281,6 +434,11 @@ function getAgentDetail(name: string): AgentDetail {
 function listAgentSummaries(): AgentSummary[] {
   return listAgentNames().map(getAgentSummary)
 }
+
+// Max inter-agent messages a single main-agent inbox drain returns. The rest
+// stay pending (FIFO) for the next turn's drain -- bounds the context a single
+// turn absorbs, mirroring the router's MAX_MESSAGES_PER_TICK.
+const INBOX_DRAIN_CAP = 10
 
 export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
@@ -295,9 +453,9 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
     json(res, {
       claude: [
-        { id: 'claude-opus-4-7', label: 'Opus 4.7 (legújabb, legjobb)' },
-        { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-        { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (alapértelmezett)' },
+        { id: 'claude-fable-5', label: 'Fable 5 (legújabb)' },
+        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus, alapértelmezett)' },
+        { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
         { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (leggyorsabb)' },
       ],
       deepseek: hasDeepseek
@@ -313,6 +471,154 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
   if (path === '/api/agents' && method === 'GET') {
     json(res, listAgentSummaries())
+    return true
+  }
+
+  // Live activity panel: per-agent "what is it doing right now". Read-only,
+  // polled by the dashboard every 3s; uses the same pane-state detector as the
+  // scheduler (detectPaneState) and returns the last few output lines as a tail.
+  // Includes the main agent's channels session so the operator sees the whole
+  // fleet, not just sub-agents. Restored after #226 dropped this route while the
+  // frontend kept calling /api/agents/activity (which then 404'd the panel).
+  if (path === '/api/agents/activity' && method === 'GET') {
+    const label = (running: boolean, pane: string | null): string => {
+      if (!running) return 'stopped'
+      if (pane === null) return 'unknown'
+      const s = detectPaneState(pane)
+      if (s === 'busy' || s === 'typing') return 'working'
+      if (s === 'idle') return 'idle'
+      return s // 'unknown' | 'error'
+    }
+    const tailOf = (pane: string | null): string[] =>
+      pane === null
+        ? []
+        : pane
+            .split('\n')
+            .map(l => l.replace(/\s+$/, ''))
+            .filter(l => l.trim().length > 0)
+            .slice(-8)
+
+    const entries: Array<{ name: string; isMain: boolean; running: boolean; state: string; tail: string[] }> = []
+
+    // Main agent runs in the --channels session, not agent-<name>.
+    {
+      const mainPane = capturePane(MAIN_CHANNELS_SESSION)
+      const running = mainPane !== null
+      entries.push({
+        name: MAIN_AGENT_ID,
+        isMain: true,
+        running,
+        state: label(running, mainPane),
+        tail: tailOf(mainPane),
+      })
+    }
+
+    for (const name of listAgentNames()) {
+      // Remote agents: resolve run state + pane through the short-TTL caches so
+      // this 3s-polled endpoint never blocks the event loop on an ssh timeout.
+      const host = readAgentRemoteHost(name)
+      const runState = agentRunStateCached(name, host != null)
+      const running = runState === 'running'
+      let pane: string | null = null
+      if (running) {
+        pane = host
+          ? remotePaneCache.getOrRefresh(name, Date.now(), () => capturePane(agentSessionName(name), host), null)
+          : capturePane(agentSessionName(name))
+      }
+      const state = runState === 'unreachable' ? 'unreachable' : label(running, pane)
+      entries.push({ name, isMain: false, running, state, tail: tailOf(pane) })
+    }
+
+    json(res, entries)
+    return true
+  }
+
+  if (path === '/api/agents/model-suggest' && method === 'POST') {
+    // Collect runtime signals once, then classify per agent.
+    // I/O is centralised here; the classifier (model-suggest.ts) stays pure.
+
+    // Token usage: per-agent average input tokens/call over the last 30 days
+    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 3600
+    const tokenSummaries = getTokenSummary(thirtyDaysAgo)
+    const tokenMap = new Map(
+      tokenSummaries.map(s => [s.agent, s.totalCalls > 0 ? s.totalInput / s.totalCalls : 0])
+    )
+
+    // Kanban: open and urgent/high card counts per assignee
+    const db = getDb()
+    type KanbanRow = { assignee: string | null; priority: string; cnt: number }
+    const kanbanRows = db.prepare(
+      `SELECT assignee, priority, COUNT(*) as cnt
+       FROM kanban_cards
+       WHERE archived_at IS NULL AND assignee IS NOT NULL
+       GROUP BY assignee, priority`
+    ).all() as KanbanRow[]
+    const kanbanMap = new Map<string, { open: number; urgent: number }>()
+    for (const row of kanbanRows) {
+      if (!row.assignee) continue
+      const cur = kanbanMap.get(row.assignee) ?? { open: 0, urgent: 0 }
+      cur.open += row.cnt
+      if (row.priority === 'urgent' || row.priority === 'high') cur.urgent += row.cnt
+      kanbanMap.set(row.assignee, cur)
+    }
+
+    // Scheduled-task frequency: total estimated runs/day per agent (cron-derived)
+    function cronFreqPerDay(cron: string): number {
+      const parts = cron.trim().split(/\s+/)
+      if (parts.length < 5) return 1
+      const [min, hour] = parts
+      if (min.startsWith('*/')) {
+        const n = parseInt(min.slice(2), 10)
+        if (!isNaN(n) && n > 0) return Math.round((60 / n) * 24)
+      }
+      if (hour === '*') return 24
+      if (hour.startsWith('*/')) {
+        const n = parseInt(hour.slice(2), 10)
+        if (!isNaN(n) && n > 0) return Math.round(24 / n)
+      }
+      return 1
+    }
+    const schedFreqMap = new Map<string, number>()
+    try {
+      for (const task of listScheduledTasks()) {
+        if (!task.enabled) continue
+        const freq = cronFreqPerDay(task.schedule)
+        schedFreqMap.set(task.agent, (schedFreqMap.get(task.agent) ?? 0) + freq)
+      }
+    } catch { /* scheduled-tasks dir may not exist yet */ }
+
+    // MCP server count: read agents/<name>/.mcp.json
+    function mcpServerCount(agentName: string): number {
+      const mcpPath = join(agentDir(agentName), '.mcp.json')
+      if (!existsSync(mcpPath)) return 0
+      try {
+        const cfg = JSON.parse(readFileSync(mcpPath, 'utf-8')) as { mcpServers?: Record<string, unknown> }
+        return Object.keys(cfg.mcpServers ?? {}).length
+      } catch { return 0 }
+    }
+
+    const names = listAgentNames()
+    const results = [MAIN_AGENT_ID, ...names].map(name => {
+      const dir = agentDir(name)
+      const claudeMd = readFileOr(join(dir, 'CLAUDE.md'), '')
+      const personaPath = join(PROJECT_ROOT, 'personas', `${name}.md`)
+      const personaMd = existsSync(personaPath) ? readFileSync(personaPath, 'utf-8') : ''
+      const personaText = [claudeMd, personaMd].filter(Boolean).join('\n')
+      const currentModel = readAgentModel(name)
+      const contextTokens = readContextTokensFromProjectDir(dir) ?? 0
+
+      const kanban = kanbanMap.get(name)
+      const signals: AgentSignals = {
+        tokenAvgInputPerCall: tokenMap.has(name) ? tokenMap.get(name) : undefined,
+        kanbanOpenCount: kanban?.open,
+        kanbanUrgentCount: kanban?.urgent,
+        scheduledFreqPerDay: schedFreqMap.has(name) ? schedFreqMap.get(name) : undefined,
+        mcpServerCount: mcpServerCount(name),
+      }
+
+      return suggestForAgent(name, currentModel, personaText, contextTokens, signals)
+    })
+    json(res, { results })
     return true
   }
 
@@ -354,7 +660,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     } catch (err) {
       rmSync(agentDir(name), { recursive: true, force: true })
       logger.error({ err, name }, 'Failed to generate agent files')
-      json(res, { error: 'Failed to generate agent files' }, 500)
+      // Propagate the underlying message so the dashboard surfaces the actual
+      // cause (auth not configured, Claude Code CLI missing, etc.) instead of
+      // the previous opaque "Failed to generate agent files" — Issue #179.
+      const detail = err instanceof Error ? err.message : 'Unknown error'
+      json(res, { error: 'Failed to generate agent files', detail }, 500)
       return true
     }
 
@@ -404,7 +714,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (avatarUploadMatch && method === 'GET') {
     const name = decodeURIComponent(avatarUploadMatch[1])
     const avatarPath = findAvatarForAgent(name)
-    if (avatarPath) { serveFile(res, avatarPath); return true }
+    if (avatarPath) { serveFile(req, res, avatarPath); return true }
     res.writeHead(404); res.end()
     return true
   }
@@ -498,15 +808,82 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const setupMatch = matchChannelRoute(path, '')
   if (setupMatch && method === 'POST') {
     const [name, provider] = setupMatch
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const isMain = name === MAIN_AGENT_ID
+    // Marveen lives at PROJECT_ROOT, not under agents/marveen/ -- skip the
+    // dir check for the main agent and route writes to ~/.claude/channels/.
+    if (!isMain && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
 
     const body = await readBody(req)
-    const { botToken, appToken } = JSON.parse(body.toString()) as { botToken: string; appToken?: string }
+
+    // Google Chat is creds-based (service-account key + Pub/Sub), not a bot
+    // token. Handle it on its own path: write the channel .env + identity
+    // access.json, enable the plugin, and restart.
+    if (provider === 'googlechat') {
+      const { saKeyPath, projectId, subscription, owner, allowDomain } =
+        JSON.parse(body.toString()) as { saKeyPath?: string; projectId?: string; subscription?: string; owner?: string; allowDomain?: string }
+      if (!saKeyPath?.trim() || !projectId?.trim() || !subscription?.trim() || !owner?.trim()) {
+        json(res, { error: 'Google Chat: saKeyPath, projectId, subscription és owner kötelező' }, 400); return true
+      }
+      const gcDir = isMain ? channelStateDir(provider) : channelStateDir(provider, agentDir(name))
+      mkdirSync(gcDir, { recursive: true })
+      const gcEnv =
+        `GOOGLE_APPLICATION_CREDENTIALS=${saKeyPath.trim()}\n` +
+        `GOOGLECHAT_PROJECT_ID=${projectId.trim()}\n` +
+        `GOOGLECHAT_SUBSCRIPTION=${subscription.trim()}\n`
+      atomicWriteFileSync(join(gcDir, '.env'), gcEnv, { mode: 0o600 })
+      atomicWriteFileSync(join(gcDir, 'access.json'), JSON.stringify({
+        policy: allowDomain?.trim() ? 'domain' : 'allowlist',
+        owner: owner.trim(),
+        allowFrom: [],
+        allowDomains: allowDomain?.trim() ? [allowDomain.trim()] : [],
+        roles: {},
+        spaces: {},
+        flatReplies: true,
+      }, null, 2))
+      let gcRestarted = false
+      let gcWasRunning = false
+      if (isMain) {
+        const r = hardRestartMarveenChannels()
+        gcRestarted = r.ok
+        gcWasRunning = true
+      } else {
+        writeAgentChannelProvider(name, provider)
+        setAgentEnabledPlugins(name, provider)
+        gcWasRunning = isAgentRunning(name)
+        if (gcWasRunning) {
+          const stopRes = stopAgentProcess(name)
+          if (stopRes.ok) {
+            try { execSync('sleep 2', { timeout: 4000 }) } catch {}
+            gcRestarted = startAgentProcess(name).ok
+          }
+        }
+      }
+      json(res, { ok: true, botName: 'Google Chat', restarted: gcRestarted, wasRunning: gcWasRunning })
+      return true
+    }
+
+    const { botToken, appToken, channelId } = JSON.parse(body.toString()) as { botToken: string; appToken?: string; channelId?: string }
     if (!botToken?.trim()) { json(res, { error: 'botToken is required' }, 400); return true }
+
+    // Discord-specific channelId guard: the dashboard ships the channel where
+    // the bot will post by default; without it the plugin spins up but cannot
+    // resolve a default channel, and on the main Marveen agent the missing
+    // value would still trigger hardRestartMarveenChannels and bounce the
+    // live session for no useful reason. Reject before any state write.
+    if (provider === 'discord') {
+      const cidCheck = validateDiscordChannelId(channelId)
+      if (!cidCheck.ok) { json(res, { error: cidCheck.error }, 400); return true }
+    }
 
     const channelProvider = getProvider(provider)
     const validation = await channelProvider.validateToken(botToken.trim())
     if (!validation.ok) { json(res, { error: validation.error || 'Invalid token' }, 400); return true }
+
+    const dupeOwner = findBotTokenDuplicate(provider, botToken.trim(), name)
+    if (dupeOwner) {
+      json(res, { error: `This bot token is already used by agent "${dupeOwner}". Each agent needs its own bot token to avoid getUpdates conflicts.` }, 409)
+      return true
+    }
 
     if (provider === 'slack' && !isManagedSettingsReady()) {
       const displayName = readAgentDisplayName(name) || name
@@ -519,12 +896,19 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return true
     }
 
-    const stateDir = channelStateDir(provider, agentDir(name))
+    // Main agent's channel state lives under ~/.claude/channels/<provider>,
+    // sub-agents under agents/<name>/.claude/channels/<provider>.
+    const stateDir = isMain ? channelStateDir(provider) : channelStateDir(provider, agentDir(name))
     mkdirSync(stateDir, { recursive: true })
-    const tokenKey = provider === 'slack' ? 'SLACK_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN'
+    const tokenKey = provider === 'slack' ? 'SLACK_BOT_TOKEN'
+      : provider === 'discord' ? 'DISCORD_BOT_TOKEN'
+      : 'TELEGRAM_BOT_TOKEN'
     let envContent = `${tokenKey}=${botToken.trim()}\n`
     if (provider === 'slack' && appToken?.trim()) {
       envContent += `SLACK_APP_TOKEN=${appToken.trim()}\n`
+    }
+    if (provider === 'discord' && channelId?.trim()) {
+      envContent += `DISCORD_CHANNEL_ID=${channelId.trim()}\n`
     }
     atomicWriteFileSync(join(stateDir, '.env'), envContent, { mode: 0o600 })
     atomicWriteFileSync(join(stateDir, 'access.json'), JSON.stringify({
@@ -534,19 +918,28 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       pending: {},
     }, null, 2))
 
-    writeAgentChannelProvider(name, provider)
-    setAgentEnabledPlugins(name, provider)
-
-    if (provider === 'telegram') sendWelcomeMessage(name, botToken.trim()).catch(() => {})
-
-    const wasRunning = isAgentRunning(name)
+    // Main agent doesn't have an agent-config.json or enabled-plugins entry
+    // (the channels session reuses the system claude install), so skip the
+    // sub-agent-specific bookkeeping. Restart goes through the dedicated
+    // marveen-channels helper instead of the agent process lifecycle.
     let restarted = false
-    if (wasRunning) {
-      const stopRes = stopAgentProcess(name)
-      if (stopRes.ok) {
-        try { execSync('sleep 2', { timeout: 4000 }) } catch {}
-        const startRes = startAgentProcess(name)
-        restarted = startRes.ok
+    let wasRunning = false
+    if (isMain) {
+      const r = hardRestartMarveenChannels()
+      restarted = r.ok
+      wasRunning = true
+    } else {
+      writeAgentChannelProvider(name, provider)
+      setAgentEnabledPlugins(name, provider)
+      if (provider === 'telegram') sendWelcomeMessage(name, botToken.trim()).catch(() => {})
+      wasRunning = isAgentRunning(name)
+      if (wasRunning) {
+        const stopRes = stopAgentProcess(name)
+        if (stopRes.ok) {
+          try { execSync('sleep 2', { timeout: 4000 }) } catch {}
+          const startRes = startAgentProcess(name)
+          restarted = startRes.ok
+        }
       }
     }
 
@@ -599,6 +992,43 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     writeAgentSecurityProfile(name, requested)
     writeAgentSettingsFromProfile(name, profile)
     json(res, { ok: true, requiresRestart: isAgentRunning(name) })
+    return true
+  }
+
+  // PUT /api/agents/:name/auto-restart -- set the per-agent auto-restart config.
+  // Accepts the main orchestrator id too (auto-restart applies to it as well).
+  // The body is normalized server-side, so a partial/garbled payload is coerced
+  // to a safe config rather than rejected.
+  const autoRestartMatch = path.match(/^\/api\/agents\/([^/]+)\/auto-restart$/)
+  if (autoRestartMatch && method === 'PUT') {
+    const name = decodeURIComponent(autoRestartMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const body = await readBody(req)
+    let data: unknown
+    try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    setStoreWriteActor('dashboard')
+    const saved = writeAutoRestartConfig(name, data)
+    json(res, { ok: true, autoRestart: saved })
+    return true
+  }
+
+  // PUT /api/agents/:name/remote -- set or clear the remote host + workdir that
+  // makes this agent's tmux session run on another machine over ssh. Empty
+  // strings clear the fields (revert to local). The main agent is always local.
+  const remoteCfgMatch = path.match(/^\/api\/agents\/([^/]+)\/remote$/)
+  if (remoteCfgMatch && method === 'PUT') {
+    const name = decodeURIComponent(remoteCfgMatch[1])
+    if (name === MAIN_AGENT_ID) { json(res, { error: 'Main agent is always local' }, 400); return true }
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const body = await readBody(req)
+    let data: { host?: string; workdir?: string }
+    try { data = JSON.parse(body.toString() || '{}') } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    const result = writeAgentRemoteConfig(name, data.host ?? '', data.workdir ?? '')
+    if (!result.ok) { json(res, { error: result.error }, 400); return true }
+    // Config changed -> drop any cached status so the next poll reflects it.
+    remoteRunStateCache.invalidate(name)
+    remotePaneCache.invalidate(name)
+    json(res, { ok: true, remoteHost: result.remote.host, remoteWorkdir: result.remote.workdir })
     return true
   }
 
@@ -822,10 +1252,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         ? readMarveenTelegramConfig().botUsername
         : readAgentTelegramConfig(name).botUsername
     }
+    const cleanBotName = botName?.replace(/^@/, '')
     const items = listInvites(accessPath).map((inv) => ({
       ...inv,
-      deepLink: provider === 'telegram' && botName
-        ? `https://t.me/${botName}?start=invite-${inv.token}`
+      deepLink: provider === 'telegram' && cleanBotName
+        ? `https://t.me/${cleanBotName}?start=invite-${inv.token}`
         : undefined,
     }))
     json(res, items)
@@ -895,7 +1326,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const chReqListMatch = path.match(/^\/api\/agents\/([^/]+)\/channel-requests$/)
   if (chReqListMatch && method === 'GET') {
     const name = decodeURIComponent(chReqListMatch[1])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     json(res, listPendingChannelRequests(name))
     return true
   }
@@ -904,7 +1335,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (chReqApproveMatch && method === 'POST') {
     const name = decodeURIComponent(chReqApproveMatch[1])
     const reqId = Number(chReqApproveMatch[2])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
 
     const body = await readBody(req)
     let opts: { requireMention?: boolean; allowFromAll?: boolean } = {}
@@ -953,7 +1384,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (chReqDenyMatch && method === 'POST') {
     const name = decodeURIComponent(chReqDenyMatch[1])
     const reqId = Number(chReqDenyMatch[2])
-    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     if (updateChannelRequestStatus(reqId, 'denied')) {
       json(res, { ok: true })
     } else {
@@ -970,13 +1401,14 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     if (!isAgentRunning(name)) { json(res, { error: 'Agent is not running' }, 400); return true }
     const session = agentSessionName(name)
+    const host = readAgentRemoteHost(name)
     try {
-      sendPromptToSession(session, '/login')
+      sendPromptToSession(session, '/login', host)
       // Wait for Claude Code to render the auth URL (typically 3-6s)
       let authUrl: string | null = null
       for (let i = 0; i < 12; i++) {
         execSync('sleep 1', { timeout: 3000 })
-        const pane = capturePane(session)
+        const pane = capturePane(session, host)
         if (!pane) continue
         const urlMatch = pane.match(/https:\/\/console\.anthropic\.com\/[^\s"']+/)
           || pane.match(/https:\/\/auth\.anthropic\.com\/[^\s"']+/)
@@ -1002,7 +1434,15 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (startMatch && method === 'POST') {
     const name = decodeURIComponent(startMatch[1])
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const result = startAgentProcess(name)
+    // Optional { "fresh": true } body -> no `--continue`. Required for channel
+    // agents on Claude Code 2.1.193, where a `--continue` resume does not load
+    // the --channels plugin MCP server (agent comes up deaf).
+    let startFresh = false
+    try { startFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = startAgentProcess(name, { fresh: startFresh })
+    // Record operator intent so the monitor keeps this agent up across shared
+    // tmux-server restarts / reboots (see agent-desired-state.ts).
+    if (result.ok || result.error === 'Agent is already running') addDesiredAgent(name)
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true
@@ -1012,6 +1452,60 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (stopMatch && method === 'POST') {
     const name = decodeURIComponent(stopMatch[1])
     const result = stopAgentProcess(name)
+    // Explicit stop clears intent so the monitor will not resurrect it.
+    removeDesiredAgent(name)
+    if (result.ok) { json(res, { ok: true }); return true }
+    json(res, { error: result.error }, 400)
+    return true
+  }
+
+  // Main-agent inbox PULL (drain-inbox): atomically CLAIM the main agent's
+  // pending inter-agent messages and return them already WRAPPED (single-source
+  // security framing via agent-message-wrap), for the UserPromptSubmit hook to
+  // print into the agent's context. The router skips main-agent tmux delivery,
+  // so this is the SOLE delivery path for the main agent -- which is why it is
+  // restricted to the main agent (serving a sub-agent here would double-deliver
+  // alongside the router's still-active tmux push). Auth is the global /api
+  // bearer gate. One quick claim+wrap per turn (NOT a hot loop -> not the #498
+  // self-HTTP event-loop hazard).
+  const drainMatch = path.match(/^\/api\/agents\/([^/]+)\/drain-inbox$/)
+  if (drainMatch && method === 'POST') {
+    const name = decodeURIComponent(drainMatch[1])
+    if (name !== MAIN_AGENT_ID) {
+      json(res, { error: 'drain-inbox is main-agent only (sub-agents use the router push path)' }, 400)
+      return true
+    }
+    const claimed = claimPendingForAgent(name, INBOX_DRAIN_CAP)
+    const blocks: string[] = []
+    for (const msg of claimed) {
+      const cls = classifyAgentMessage(msg.from_agent, msg.to_agent)
+      if (!cls) continue // empty/invalid from_agent -> cannot frame safely; drop
+      const { prefix, wrapped } = wrapAgentMessageForDelivery(cls.category, cls.safeFrom, msg.from_agent, msg.content, msg.id)
+      blocks.push(prefix + wrapped)
+    }
+    json(res, { count: blocks.length, text: blocks.join('\n\n') })
+    return true
+  }
+
+  const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/)
+  if (restartMatch && method === 'POST') {
+    const name = decodeURIComponent(restartMatch[1])
+    // The main agent runs in the systemd/launchd-managed `<id>-channels` session,
+    // not the `agent-<name>` template. Restart it through the channels helper --
+    // the agent-process path would spawn a rogue duplicate session and fire
+    // `/remote-control` (needs a full-scope login token the agent lacks). Mirror
+    // the precedent in the channels-config handler above. Sub-agents unchanged.
+    if (isMainChannelsAgent(name)) {
+      const r = hardRestartMarveenChannels()
+      if (r.ok) { json(res, { ok: true }); return true }
+      json(res, { error: r.error || 'Restart failed' }, 500)
+      return true
+    }
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    // Optional { "fresh": true } body -> no `--continue` (see /start note).
+    let restartFresh = false
+    try { restartFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = restartAgentProcess(name, { fresh: restartFresh })
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true
@@ -1040,7 +1534,17 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const configRoot = agentConfigRoot(name)
     const data = JSON.parse(body.toString()) as {
       claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string
-      authMode?: AuthMode; apiKey?: string
+      authMode?: AuthMode; apiKey?: string; memoryIsolation?: boolean
+    }
+    if (data.memoryIsolation !== undefined) {
+      // The main agent's cwd IS the install repo root, which is already a git
+      // root: a memory boundary there is meaningless, and exposing the knob
+      // for it would invite the classic main-agent footgun. Sub-agents only.
+      if (isMainChannelsAgent(name)) {
+        json(res, { error: 'memoryIsolation is not applicable to the main agent' }, 400)
+        return true
+      }
+      writeAgentMemoryIsolation(name, data.memoryIsolation === true)
     }
     if (data.claudeMd !== undefined) atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
@@ -1066,6 +1570,36 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     rmSync(dir, { recursive: true, force: true })
     cleanupTeamReferences(name)
     json(res, { ok: true })
+    return true
+  }
+
+  // GET /api/agents/:name/voice-config
+  const voiceConfigMatch = path.match(/^\/api\/agents\/([^/]+)\/voice-config$/)
+  if (voiceConfigMatch && method === 'GET') {
+    const name = decodeURIComponent(voiceConfigMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    json(res, { ...readAgentVoiceConfig(name), availableVoices: Array.from(KNOWN_VOICE_MODELS) })
+    return true
+  }
+
+  // PUT /api/agents/:name/voice-config
+  // Body: { responseMode?: 'text'|'voice'|'auto', voiceModel?: string }
+  if (voiceConfigMatch && method === 'PUT') {
+    const name = decodeURIComponent(voiceConfigMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const body = await readBody(req)
+    let data: { responseMode?: string; voiceModel?: string }
+    try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    try {
+      writeAgentVoiceConfig(name, {
+        responseMode: data.responseMode as 'text' | 'voice' | 'auto' | undefined,
+        voiceModel: data.voiceModel,
+      })
+    } catch (err: unknown) {
+      json(res, { error: err instanceof Error ? err.message : 'invalid config' }, 400)
+      return true
+    }
+    json(res, { ok: true, ...readAgentVoiceConfig(name) })
     return true
   }
 

@@ -1,17 +1,97 @@
+// === i18n runtime ===
+// Priority: localStorage['marveen.lang'] > DASHBOARD_LANG (server default, read
+// from /api/settings on init) > 'hu' (hardcoded fallback).
+// Rick's spec (kanban card 209696a9): t(key,params), window._i18n={hu,en},
+// window._lang; {name} interpolation; EN-fallback then key; dev-mode warning.
+;(() => {
+  const LS_KEY = 'marveen.lang'
+  const VALID = new Set(['hu', 'en'])
+
+  // Brand tokens ({brand} = product/brand name, {bot} = main agent display
+  // name, {agentId} = canonical slug) are filled from /api/marveen once it
+  // resolves (see initSidebarBrand). Until then these defaults keep a stock
+  // install byte-identical. Explicit params passed to t() still win over them.
+  window._brandTokens = window._brandTokens || { brand: 'Marveen', bot: 'Marveen', agentId: 'marveen' }
+
+  window.t = function t(key, params = {}) {
+    const lang = window._lang || 'hu'
+    const str =
+      window._i18n?.[lang]?.[key] ??
+      window._i18n?.['en']?.[key] ??
+      key
+    if (str === key && localStorage.getItem('marveen.dev') === '1') {
+      console.warn('[i18n] missing key:', key)
+    }
+    const vals = { ...window._brandTokens, ...params }
+    return str.replace(/\{(\w+)\}/g, (_, k) => (vals[k] != null ? vals[k] : `{${k}}`))
+  }
+
+  function applyLang(lang) {
+    window._lang = VALID.has(lang) ? lang : 'hu'
+  }
+
+  // Initialise from localStorage; server default fetched async below.
+  applyLang(localStorage.getItem(LS_KEY) || 'hu')
+
+  // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not set.
+  fetch('/api/settings')
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if (!data || localStorage.getItem(LS_KEY)) return
+      const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
+      if (entry && VALID.has(entry.value)) applyLang(entry.value)
+    })
+    .catch(() => {})
+
+  window.setLang = function setLang(lang) {
+    if (!VALID.has(lang)) return
+    window._lang = lang
+    localStorage.setItem(LS_KEY, lang)
+    renderNav()
+    // Static elements (kanban column titles, hints, empty states) are otherwise
+    // only translated at DOMContentLoaded -- re-apply them on every switch so the
+    // currently-open page updates live, not just after a manual reload.
+    if (typeof renderStaticI18n === 'function') renderStaticI18n()
+    // Re-render the active page by re-triggering the switchPage handler.
+    const activeLink = document.querySelector('.sb-link.active[data-page]')
+    if (activeLink) {
+      const pageId = activeLink.dataset.page
+      if (typeof switchPage === 'function') switchPage(pageId)
+    }
+  }
+})()
+
 // === Dashboard auth bootstrap ===
 // The server prints an URL like http://127.0.0.1:3420/?token=XXX on startup.
 // On first visit we pluck the token out of the URL, store it in localStorage,
 // strip it from the visible URL, and then inject it into every /api/* fetch
 // as a Bearer header so the server lets us through.
+
+// The main (channels) agent's real id. The backend /api/marveen route returns
+// the configured MAIN_AGENT_ID (NOT the literal "marveen") in window._marveen;
+// use this everywhere an agent id is sent to /api/agents/... or compared to a
+// fleet name, so the dashboard works on non-"marveen" installs. Falls back to
+// "marveen" only before /api/marveen has resolved (or on a legacy backend).
+function mainAgentId() {
+  return window._marveen?.agentId || 'marveen'
+}
+
 (() => {
   const TOKEN_KEY = 'marveen-dashboard-token'
   const urlParams = new URLSearchParams(window.location.search)
   const urlToken = urlParams.get('token')
+  // Keep the token in memory for the whole session in addition to localStorage.
+  // Some iOS/Safari privacy modes purge or block localStorage (especially over
+  // plain http / non-primary origins); an in-memory copy keeps the session
+  // authenticated even when the persisted copy is unavailable.
+  let sessionToken = urlToken || ''
   if (urlToken) {
-    localStorage.setItem(TOKEN_KEY, urlToken)
+    try { localStorage.setItem(TOKEN_KEY, urlToken) } catch { /* storage blocked */ }
     urlParams.delete('token')
     const clean = window.location.pathname + (urlParams.toString() ? '?' + urlParams : '') + window.location.hash
     window.history.replaceState({}, '', clean)
+  } else {
+    try { sessionToken = localStorage.getItem(TOKEN_KEY) || '' } catch { /* storage blocked */ }
   }
 
   const originalFetch = window.fetch.bind(window)
@@ -23,7 +103,8 @@
       url.startsWith('/api/') ||
       (url.startsWith(window.location.origin + '/api/'))
     if (isSameOriginApi) {
-      const token = localStorage.getItem(TOKEN_KEY)
+      let token = sessionToken
+      if (!token) { try { token = localStorage.getItem(TOKEN_KEY) } catch { token = '' } }
       if (token) {
         init = init || {}
         const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined))
@@ -34,16 +115,98 @@
     const res = await originalFetch(input, init)
     if (res.status === 401 && isSameOriginApi) {
       // Token missing, wrong, or revoked. Wipe and prompt once per page load.
-      localStorage.removeItem(TOKEN_KEY)
+      // Keep a URL-provided session token so a transient 401 does not lock out
+      // a session whose localStorage copy was purged.
+      try { localStorage.removeItem(TOKEN_KEY) } catch { /* storage blocked */ }
+      if (!urlToken) sessionToken = ''
       if (!window.__marveenAuthPrompted) {
         window.__marveenAuthPrompted = true
-        alert(
-          'Dashboard authentication failed. Check the server log for the access URL ' +
-          '(look for "Dashboard access URL" with ?token=...), then reopen it in your browser.'
-        )
+        // An installed (home-screen) PWA has its own localStorage, separate from
+        // Safari's, and the manifest start_url has no ?token=, so the very first
+        // standalone launch is token-less and 401s. There is no address bar to
+        // paste a ?token= URL into either. Offer an in-app paste field that
+        // writes the token to the app's own storage, then reload.
+        const isStandalone = window.navigator.standalone === true ||
+          (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+        if (isStandalone) {
+          showStandaloneTokenPrompt(TOKEN_KEY)
+        } else {
+          alert(
+            'Dashboard authentication failed. Check the server log for the access URL ' +
+            '(look for "Dashboard access URL" with ?token=...), then reopen it in your browser.'
+          )
+        }
       }
     }
     return res
+  }
+
+  // Full-screen, one-time token paste for installed PWAs (see the 401 handler).
+  // The user pastes the access token (the value after ?token= in the server's
+  // startup URL, or from the dashboard Settings / mobile-login QR); it is saved
+  // to this app instance's localStorage and the page reloads authenticated.
+  function showStandaloneTokenPrompt(tokenKey) {
+    if (document.getElementById('mv-token-overlay')) return
+    // Lang files are not yet loaded here; use a local inline lookup so EN mode works.
+    const _lang = localStorage.getItem('marveen.lang') || 'hu'
+    const _pwa = {
+      hu: {
+        title: 'Hozzáférés szükséges',
+        desc: 'A home-screen app saját tárhelye még üres. Illeszd be a dashboard access tokent (a szerver indítási URL-jében a ?token= utáni rész, vagy a Beállítások / mobil-login QR), és elmentődik ehhez az apphoz.',
+        btn: 'Mentés és újratöltés',
+        empty_token: 'Üres token.'
+      },
+      en: {
+        title: 'Access Required',
+        desc: "The home-screen app's own storage is empty. Paste the dashboard access token (the part after ?token= in the server startup URL, or from Settings / mobile-login QR), and it will be saved for this app.",
+        btn: 'Save & Reload',
+        empty_token: 'Empty token.'
+      }
+    }
+    const _p = _pwa[_lang] || _pwa.hu
+    const overlay = document.createElement('div')
+    overlay.id = 'mv-token-overlay'
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#1a1917;color:#faf9f5;' +
+      'display:flex;align-items:center;justify-content:center;padding:24px;' +
+      'font-family:system-ui,-apple-system,sans-serif'
+    overlay.innerHTML =
+      '<div style="max-width:420px;width:100%;display:flex;flex-direction:column;gap:14px">' +
+        '<h2 style="margin:0;font-size:18px;text-align:center">' + _p.title + '</h2>' +
+        '<p style="margin:0;font-size:14px;opacity:0.8;line-height:1.5;text-align:center">' +
+          _p.desc + '</p>' +
+        '<textarea id="mv-token-input" rows="3" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
+          'style="width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #555;' +
+          'background:#0f0e0d;color:#faf9f5;font-size:14px;font-family:monospace" placeholder="token..."></textarea>' +
+        '<button id="mv-token-save" style="padding:12px;border:0;border-radius:8px;background:#10b981;' +
+          'color:#fff;font-size:15px;font-weight:600">' + _p.btn + '</button>' +
+        '<div id="mv-token-err" style="color:#f87171;font-size:13px;min-height:16px;text-align:center"></div>' +
+      '</div>'
+    document.body.appendChild(overlay)
+    const input = overlay.querySelector('#mv-token-input')
+    const errEl = overlay.querySelector('#mv-token-err')
+    const submit = () => {
+      const raw = (input.value || '').trim()
+      if (!raw) { errEl.textContent = _p.empty_token; return }
+      // Accept either a bare token or the whole startup URL (the user often
+      // pastes the full https://host/?token=... link). Pull just the token out.
+      let token = raw
+      if (raw.includes('token=')) {
+        let extracted = null
+        try { extracted = new URL(raw).searchParams.get('token') } catch { /* not a full URL */ }
+        if (!extracted) {
+          // covers ?token=, &token=, and the hash form (/#...?token=...)
+          const m = raw.match(/[?&#]token=([^&#\s]+)/)
+          if (m) extracted = m[1]
+        }
+        if (extracted) { try { token = decodeURIComponent(extracted) } catch { token = extracted } }
+      }
+      token = token.trim()
+      if (!token) { errEl.textContent = _p.empty_token; return }
+      localStorage.setItem(tokenKey, token)
+      window.location.reload()
+    }
+    overlay.querySelector('#mv-token-save').addEventListener('click', submit)
+    setTimeout(() => input.focus(), 50)
   }
 })()
 
@@ -62,37 +225,381 @@ themeToggle.addEventListener('click', () => {
   localStorage.setItem('cc-theme', next)
 })
 
+// === Language toggle ===
+;(() => {
+  const btn = document.getElementById('langToggle')
+  if (!btn) return
+  function syncLangBtn() {
+    btn.textContent = (window._lang || 'hu').toUpperCase()
+  }
+  syncLangBtn()
+  btn.addEventListener('click', () => {
+    const next = (window._lang || 'hu') === 'hu' ? 'en' : 'hu'
+    window.setLang(next)
+    syncLangBtn()
+  })
+  // Keep button in sync when setLang is called from elsewhere (e.g. /api/settings async load).
+  const _origSetLang = window.setLang
+  window.setLang = function setLang(lang) {
+    _origSetLang(lang)
+    syncLangBtn()
+  }
+})()
+
 // === Page switching ===
 const navLinks = document.querySelectorAll('.sb-link[data-page], .nav-link[data-page]')
 const pages = document.querySelectorAll('.page')
 
+function confirmSettingsLeave() {
+  if (settingsDirty.size === 0) return true
+  return window.confirm(t('settings.unsaved_warning'))
+}
+
 function switchPage(pageId) {
+  // Guard unsaved settings before leaving the settings page
+  if (!document.getElementById('settingsPage').hidden && pageId !== 'settings' && !confirmSettingsLeave()) return
   pages.forEach((p) => (p.hidden = p.id !== pageId + 'Page'))
   navLinks.forEach((l) => l.classList.toggle('active', l.dataset.page === pageId))
+  // Kanban needs full-width layout (overrides main's max-width: 1200px)
+  document.querySelector('main').classList.toggle('kanban-active', pageId === 'kanban')
+  // Activity page runs a live poll; stop it whenever we navigate away.
+  if (pageId !== 'activity') stopActivityPoll()
+  if (pageId === 'activity') startActivityPoll()
+  // Kanban auto-refresh: start on enter, stop on leave.
+  if (pageId !== 'kanban') stopKanbanRefresh()
   if (pageId === 'overview') loadOverview()
-  if (pageId === 'kanban') loadKanban()
+  if (pageId === 'kanban') { if (typeof _initGanttViewSwitcher === 'function') _initGanttViewSwitcher(); loadKanban(); startKanbanRefresh() }
   if (pageId === 'tasks') loadSchedules()
   if (pageId === 'agents') loadAgents()
   if (pageId === 'memories') { loadMemAgents(); loadMemStats(); loadMemories() }
   if (pageId === 'skills') loadGlobalSkills()
   if (pageId === 'connectors') loadConnectors()
   if (pageId === 'migrate') loadMigrateAgents()
+  if (pageId === 'docs') loadDocs()
   if (pageId === 'status') loadStatus()
   if (pageId === 'recall') loadRecallPage()
   if (pageId === 'bgTasks') loadBgTasksPage()
   if (pageId === 'vault') loadVaultPage()
   if (pageId === 'autonomy') loadAutonomy()
+  if (pageId === 'settings') loadSettings()
   if (pageId === 'updates') loadUpdates()
-  if (pageId === 'team') loadTeamGraph()
+  if (pageId === 'team') { loadTeamGraph() }
+  if (pageId === 'messages') loadMessagesPage()
   if (pageId === 'tokenUsage') loadTokenUsage()
+  if (pageId === 'ideas') loadIdeasPage()
+  if (pageId === 'archived') loadArchivedPage()
+  if (pageId === 'naplo') loadNaplo()
 }
+
+// Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
+// hamburger/backdrop are display:none there); on narrow screens it slides the
+// sidebar in over a backdrop.
+const sidebarEl = document.querySelector('.sidebar')
+const sidebarBackdrop = document.getElementById('sidebarBackdrop')
+const mobileMenuBtn = document.getElementById('mobileMenuBtn')
+function setSidebarOpen(open) {
+  if (sidebarEl) sidebarEl.classList.toggle('open', open)
+  if (sidebarBackdrop) sidebarBackdrop.classList.toggle('open', open)
+  if (mobileMenuBtn) mobileMenuBtn.setAttribute('aria-expanded', open ? 'true' : 'false')
+}
+if (mobileMenuBtn) mobileMenuBtn.addEventListener('click', () => setSidebarOpen(!sidebarEl.classList.contains('open')))
+if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setSidebarOpen(false))
 
 navLinks.forEach((link) => {
   link.addEventListener('click', (e) => {
     e.preventDefault()
-    switchPage(link.dataset.page)
+    const pageId = link.dataset.page
+    // Same hash won't fire 'hashchange', so re-render manually; otherwise let the
+    // hashchange listener drive switchPage so the URL stays the single source of truth.
+    if (location.hash.slice(1) === pageId) switchPage(pageId)
+    else location.hash = pageId
+    setSidebarOpen(false) // close the drawer after navigating on mobile
   })
 })
+
+
+// ============================================================
+// === i18n nav + static element rendering ===
+// ============================================================
+
+// Map: data-page value -> nav i18n key.
+const NAV_I18N = {
+  overview: 'nav.overview', kanban: 'nav.kanban', archived: 'nav.archived',
+  agents: 'nav.agents', activity: 'nav.activity', team: 'nav.team',
+  messages: 'nav.messages', tasks: 'nav.tasks', memories: 'nav.memories',
+  recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks',
+  skills: 'nav.skills', connectors: 'nav.connectors', migrate: 'nav.migrate',
+  docs: 'nav.docs', status: 'nav.status', autonomy: 'nav.autonomy',
+  settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
+  ideas: 'nav.ideas', updates: 'nav.updates',
+}
+
+function renderNav() {
+  document.querySelectorAll('.sb-link[data-page] .sb-label').forEach((span) => {
+    const page = span.closest('[data-page]')?.dataset?.page
+    if (page && NAV_I18N[page]) span.textContent = t(NAV_I18N[page])
+  })
+}
+
+// Map: element ID -> i18n key, for static HTML elements not handled by page render fns.
+const STATIC_I18N_MAP = {
+  // Kanban column headers
+  'countPlanned':   null,  // dynamic count, skip
+  // Overview
+  'overviewTeamMeta': 'overview.card.team_meta',
+  // Docs
+  'docsContent': null,  // rendered by JS
+}
+
+// Simpler approach: update known static text nodes directly by selector.
+// Page id -> { title key, subtitle key (or null) }
+const PAGE_HEADER_I18N = {
+  agentsPage:     { title: 'agents.page_title',     sub: 'agents.page_subtitle' },
+  activityPage:   { title: 'activity.page_title',   sub: 'activity.page_subtitle' },
+  tasksPage:      { title: 'tasks.page_title',       sub: 'tasks.page_subtitle' },
+  skillsPage:     { title: 'skills.page_title',      sub: 'skills.page_subtitle' },
+  memoriesPage:   { title: 'memories.page_title',    sub: 'memories.page_subtitle' },
+  recallPage:     { title: 'recall.page_title',      sub: 'recall.page_subtitle' },
+  bgTasksPage:    { title: 'bgTasks.page_title',     sub: 'bgTasks.page_subtitle' },
+  connectorsPage: { title: 'connectors.page_title',  sub: 'connectors.page_subtitle' },
+  migratePage:    { title: 'migrate.page_title',     sub: 'migrate.page_subtitle' },
+  docsPage:       { title: 'docs.page_title',        sub: 'docs.page_subtitle' },
+  statusPage:     { title: 'status.page_title',      sub: 'status.page_subtitle' },
+  teamPage:       { title: 'team.page_title',        sub: 'team.page_subtitle' },
+  messagesPage:   { title: 'messages.page_title',    sub: 'messages.page_subtitle' },
+  autonomyPage:   { title: 'autonomy.page_title',    sub: 'autonomy.page_subtitle' },
+  settingsPage:   { title: 'settings.page_title',    sub: 'settings.page_subtitle' },
+  ideasPage:      { title: 'ideas.page_title',       sub: 'ideas.page_subtitle' },
+  vaultPage:      { title: 'vault.page_title',       sub: 'vault.page_subtitle' },
+  tokenUsagePage: { title: 'tokenUsage.page_title',  sub: 'tokenUsage.page_subtitle' },
+  updatesPage:    { title: 'updates.page_title',     sub: null },
+  naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
+}
+
+function renderStaticI18n() {
+  // Page headers + subtitles
+  for (const [pageId, keys] of Object.entries(PAGE_HEADER_I18N)) {
+    const pageEl = document.getElementById(pageId)
+    if (!pageEl) continue
+    const h1 = pageEl.querySelector('.page-header h1')
+    if (h1 && keys.title) h1.textContent = t(keys.title)
+    const sub = pageEl.querySelector('.page-header .subtitle')
+    if (sub && keys.sub) sub.textContent = t(keys.sub)
+  }
+  // Kanban column titles
+  const colTitles = document.querySelectorAll('.kanban-col-title')
+  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.testing', 'kanban.col.done']
+  const statuses = ['planned', 'in_progress', 'waiting', 'testing', 'done']
+  colTitles.forEach((el) => {
+    const status = el.closest('[data-status]')?.dataset?.status
+    if (status) {
+      const idx = statuses.indexOf(status)
+      if (idx !== -1) el.textContent = t(statusKeys[idx])
+    }
+  })
+  // Docs hints
+  const docsHint = document.getElementById('docsContent')
+  if (docsHint && docsHint.querySelector('p.muted')) {
+    docsHint.querySelector('p.muted').textContent = t('docs.select_hint')
+  }
+  // Messages empty state
+  const chatEmpty = document.querySelector('.chat-thread-empty p')
+  if (chatEmpty) chatEmpty.textContent = t('messages.select_agent')
+  // Team hint
+  const teamHint = document.querySelector('#teamPage > p')
+  if (teamHint) teamHint.textContent = t('team.hint')
+
+  // Overview stat labels (siblings of statAgents, statTasks, statMemories, statSkills)
+  const statLabelKeys = ['overview.stat.agents', 'overview.stat.tasks', 'overview.stat.memories', 'overview.stat.skills']
+  const statValueIds = ['statAgents', 'statTasks', 'statMemories', 'statSkills']
+  statValueIds.forEach((id, i) => {
+    const valEl = document.getElementById(id)
+    if (valEl) {
+      const labelEl = valEl.parentElement?.querySelector('.overview-stat-label')
+      if (labelEl) labelEl.textContent = t(statLabelKeys[i])
+    }
+  })
+
+  // Overview card headers
+  const overviewTeamH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(1) h3')
+  if (overviewTeamH3) overviewTeamH3.textContent = t('overview.card.team')
+  const overviewTeamMeta = document.getElementById('overviewTeamMeta')
+  if (overviewTeamMeta) overviewTeamMeta.textContent = t('overview.meta.live')
+  const overviewActivityH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(2) h3')
+  if (overviewActivityH3) overviewActivityH3.textContent = t('overview.card.activity')
+  const overviewAgentH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) h3')
+  if (overviewAgentH3) overviewAgentH3.textContent = t('overview.card.agent_activity')
+  const overviewAgentMeta = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) .overview-card-meta')
+  if (overviewAgentMeta) overviewAgentMeta.textContent = t('overview.meta.messages')
+
+  // Kanban filter labels
+  const kanbanProjectLabel = document.querySelector('label[for="kanbanProjectFilter"]')
+  if (kanbanProjectLabel) kanbanProjectLabel.textContent = t('kanban.filter.project_label')
+  const kanbanGroupLabel = document.querySelector('label[for="kanbanGroupBy"]')
+  if (kanbanGroupLabel) kanbanGroupLabel.textContent = t('kanban.filter.group_label')
+
+  // Kanban project filter "Mind" option (first option)
+  const kanbanProjectFilter = document.getElementById('kanbanProjectFilter')
+  if (kanbanProjectFilter?.options[0]) kanbanProjectFilter.options[0].text = t('kanban.filter.all_projects')
+
+  // Kanban group-by options
+  const kanbanGroupBy = document.getElementById('kanbanGroupBy')
+  if (kanbanGroupBy) {
+    const opts = kanbanGroupBy.options
+    if (opts[0]) opts[0].text = t('kanban.filter.group_none')
+    if (opts[1]) opts[1].text = t('kanban.filter.group_assignee')
+    if (opts[2]) opts[2].text = t('kanban.filter.group_priority')
+  }
+
+  // Generic data-i18n sweep for static HTML elements
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const val = t(el.dataset.i18n)
+    if (el.children.length === 0) {
+      el.textContent = val
+    } else {
+      const nodes = [...el.childNodes]
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        if (nodes[i].nodeType === 3 && nodes[i].textContent.trim()) {
+          nodes[i].textContent = ' ' + val
+          break
+        }
+      }
+    }
+  })
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    el.placeholder = t(el.dataset.i18nPlaceholder)
+  })
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    el.title = t(el.dataset.i18nTitle)
+  })
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(el => {
+    el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel))
+  })
+  // Elements whose translation contains inline markup (strong/code/a): set innerHTML.
+  document.querySelectorAll('[data-i18n-html]').forEach(el => {
+    el.innerHTML = t(el.dataset.i18nHtml)
+  })
+}
+
+// Initial render on page load.
+document.addEventListener('DOMContentLoaded', () => {
+  renderNav()
+  renderStaticI18n()
+}, { once: true })
+// Fallback if DOMContentLoaded already fired (scripts deferred).
+if (document.readyState !== 'loading') {
+  renderNav()
+  renderStaticI18n()
+}
+
+// ============================================================
+// === Activity (live agent status) ===
+// ============================================================
+
+let activityTimer = null
+
+const ACTIVITY_STATE_META = {
+  working: { label: () => t('activity.state.working'), cls: 'act-working', tip: 'Élő állapot (a tmux pane tartalmából, 3 másodpercenként): éppen dolgozik / gondolkodik.' },
+  idle: { label: () => t('activity.state.idle'), cls: 'act-idle', tip: 'Élő állapot (3 másodpercenként): fut, de épp nem csinál semmit.' },
+  unknown: { label: () => t('activity.state.unknown'), cls: 'act-unknown', tip: 'Élő állapot: nem sikerült megállapítani a session pane tartalmából.' },
+  error: { label: () => t('activity.state.error'), cls: 'act-error', tip: 'Élő állapot: hiba látszik az ágens session paneljén.' },
+  stopped: { label: () => t('activity.state.stopped'), cls: 'act-stopped', tip: 'Élő állapot: az ágens session nem fut.' },
+}
+
+// === Kanban auto-refresh ===
+let kanbanRefreshTimer = null
+
+function startKanbanRefresh() {
+  if (kanbanRefreshTimer) clearInterval(kanbanRefreshTimer)
+  kanbanRefreshTimer = setInterval(loadKanban, 30000)
+}
+
+function stopKanbanRefresh() {
+  if (kanbanRefreshTimer) {
+    clearInterval(kanbanRefreshTimer)
+    kanbanRefreshTimer = null
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopKanbanRefresh()
+  } else if (!document.getElementById('kanbanPage').hidden) {
+    loadKanban()
+    startKanbanRefresh()
+  }
+})
+
+function startActivityPoll() {
+  loadActivity()
+  if (activityTimer) clearInterval(activityTimer)
+  activityTimer = setInterval(loadActivity, 3000)
+}
+
+function stopActivityPoll() {
+  if (activityTimer) {
+    clearInterval(activityTimer)
+    activityTimer = null
+  }
+}
+
+async function loadActivity() {
+  try {
+    const res = await fetch('/api/agents/activity')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const entries = await res.json()
+    renderActivity(entries)
+    const upd = document.getElementById('activityUpdated')
+    if (upd) upd.textContent = t('activity.updated', { time: new Date().toLocaleTimeString('hu-HU') })
+  } catch (e) {
+    const list = document.getElementById('activityList')
+    if (list) list.innerHTML = '<p class="activity-empty">' + t('activity.error_load') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
+  }
+}
+
+function renderActivity(entries) {
+  const list = document.getElementById('activityList')
+  if (!list) return
+  if (!Array.isArray(entries) || entries.length === 0) {
+    list.innerHTML = '<p class="activity-empty">' + t('activity.empty') + '</p>'
+    return
+  }
+  list.innerHTML = entries.map((a) => {
+    const metaRaw = ACTIVITY_STATE_META[a.state] || ACTIVITY_STATE_META.unknown
+    const meta = { ...metaRaw, label: typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label }
+    const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
+    const mainBadge = a.isMain ? '<span class="act-main-badge">' + t('activity.badge.main') + '</span>' : ''
+    const canOpen = !!a.running
+    const termIcon = canOpen
+      ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="' + t('activity.tooltip.terminal') + '"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+      : ''
+    return (
+      '<div class="activity-card ' + meta.cls + (canOpen ? ' act-clickable' : '') + '" data-agent="' + escapeHtml(a.name) + '">' +
+        '<div class="activity-card-head">' +
+          '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
+          '<span style="display:flex;align-items:center;gap:8px">' +
+            termIcon +
+            '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + meta.label + '</span>' +
+          '</span>' +
+        '</div>' +
+        (tail
+          ? '<pre class="activity-tail">' + tail + '</pre>'
+          : '<p class="activity-tail-empty">' + (a.running ? 'nincs friss kimenet' : 'a session nem fut') + '</p>') +
+      '</div>'
+    )
+  }).join('')
+}
+
+// Event delegation: clicking a running activity-card opens the terminal modal
+;(() => {
+  const actList = document.getElementById('activityList')
+  if (actList) {
+    actList.addEventListener('click', (e) => {
+      const card = e.target.closest('.activity-card.act-clickable[data-agent]')
+      if (card) openTerminalModal(card.dataset.agent)
+    })
+  }
+})()
 
 
 // ============================================================
@@ -102,13 +609,42 @@ navLinks.forEach((link) => {
 let kanbanCards = []
 let kanbanAssignees = []
 let kanbanProjects = []
+// Label registry (id/name/color), independent of which cards currently carry
+// which labels -- card.labels (embedded by GET /api/kanban) holds that link.
+let kanbanAllLabels = []
+// Active label-filter ids -- the quick-filter chip row AND the per-card
+// footer label pills both toggle this same set (two entry points, one
+// filter dimension). OR-combined within itself (any active label matches),
+// AND-combined with the existing project/assignee filters. Persisted in
+// localStorage alongside the swimlane groupBy choice.
+let kanbanLabelFilter = new Set()
 let kanbanProjectFilter = ''
+// Assignee filter for the kanban board. '' = show all. Set via the
+// assignee dropdown / "Csak Gábor" toggle injected by setupAssigneeFilter().
+// Matched case-insensitively against card.assignee so a casing mismatch
+// (e.g. card "gorcsevivan" vs list "GorcsevIvan") still filters correctly.
+let kanbanAssigneeFilter = ''
+// Swimlane grouping: 'none' (flat board, default) | 'assignee' | 'priority'.
+// The initial value is pulled from window._marveen.kanbanSwimlanes.defaultGroup
+// the first time loadKanban() runs (see kanbanGroupByInitialized below), then
+// fully user-controlled via the toolbar dropdown.
+let kanbanGroupBy = 'none'
+let kanbanGroupByInitialized = false
+// Which swimlane keys (assignee name or priority value) are collapsed. Lives
+// for the page session only -- intentionally not persisted across reloads.
+const kanbanCollapsedLanes = new Set()
+// Set of status column keys that are hidden from the board view.
+// Empty = all columns visible. Persisted in localStorage.
+let kanbanHiddenColumns = new Set()
 
 const cardModalOverlay = document.getElementById('cardModalOverlay')
 const cardDetailOverlay = document.getElementById('cardDetailOverlay')
 const breakdownOverlay = document.getElementById('breakdownOverlay')
 let breakdownCardId = null
 let breakdownSubtasks = []
+// Breakdown modal is shared between kanban-card breakdown and idea promote.
+let breakdownMode = 'kanban' // 'kanban' | 'idea'
+let breakdownIdeaId = null
 const columns = document.querySelectorAll('.kanban-col-body')
 
 // Modal wiring
@@ -124,21 +660,66 @@ document.querySelectorAll('.kanban-add-btn').forEach((btn) => {
 
 async function loadKanban() {
   try {
-    const [cardsRes, assigneesRes, projectsRes] = await Promise.all([
+    // Always refresh the marveen config so values changed on the Settings page
+    // (e.g. WIP limits) show up on the board on the next Kanban open, without a
+    // hard reload. The full /api/marveen payload includes kanbanAging, kanbanWip,
+    // kanbanSwimlanes and kanbanLabels, so the labels (from the labels feature)
+    // stay populated too. Also covers opening the Kanban page first, before the
+    // Agents page populated window._marveen.
+    try {
+      const mr = await fetch('/api/marveen')
+      if (mr.ok) window._marveen = { ...(window._marveen || {}), ...(await mr.json()) }
+    } catch { /* ignore -- aging/WIP/swimlanes/labels just won't render until _marveen loads */ }
+    if (!kanbanGroupByInitialized) {
+      kanbanGroupByInitialized = true
+      // A user's own past choice (saved to localStorage) wins over the
+      // server-configured default, so switching the grouping sticks across
+      // page reloads instead of resetting every time.
+      const stored = localStorage.getItem('marveen.kanbanGroupBy')
+      const defaultGroup = window._marveen?.kanbanSwimlanes?.defaultGroup
+      const initialGroup = (stored === 'assignee' || stored === 'priority' || stored === 'none')
+        ? stored
+        : (defaultGroup === 'assignee' || defaultGroup === 'priority' ? defaultGroup : 'none')
+      if (initialGroup !== 'none') {
+        kanbanGroupBy = initialGroup
+        const sel = document.getElementById('kanbanGroupBy')
+        if (sel) sel.value = initialGroup
+      }
+      // Active label-filter selection, restored the same way as the groupBy
+      // choice -- a fresh page load should not lose the filters set up.
+      try {
+        const storedLabels = JSON.parse(localStorage.getItem('marveen.kanbanLabelFilter') || '[]')
+        if (Array.isArray(storedLabels)) kanbanLabelFilter = new Set(storedLabels)
+      } catch { /* ignore malformed storage */ }
+      try {
+        const storedHiddenCols = JSON.parse(localStorage.getItem('marveen.kanbanHiddenColumns') || '[]')
+        if (Array.isArray(storedHiddenCols)) kanbanHiddenColumns = new Set(storedHiddenCols)
+      } catch { /* ignore malformed storage */ }
+    }
+    const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
       fetch('/api/kanban/assignees'),
       fetch('/api/kanban-projects'),
+      fetch('/api/kanban/labels'),
     ])
     kanbanCards = await cardsRes.json()
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
+    kanbanAllLabels = await labelsRes.json()
     populateProjectFilter()
     populateProjectSuggestions()
+    setupAssigneeFilter()
     renderKanban()
   } catch (err) {
     console.error('Kanban betöltés hiba:', err)
   }
 }
+
+document.getElementById('kanbanGroupBy').addEventListener('change', (e) => {
+  kanbanGroupBy = e.target.value
+  localStorage.setItem('marveen.kanbanGroupBy', kanbanGroupBy)
+  renderKanban()
+})
 
 function populateProjectFilter() {
   const sel = document.getElementById('kanbanProjectFilter')
@@ -152,6 +733,27 @@ function populateProjectFilter() {
     sel.appendChild(opt)
   }
   if (prev && !kanbanProjects.includes(prev)) kanbanProjectFilter = ''
+}
+
+function renderKanbanColumnChips() {
+  const container = document.getElementById('kanbanColumnChips')
+  if (!container) return
+  container.innerHTML = ''
+  for (const def of KANBAN_STATUS_DEFS) {
+    const hidden = kanbanHiddenColumns.has(def.status)
+    const label = typeof def.title === 'function' ? def.title() : def.title
+    const chip = document.createElement('span')
+    chip.className = 'kanban-col-chip' + (hidden ? ' hidden' : '')
+    chip.title = hidden ? t('kanban.filter.column_show') : t('kanban.filter.column_hide')
+    chip.textContent = label
+    chip.addEventListener('click', () => {
+      if (kanbanHiddenColumns.has(def.status)) kanbanHiddenColumns.delete(def.status)
+      else kanbanHiddenColumns.add(def.status)
+      localStorage.setItem('marveen.kanbanHiddenColumns', JSON.stringify([...kanbanHiddenColumns]))
+      renderKanban()
+    })
+    container.appendChild(chip)
+  }
 }
 
 function populateProjectSuggestions() {
@@ -170,69 +772,459 @@ document.getElementById('kanbanProjectFilter').addEventListener('change', (e) =>
   renderKanban()
 })
 
+// The kanban "owner" is the assignee whose type is 'owner' -- the person the
+// board is primarily run for, on any deployment. Identified by type, never by
+// a hard-coded display name, so the quick "show what's on me" view is generic.
+// Returns null when no owner-type assignee exists (then the quick button is
+// hidden and only the general per-assignee dropdown is shown).
+function ownerAssigneeName() {
+  const owner = kanbanAssignees.find((a) => a.type === 'owner')
+  return owner ? owner.name : null
+}
+
+// Reflect the active state of the owner quick-toggle button (hidden when there
+// is no owner-type assignee).
+function syncOwnerFilterBtn() {
+  const btn = document.getElementById('kanbanOwnerBtn')
+  if (!btn) return
+  const owner = ownerAssigneeName()
+  if (!owner) { btn.style.display = 'none'; return }
+  btn.style.display = ''
+  const on = !!kanbanAssigneeFilter && kanbanAssigneeFilter.toLowerCase() === owner.toLowerCase()
+  btn.style.background = on ? 'var(--accent)' : 'var(--bg)'
+  btn.style.color = on ? '#081a2d' : 'var(--fg)'
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false')
+}
+
+// Inject the assignee filter (per-assignee dropdown + an owner "Rám vár" quick
+// toggle) into the kanban toolbar. Built in JS rather than as static markup so
+// the toolbar stays self-contained. Idempotent: the controls are created once;
+// later calls only refresh the <option>s from the current assignee list.
+function setupAssigneeFilter() {
+  const projectSel = document.getElementById('kanbanProjectFilter')
+  if (!projectSel) return
+  const toolbar = projectSel.parentElement
+  let sel = document.getElementById('kanbanAssigneeFilter')
+  if (!sel) {
+    const label = document.createElement('label')
+    label.setAttribute('for', 'kanbanAssigneeFilter')
+    label.textContent = t('kanban.filter.assignee_label')
+    label.style.cssText = 'font-size:13px;color:var(--muted);white-space:nowrap;margin-left:8px;'
+
+    sel = document.createElement('select')
+    sel.id = 'kanbanAssigneeFilter'
+    sel.style.cssText = 'font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-width:140px;'
+    sel.addEventListener('change', (e) => {
+      kanbanAssigneeFilter = e.target.value
+      syncOwnerFilterBtn()
+      renderKanban()
+    })
+
+    const ownerBtn = document.createElement('button')
+    ownerBtn.id = 'kanbanOwnerBtn'
+    ownerBtn.type = 'button'
+    ownerBtn.textContent = t('kanban.filter.owner_btn')
+    ownerBtn.title = t('kanban.owner_filter')
+    ownerBtn.style.cssText = 'font-size:13px;padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);cursor:pointer;'
+    ownerBtn.addEventListener('click', () => {
+      const owner = ownerAssigneeName()
+      if (!owner) return
+      const on = kanbanAssigneeFilter.toLowerCase() === owner.toLowerCase()
+      kanbanAssigneeFilter = on ? '' : owner
+      // Keep the dropdown in sync (only selectable if the owner is a known assignee).
+      sel.value = kanbanAssignees.some((a) => a.name === kanbanAssigneeFilter) ? kanbanAssigneeFilter : ''
+      syncOwnerFilterBtn()
+      renderKanban()
+    })
+
+    toolbar.appendChild(label)
+    toolbar.appendChild(sel)
+    toolbar.appendChild(ownerBtn)
+  }
+
+  // (Re)populate options from the current assignee list, preserving selection.
+  const prev = kanbanAssigneeFilter
+  sel.innerHTML = '<option value="">Mind</option>'
+  for (const a of kanbanAssignees) {
+    const opt = document.createElement('option')
+    opt.value = a.name
+    // Show the persona displayName (id as fallback), matching #216; the
+    // option value / filter key stays the agent id.
+    opt.textContent = a.displayName || a.name
+    if (a.name === prev) opt.selected = true
+    sel.appendChild(opt)
+  }
+  // syncOwnerFilterBtn shows/hides the owner quick-button based on whether an
+  // owner-type assignee exists in the freshly loaded list.
+  syncOwnerFilterBtn()
+}
+
+// Project + assignee + label filters, independent of the priority quick-filter
+// Project + assignee filters only -- the baseline the label quick-filter
+// chip counts are computed against, independent of which labels are
+// currently active, so a chip's count stays meaningful whether it's the one
+// being toggled or not.
+function kanbanCardMatchesBaseFilters(card) {
+  if (kanbanProjectFilter && (card.project || '') !== kanbanProjectFilter) return false
+  const assigneeFilter = kanbanAssigneeFilter.toLowerCase()
+  if (assigneeFilter && String(card.assignee || '').trim().toLowerCase() !== assigneeFilter) return false
+  return true
+}
+
+// The label-filter dimension itself: a card matches when no label filter is
+// active, or when it carries at least one of the active labels (OR within
+// the dimension).
+function kanbanCardMatchesLabelFilter(card) {
+  if (kanbanLabelFilter.size === 0) return true
+  const cardLabelIds = (card.labels || []).map((l) => l.id)
+  return cardLabelIds.some((id) => kanbanLabelFilter.has(id))
+}
+
+// Shared by both the header quick-filter chips and the per-card footer label
+// pills -- one filter dimension, two entry points into the same toggle.
+function toggleKanbanLabelFilter(labelId) {
+  if (kanbanLabelFilter.has(labelId)) kanbanLabelFilter.delete(labelId)
+  else kanbanLabelFilter.add(labelId)
+  persistKanbanFilters()
+  renderKanban()
+}
+
+function clearKanbanQuickFilters() {
+  kanbanLabelFilter.clear()
+  persistKanbanFilters()
+  renderKanban()
+}
+
+function persistKanbanFilters() {
+  localStorage.setItem('marveen.kanbanLabelFilter', JSON.stringify([...kanbanLabelFilter]))
+}
+
+// Quick-filter chip row: one chip per defined label (not per priority), tinted
+// with that label's own colour. Clicking toggles the same kanbanLabelFilter
+// set the footer pills use.
+function renderKanbanQuickFilters() {
+  const row = document.getElementById('kanbanQuickFilters')
+  if (!row) return
+  row.innerHTML = ''
+  for (const label of kanbanAllLabels) {
+    const count = kanbanCards.filter((c) =>
+      kanbanCardMatchesBaseFilters(c) && (c.labels || []).some((l) => l.id === label.id)
+    ).length
+    const active = kanbanLabelFilter.has(label.id)
+    const chip = document.createElement('span')
+    chip.className = 'kanban-quick-filter-chip' + (active ? ' active' : '')
+    chip.dataset.labelId = label.id
+    chip.style.setProperty('--chip-color', label.color)
+    chip.innerHTML = `#${escapeHtml(label.name)} <span class="kanban-quick-filter-count">${count}</span>${active ? '<span class="kanban-quick-filter-clear">&times;</span>' : ''}`
+    chip.addEventListener('click', () => toggleKanbanLabelFilter(label.id))
+    row.appendChild(chip)
+  }
+  if (kanbanLabelFilter.size > 0) {
+    const clearAll = document.createElement('button')
+    clearAll.className = 'kanban-quick-filter-clear-all'
+    clearAll.textContent = t('kanban.filter.clear')
+    clearAll.addEventListener('click', clearKanbanQuickFilters)
+    row.appendChild(clearAll)
+  }
+}
+
 function renderKanban() {
-  const grouped = { planned: [], in_progress: [], waiting: [], done: [] }
+  const cardById = new Map(kanbanCards.map(c => [c.id, c]))
+
+  renderKanbanColumnChips()
+  renderKanbanQuickFilters()
+
+  // Determine which top-level cards are visible under current filters.
+  const visibleCardIds = new Set()
   for (const card of kanbanCards) {
-    if (kanbanProjectFilter && (card.project || '') !== kanbanProjectFilter) continue
+    if (!kanbanCardMatchesBaseFilters(card)) continue
+    if (!kanbanCardMatchesLabelFilter(card)) continue
+    visibleCardIds.add(card.id)
+  }
+
+  // A subtask is "embedded" when its parent is visible AND both share the same
+  // column. Embedded subtasks are hidden as standalone cards and rendered
+  // inside the parent card instead. Filter state of the subtask itself is
+  // intentionally ignored so it always shows under its visible parent.
+  const embeddedSubtaskIds = new Set()
+  for (const card of kanbanCards) {
+    if (!card.parent_id) continue
+    const parent = cardById.get(card.parent_id)
+    if (!parent || !visibleCardIds.has(parent.id)) continue
+    if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
+  }
+
+  const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
+  for (const card of kanbanCards) {
+    if (embeddedSubtaskIds.has(card.id)) continue
+    if (!visibleCardIds.has(card.id)) continue
     if (grouped[card.status]) grouped[card.status].push(card)
   }
 
-  for (const [status, cards] of Object.entries(grouped)) {
-    const col = document.querySelector(`.kanban-col-body[data-status="${status}"]`)
-    col.innerHTML = ''
-    cards.sort((a, b) => a.sort_order - b.sort_order)
-
-    for (const card of cards) {
-      col.appendChild(createCardEl(card))
-    }
-  }
-
-  // Update counts
+  // Update counts (embedded subtasks don't count as separate cards)
   document.getElementById('countPlanned').textContent = grouped.planned.length
   document.getElementById('countInProgress').textContent = grouped.in_progress.length
+  document.getElementById('countTesting').textContent = grouped.testing.length
   document.getElementById('countWaiting').textContent = grouped.waiting.length
   document.getElementById('countDone').textContent = grouped.done.length
 
-  // Async parent-badge: fetch children count per card, show badge if any
-  loadSubtaskBadges()
-}
+  const flatBoard = document.getElementById('kanbanBoard')
+  const swimlaneBoard = document.getElementById('kanbanSwimlaneBoard')
 
-async function loadSubtaskBadges() {
-  const cardEls = document.querySelectorAll('.kanban-card[data-id]')
-  await Promise.all([...cardEls].map(async (el) => {
-    const id = el.dataset.id
-    try {
-      const res = await fetch(`/api/kanban/${encodeURIComponent(id)}/children`)
-      if (!res.ok) return
-      const children = await res.json()
-      const badge = el.querySelector('.kanban-subtask-badge')
-      if (!badge) return
-      if (children.length > 0) {
-        badge.textContent = `${children.length} subtask`
-        badge.style.display = ''
-        badge.onclick = (e) => {
-          e.stopPropagation()
-          const card = kanbanCards.find((c) => c.id === id)
-          if (card) showCardDetail(card)
-        }
-      } else {
-        badge.style.display = 'none'
+  if (kanbanGroupBy === 'none') {
+    swimlaneBoard.hidden = true
+    flatBoard.hidden = false
+    for (const [status, cards] of Object.entries(grouped)) {
+      const col = document.querySelector(`#kanbanBoard .kanban-col-body[data-status="${status}"]`)
+      col.innerHTML = ''
+      cards.sort((a, b) => a.sort_order - b.sort_order)
+
+      for (const card of cards) {
+        const embeddedChildren = kanbanCards
+          .filter(c => c.parent_id === card.id && embeddedSubtaskIds.has(c.id))
+          .sort((a, b) => a.sort_order - b.sort_order)
+        col.appendChild(createCardEl(card, embeddedChildren))
       }
-    } catch { /* ignore */ }
-  }))
+    }
+    // Hide/show flat-board columns based on visibility set
+    const allColsHidden = KANBAN_STATUS_DEFS.every(d => kanbanHiddenColumns.has(d.status))
+    for (const def of KANBAN_STATUS_DEFS) {
+      const colEl = flatBoard.querySelector(`.kanban-col[data-status="${def.status}"]`)
+      if (colEl) colEl.hidden = kanbanHiddenColumns.has(def.status)
+    }
+    // "All columns hidden" hint
+    let allHiddenMsg = document.getElementById('kanbanAllHiddenMsg')
+    if (allColsHidden) {
+      if (!allHiddenMsg) {
+        allHiddenMsg = document.createElement('p')
+        allHiddenMsg.id = 'kanbanAllHiddenMsg'
+        allHiddenMsg.style.cssText = 'color:var(--muted);font-size:13px;padding:24px 0;text-align:center;width:100%;'
+        flatBoard.appendChild(allHiddenMsg)
+      }
+      allHiddenMsg.textContent = t('kanban.filter.all_cols_hidden')
+    } else {
+      allHiddenMsg?.remove()
+    }
+    // Badge: only count subtasks that are in a different column (not embedded here)
+    updateSubtaskBadges(embeddedSubtaskIds)
+    // WIP limit badges (count/limit + colour) on the flat board too -- previously
+    // only the swimlane view updated these, so a configured limit never showed
+    // on the default flat board.
+    updateWipBadges(grouped)
+  } else {
+    flatBoard.hidden = true
+    swimlaneBoard.hidden = false
+    renderSwimlaneBoard(grouped, embeddedSubtaskIds)
+  }
 }
 
-function createCardEl(card) {
+const KANBAN_STATUS_DEFS = [
+  { status: 'planned', title: () => t('kanban.col.planned') },
+  { status: 'in_progress', title: () => t('kanban.col.in_progress') },
+  { status: 'waiting', title: () => t('kanban.col.waiting') },
+  { status: 'testing', title: () => t('kanban.col.testing') },
+  { status: 'done', title: () => t('kanban.col.done') },
+]
+const KANBAN_PRIORITY_LABELS = { urgent: () => t('kanban.priority.urgent'), high: () => t('kanban.priority.high'), normal: () => t('kanban.priority.normal'), low: () => t('kanban.priority.low') }
+const KANBAN_PRIORITY_ORDER = ['urgent', 'high', 'normal', 'low']
+
+// Which swimlane a card belongs to under the current grouping. Returns a
+// stable string key: the matched assignee's canonical name, '__unassigned__'
+// for cards with no/unmatched assignee, or the priority value.
+function kanbanSwimlaneKeyFor(card) {
+  if (kanbanGroupBy === 'priority') return card.priority || 'normal'
+  const raw = card.assignee ? String(card.assignee).trim() : ''
+  if (!raw) return '__unassigned__'
+  const match = kanbanAssignees.find(a => a.name.toLowerCase() === raw.toLowerCase())
+  return match ? match.name : raw
+}
+
+// Display metadata (label + avatar styling) for a swimlane key.
+function kanbanSwimlaneMeta(key) {
+  if (kanbanGroupBy === 'priority') {
+    const _rawPL = KANBAN_PRIORITY_LABELS[key]; const label = _rawPL ? (typeof _rawPL === 'function' ? _rawPL() : _rawPL) : key
+    return { label, avatarClass: `priority-${key}`, avatarChar: '' }
+  }
+  if (key === '__unassigned__') return { label: t('kanban.unassigned'), avatarClass: 'unknown', avatarChar: '?' }
+  const match = kanbanAssignees.find(a => a.name === key)
+  const label = match ? (match.displayName || match.name) : key
+  return { label, avatarClass: match ? match.type : 'unknown', avatarChar: (label[0] || '?').toUpperCase() }
+}
+
+function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
+  const board = document.getElementById('kanbanSwimlaneBoard')
+  board.innerHTML = ''
+
+  const presentKeys = new Set()
+  for (const cards of Object.values(grouped)) {
+    for (const c of cards) presentKeys.add(kanbanSwimlaneKeyFor(c))
+  }
+
+  const canonicalOrder = kanbanGroupBy === 'priority'
+    ? KANBAN_PRIORITY_ORDER
+    : [...kanbanAssignees.map(a => a.name), '__unassigned__']
+  const orderedKeys = canonicalOrder.filter(k => presentKeys.has(k))
+  const leftoverKeys = [...presentKeys].filter(k => !orderedKeys.includes(k)).sort((a, b) => a.localeCompare(b))
+  const keys = [...orderedKeys, ...leftoverKeys]
+
+  const separatorColor = window._marveen?.kanbanSwimlanes?.separatorColor
+
+  for (const key of keys) {
+    const meta = kanbanSwimlaneMeta(key)
+    const collapsed = kanbanCollapsedLanes.has(key)
+
+    const laneCardsByStatus = {}
+    let totalCount = 0
+    for (const def of KANBAN_STATUS_DEFS) {
+      const cards = grouped[def.status].filter(c => kanbanSwimlaneKeyFor(c) === key)
+      laneCardsByStatus[def.status] = cards
+      if (!kanbanHiddenColumns.has(def.status)) totalCount += cards.length
+    }
+
+    const lane = document.createElement('div')
+    lane.className = 'kanban-swimlane' + (collapsed ? ' collapsed' : '')
+    lane.dataset.group = key
+    if (separatorColor) lane.style.borderBottomColor = separatorColor
+
+    const header = document.createElement('div')
+    header.className = 'kanban-swimlane-header'
+    header.innerHTML = `
+      <span class="kanban-swimlane-avatar ${meta.avatarClass}">${escapeHtml(meta.avatarChar)}</span>
+      <span class="kanban-swimlane-name">${escapeHtml(meta.label)}</span>
+      <span class="kanban-swimlane-count">${totalCount}</span>
+      <button class="kanban-swimlane-toggle" type="button" aria-expanded="${!collapsed}" title="${collapsed ? t('kanban.swimlane.expand') : t('kanban.swimlane.collapse')}">${collapsed ? '▶' : '▼'}</button>
+    `
+    header.querySelector('.kanban-swimlane-toggle').addEventListener('click', (e) => {
+      e.stopPropagation()
+      if (kanbanCollapsedLanes.has(key)) kanbanCollapsedLanes.delete(key)
+      else kanbanCollapsedLanes.add(key)
+      renderKanban()
+    })
+    lane.appendChild(header)
+
+    const body = document.createElement('div')
+    body.className = 'kanban-swimlane-body'
+    for (const def of KANBAN_STATUS_DEFS) {
+      if (kanbanHiddenColumns.has(def.status)) continue
+      const col = document.createElement('div')
+      col.className = 'kanban-swimlane-col'
+
+      const colHeader = document.createElement('div')
+      colHeader.className = 'kanban-swimlane-col-header'
+      colHeader.textContent = typeof def.title === 'function' ? def.title() : def.title
+
+      const colBody = document.createElement('div')
+      colBody.className = 'kanban-col-body kanban-swimlane-col-body'
+      colBody.dataset.status = def.status
+
+      const cards = laneCardsByStatus[def.status].sort((a, b) => a.sort_order - b.sort_order)
+      for (const card of cards) {
+        const embeddedChildren = kanbanCards
+          .filter(c => c.parent_id === card.id && embeddedSubtaskIds.has(c.id))
+          .sort((a, b) => a.sort_order - b.sort_order)
+        colBody.appendChild(createCardEl(card, embeddedChildren))
+      }
+      wireKanbanColumnDnD(colBody)
+
+      col.appendChild(colHeader)
+      col.appendChild(colBody)
+      body.appendChild(col)
+    }
+    lane.appendChild(body)
+    board.appendChild(lane)
+  }
+
+  updateSubtaskBadges(embeddedSubtaskIds)
+
+  // WIP limit badges: update column-header count spans with "count/limit" when configured
+  updateWipBadges(grouped)
+}
+
+// Map column status keys to their count-span IDs
+const WIP_COUNT_IDS = {
+  planned: 'countPlanned',
+  in_progress: 'countInProgress',
+  testing: 'countTesting',
+  waiting: 'countWaiting',
+  done: 'countDone',
+}
+
+function updateWipBadges(grouped) {
+  const cfg = window._marveen?.kanbanWip
+  for (const [status, cards] of Object.entries(grouped)) {
+    const el = document.getElementById(WIP_COUNT_IDS[status])
+    if (!el) continue
+    const limit = cfg?.limits?.[status] || 0
+    if (!limit) {
+      // No limit configured: restore plain count and clear WIP styling
+      el.textContent = cards.length
+      delete el.dataset.wip
+      el.style.color = ''
+      el.style.borderColor = ''
+      continue
+    }
+    const count = cards.length
+    el.textContent = `${count}/${limit}`
+    let state, color
+    if (count > limit) {
+      state = 'over'; color = cfg.overColor
+    } else if (count === limit) {
+      state = 'full'; color = cfg.fullColor
+    } else if ((count / limit) * 100 >= cfg.warnPct) {
+      state = 'warn'; color = cfg.warnColor
+    } else {
+      state = 'ok'; color = cfg.okColor
+    }
+    el.dataset.wip = state
+    el.style.color = color
+    el.style.borderColor = color
+  }
+}
+
+function updateSubtaskBadges(embeddedSubtaskIds) {
+  for (const el of document.querySelectorAll('.kanban-card[data-id]')) {
+    const id = el.dataset.id
+    const badge = el.querySelector('.kanban-subtask-badge')
+    if (!badge) continue
+    const nonEmbedded = kanbanCards.filter(c => c.parent_id === id && !embeddedSubtaskIds.has(c.id))
+    if (nonEmbedded.length > 0) {
+      badge.textContent = `${nonEmbedded.length} subtask`
+      badge.style.display = ''
+      badge.onclick = (e) => {
+        e.stopPropagation()
+        const card = kanbanCards.find(c => c.id === id)
+        if (card) showCardDetail(card)
+      }
+    } else {
+      badge.style.display = 'none'
+    }
+  }
+}
+
+function createCardEl(card, embeddedChildren = []) {
   const el = document.createElement('div')
   el.className = 'kanban-card'
   el.dataset.id = card.id
   el.dataset.priority = card.priority
   el.draggable = true
 
-  const assignee = card.assignee ? kanbanAssignees.find((a) => a.name === card.assignee) : null
+  // Assignee chip. Match the card's assignee against the known list
+  // case-insensitively (a card stored as "gorcsevivan" must still match the
+  // list entry "GorcsevIvan"). When the assignee is set but not in the list
+  // at all, still render a fallback chip with the raw name + a neutral dot,
+  // so a card never silently loses its assignee chip on a name mismatch.
+  const rawAssignee = card.assignee ? String(card.assignee).trim() : ''
+  const assignee = rawAssignee
+    ? kanbanAssignees.find((a) => a.name.toLowerCase() === rawAssignee.toLowerCase())
+    : null
+  // Display the persona displayName (falling back to the id) per #216, while
+  // keeping the robust match above and the raw-name fallback chip below.
+  const assigneeLabel = assignee ? (assignee.displayName || assignee.name) : ''
   const assigneeHtml = assignee
-    ? `<span class="kanban-card-assignee"><span class="assignee-dot ${assignee.type}">${assignee.name[0]}</span>${escapeHtml(assignee.name)}</span>`
-    : ''
+    ? `<span class="kanban-card-assignee"><span class="assignee-dot ${assignee.type}">${escapeHtml(assigneeLabel[0])}</span>${escapeHtml(assigneeLabel)}</span>`
+    : rawAssignee
+      ? `<span class="kanban-card-assignee"><span class="assignee-dot unknown">${escapeHtml(rawAssignee[0])}</span>${escapeHtml(rawAssignee)}</span>`
+      : ''
 
   let dueHtml = ''
   if (card.due_date) {
@@ -247,20 +1239,100 @@ function createCardEl(card) {
     ? `<span class="kanban-card-project">${escapeHtml(card.project)}</span>`
     : ''
 
+  // Label footer pills: at most 3 shown + a "+N" overflow indicator. Each pill
+  // (except the overflow one) toggles that label into the active label-filter
+  // when clicked, mirroring the priority quick-filter chips above the board.
+  let labelsHtml = ''
+  if (Array.isArray(card.labels) && card.labels.length > 0) {
+    const shown = card.labels.slice(0, 3)
+    const overflow = card.labels.length - shown.length
+    const pills = shown.map((l) =>
+      `<span class="kanban-card-label-pill" data-label-id="${escapeHtml(l.id)}" style="--label-color:${escapeHtml(l.color)}" title="${t('kanban.label.filter_tooltip', { name: escapeHtml(l.name) })}">#${escapeHtml(l.name)}</span>`
+    ).join('')
+    const overflowHtml = overflow > 0
+      ? `<span class="kanban-card-label-pill kanban-card-label-overflow" title="${t('kanban.label.overflow_tooltip', { n: overflow })}">+${overflow}</span>`
+      : ''
+    labelsHtml = `<div class="kanban-card-labels">${pills}${overflowHtml}</div>`
+  }
+
+  const seqHtml = card.seq != null
+    ? `<span class="kanban-card-seq" style="font-family:monospace;font-size:11px;color:var(--muted);margin-right:5px">#${card.seq}</span>`
+    : ''
+
+  // Card aging: left stripe + top-right badge based on hours since last update.
+  // Skipped for done cards. Config thresholds and colours come from window._marveen.kanbanAging.
+  let agingBadgeHtml = ''
+  const agingCfg = window._marveen?.kanbanAging
+  if (agingCfg && card.updated_at && card.status !== 'done') {
+    const hoursOld = (Date.now() / 1000 - card.updated_at) / 3600
+    let agingLevel = null
+    let agingColor = null
+    if (hoursOld >= agingCfg.criticalH) {
+      agingLevel = 'critical'; agingColor = agingCfg.criticalColor
+    } else if (hoursOld >= agingCfg.cautionH) {
+      agingLevel = 'caution'; agingColor = agingCfg.cautionColor
+    } else if (hoursOld >= agingCfg.warnH) {
+      agingLevel = 'warn'; agingColor = agingCfg.warnColor
+    }
+    if (agingLevel) {
+      const days = Math.floor(hoursOld / 24)
+      const ageLabel = days >= 1 ? `${days}d` : `${Math.floor(hoursOld)}h`
+      const exact = new Date(card.updated_at * 1000).toLocaleString('hu-HU')
+      agingBadgeHtml = `<span class="kanban-card-aging-badge kanban-card-aging-${agingLevel}" style="color:${agingColor}" title="${t('kanban.aging.tooltip', { exact })}">⏳ ${ageLabel}</span>`
+      el.dataset.aging = agingLevel
+      el.style.setProperty('--card-aging-color', agingColor)
+    }
+  }
+
+  // Embedded subtasks: rendered as mini-cards below a divider when the subtask
+  // shares the same column as this parent card.
+  let embeddedHtml = ''
+  if (embeddedChildren.length > 0) {
+    const items = embeddedChildren.map(c => {
+      const rawCa = c.assignee ? String(c.assignee).trim() : ''
+      const ca = rawCa ? kanbanAssignees.find(a => a.name.toLowerCase() === rawCa.toLowerCase()) : null
+      const caLabel = ca ? (ca.displayName || ca.name) : rawCa
+      const caHtml = caLabel ? `<span class="kanban-embedded-assignee">${escapeHtml(caLabel)}</span>` : ''
+      const cSeq = c.seq != null ? `<span class="kanban-embedded-seq">#${c.seq}</span> ` : ''
+      return `<div class="kanban-embedded-subtask" data-id="${escapeHtml(c.id)}">${cSeq}${escapeHtml(c.title)}${caHtml}</div>`
+    }).join('')
+    embeddedHtml = `<div class="kanban-embedded-subtasks">${items}</div>`
+  }
+
   el.innerHTML = `
     ${projectHtml}
-    <div class="kanban-card-title">${escapeHtml(card.title)}</div>
+    <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
     <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
+    ${labelsHtml}
     <div class="kanban-card-actions">
-      <button class="card-breakdown-btn" title="AI szétbont" aria-label="AI szétbont">⚡</button>
+      <button class="card-breakdown-btn" title="${t('kanban.btn.breakdown')}" aria-label="${t('kanban.btn.breakdown')}">⚡</button>
     </div>
+    ${agingBadgeHtml}
     <div class="kanban-subtask-badge" style="display:none"></div>
+    ${embeddedHtml}
   `
 
   // "AI szétbont" gomb – ne nyissa meg a detail modalt
   el.querySelector('.card-breakdown-btn').addEventListener('click', (e) => {
     e.stopPropagation()
     triggerBreakdown(card)
+  })
+
+  // Label pills -> toggle that label into the active filter (don't open detail)
+  el.querySelectorAll('.kanban-card-label-pill[data-label-id]').forEach((pillEl) => {
+    pillEl.addEventListener('click', (e) => {
+      e.stopPropagation()
+      toggleKanbanLabelFilter(pillEl.dataset.labelId)
+    })
+  })
+
+  // Click on embedded subtask -> open that subtask's detail (don't bubble to parent)
+  el.querySelectorAll('.kanban-embedded-subtask').forEach(subEl => {
+    subEl.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const child = kanbanCards.find(c => c.id === subEl.dataset.id)
+      if (child) showCardDetail(child)
+    })
   })
 
   // Drag events
@@ -278,7 +1350,11 @@ function createCardEl(card) {
 }
 
 // === Drag & Drop ===
-columns.forEach((col) => {
+// Wires the drag/drop handlers for one column-body element. Used for the
+// 4 static flat-board columns at load time, and again for every swimlane
+// column-body created dynamically in renderSwimlaneBoard (those elements
+// don't exist yet when this module first runs).
+function wireKanbanColumnDnD(col) {
   col.addEventListener('dragover', (e) => {
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
@@ -318,10 +1394,11 @@ columns.forEach((col) => {
       })
       loadKanban()
     } catch {
-      showToast('Hiba az áthelyezés során')
+      showToast(t('kanban.toast.move_error'))
     }
   })
-})
+}
+columns.forEach(wireKanbanColumnDnD)
 
 function getDragAfterElement(col, y) {
   const els = [...col.querySelectorAll('.kanban-card:not(.dragging)')]
@@ -341,7 +1418,7 @@ function getDragAfterElement(col, y) {
 
 // === New card modal ===
 function openNewCardModal(status) {
-  document.getElementById('cardModalTitle').textContent = 'Új kártya'
+  document.getElementById('cardModalTitle').textContent = t('kanban.modal.title_new')
   document.getElementById('cardTitle').value = ''
   document.getElementById('cardDesc').value = ''
   document.getElementById('cardPriority').value = 'normal'
@@ -361,7 +1438,7 @@ function populateAssigneeSelect(selectId, selected) {
   for (const a of kanbanAssignees) {
     const opt = document.createElement('option')
     opt.value = a.name
-    opt.textContent = a.name
+    opt.textContent = a.displayName || a.name
     if (selected && a.name === selected) opt.selected = true
     sel.appendChild(opt)
   }
@@ -387,61 +1464,261 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
 
   try {
     if (editId) {
-      await fetch(`/api/kanban/${encodeURIComponent(editId)}`, {
+      const res = await fetch(`/api/kanban/${encodeURIComponent(editId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       })
-      showToast('Kártya frissítve')
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || res.status) }
+      showToast(t('kanban.toast.card_updated'))
     } else {
       data.status = document.getElementById('cardEditStatus').value
-      await fetch('/api/kanban', {
+      const res = await fetch('/api/kanban', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       })
-      showToast('Kártya létrehozva')
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || res.status) }
+      showToast(t('kanban.toast.card_created'))
     }
     closeModal(cardModalOverlay)
     loadKanban()
   } catch (err) {
-    showToast('Hiba a mentés során')
+    showToast(t('kanban.toast.save_error_msg', { msg: err.message }))
   }
 })
 
+// === Card labels (in the detail modal) ===
+// Always re-fetches the card's own labels via the dedicated endpoint instead
+// of trusting card.labels -- callers that pass a card object sourced from
+// /api/kanban/:id/children (subtask list) don't have labels embedded, only
+// the bulk board listing (/api/kanban) does.
+async function renderCardLabelsSection(card) {
+  const listEl = document.getElementById('cardLabelList')
+  const addSelect = document.getElementById('cardLabelAdd')
+  const newBtn = document.getElementById('cardLabelNewBtn')
+  const newForm = document.getElementById('cardLabelNewForm')
+  const newNameInput = document.getElementById('cardLabelNewName')
+  const newColorsEl = document.getElementById('cardLabelNewColors')
+  const newSaveBtn = document.getElementById('cardLabelNewSaveBtn')
+
+  let attached = []
+  try {
+    attached = await (await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`)).json()
+  } catch { /* leave empty -- pill list just stays blank */ }
+
+  listEl.innerHTML = ''
+  for (const label of attached) {
+    const pill = document.createElement('span')
+    pill.className = 'label-pill'
+    pill.style.setProperty('--label-color', label.color)
+    pill.innerHTML = `#${escapeHtml(label.name)} <button class="label-pill-remove" title="${t('kanban.label.remove_btn')}" aria-label="${t('kanban.label.remove_btn')}">&times;</button>`
+    pill.querySelector('.label-pill-remove').addEventListener('click', async () => {
+      try {
+        await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels/${encodeURIComponent(label.id)}`, { method: 'DELETE' })
+        renderCardLabelsSection(card)
+        loadKanban()
+      } catch { showToast(t('kanban.toast.label_remove_error')) }
+    })
+    listEl.appendChild(pill)
+  }
+
+  const attachedIds = new Set(attached.map((l) => l.id))
+  addSelect.innerHTML = `<option value="">-- ${t('kanban.label.add_placeholder')} --</option>`
+  for (const label of kanbanAllLabels) {
+    if (attachedIds.has(label.id)) continue
+    const opt = document.createElement('option')
+    opt.value = label.id
+    opt.textContent = label.name
+    addSelect.appendChild(opt)
+  }
+  addSelect.onchange = async () => {
+    const labelId = addSelect.value
+    if (!labelId) return
+    try {
+      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labelId }),
+      })
+      renderCardLabelsSection(card)
+      loadKanban()
+    } catch { showToast(t('kanban.toast.label_add_error')) }
+  }
+
+  newForm.style.display = 'none'
+  newBtn.onclick = () => {
+    newForm.style.display = newForm.style.display === 'none' ? '' : 'none'
+    newNameInput.value = ''
+  }
+
+  const palette = window._marveen?.kanbanLabels?.colors || ['#64748b']
+  newColorsEl.innerHTML = ''
+  let selectedColor = palette[0]
+  palette.forEach((color, i) => {
+    const sw = document.createElement('span')
+    sw.className = 'label-color-swatch' + (i === 0 ? ' selected' : '')
+    sw.style.background = color
+    sw.addEventListener('click', () => {
+      selectedColor = color
+      newColorsEl.querySelectorAll('.label-color-swatch').forEach((s) => s.classList.remove('selected'))
+      sw.classList.add('selected')
+    })
+    newColorsEl.appendChild(sw)
+  })
+
+  newSaveBtn.onclick = async () => {
+    const name = newNameInput.value.trim()
+    if (!name) { newNameInput.focus(); return }
+    try {
+      const r = await fetch('/api/kanban/labels', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, color: selectedColor }),
+      })
+      if (!r.ok) { showToast(t('kanban.toast.label_create_error')); return }
+      const newLabel = await r.json()
+      kanbanAllLabels.push(newLabel)
+      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labelId: newLabel.id }),
+      })
+      newForm.style.display = 'none'
+      renderCardLabelsSection(card)
+      loadKanban()
+    } catch { showToast(t('kanban.toast.label_create_error')) }
+  }
+}
+
 // === Card detail ===
 async function showCardDetail(card) {
-  document.getElementById('cardDetailTitle').textContent = card.title
+  // Running number (#N) in the title bar, plus the stable hex id in the meta.
+  const seqPrefix = card.seq != null ? `#${card.seq} ` : ''
+  document.getElementById('cardDetailTitle').textContent = `${seqPrefix}${card.title}`
 
-  const assignee = card.assignee ? kanbanAssignees.find((a) => a.name === card.assignee) : null
-  const priorityLabels = { low: 'Alacsony', normal: 'Normál', high: 'Magas', urgent: 'Sürgős' }
-  const statusLabels = { planned: 'Tervezett', in_progress: 'Folyamatban', waiting: 'Várakozik', done: 'Kész' }
+  // Case-insensitive match; fall back to the raw stored name so a casing
+  // mismatch (or an unregistered assignee) shows the actual name, not "nincs".
+  const rawDetailAssignee = card.assignee ? String(card.assignee).trim() : ''
+  const assignee = rawDetailAssignee
+    ? kanbanAssignees.find((a) => a.name.toLowerCase() === rawDetailAssignee.toLowerCase())
+    : null
+  const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
+  const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
+  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
 
   const meta = document.getElementById('cardDetailMeta')
+  const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
   meta.innerHTML = `
     <div class="meta-item">
-      <span class="meta-label">Állapot</span>
+      <span class="meta-label">${t('kanban.meta.id')}</span>
+      <span class="meta-value" style="font-family:monospace" title="${t('kanban.meta.id_tooltip')}">${escapeHtml(idLabel)}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">${t('kanban.meta.status')}</span>
       <span class="meta-value">${statusLabels[card.status] || card.status}</span>
     </div>
     <div class="meta-item">
-      <span class="meta-label">Felelős</span>
-      <span class="meta-value">${assignee ? escapeHtml(assignee.name) : '-- nincs --'}</span>
+      <span class="meta-label">${t('kanban.meta.assignee')}</span>
+      <span class="meta-value meta-value-editable" id="metaAssigneeValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${escapeHtml(assigneeDisplay)}</span>
     </div>
     <div class="meta-item">
-      <span class="meta-label">Prioritás</span>
+      <span class="meta-label">${t('kanban.meta.priority')}</span>
       <span class="meta-value">${priorityLabels[card.priority]}</span>
     </div>
     <div class="meta-item">
-      <span class="meta-label">Projekt</span>
-      <span class="meta-value">${card.project ? escapeHtml(card.project) : '-- nincs --'}</span>
+      <span class="meta-label">${t('kanban.meta.project')}</span>
+      <span class="meta-value">${card.project ? escapeHtml(card.project) : t('kanban.meta.none')}</span>
     </div>
     <div class="meta-item">
-      <span class="meta-label">Határidő</span>
-      <span class="meta-value">${card.due_date ? new Date(card.due_date * 1000).toLocaleDateString('hu-HU') : '-- nincs --'}</span>
+      <span class="meta-label">${t('kanban.meta.deadline')}</span>
+      <span class="meta-value">${card.due_date ? new Date(card.due_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
     </div>
   `
 
+  // Inline edit for assignee on detail view
+  const assigneeValueEl = document.getElementById('metaAssigneeValue')
+  assigneeValueEl.addEventListener('click', () => {
+    if (assigneeValueEl.querySelector('select')) return
+    const current = card.assignee || ''
+    const sel = document.createElement('select')
+    sel.style.cssText = 'padding:2px 6px; border-radius:4px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:inherit'
+    sel.innerHTML = '<option value="">-- Nincs --</option>'
+    for (const a of kanbanAssignees) {
+      const opt = document.createElement('option')
+      opt.value = a.name
+      opt.textContent = a.displayName || a.name
+      if (a.name === current) opt.selected = true
+      sel.appendChild(opt)
+    }
+    assigneeValueEl.innerHTML = ''
+    assigneeValueEl.appendChild(sel)
+    sel.focus()
+    const save = async () => {
+      const newVal = sel.value || null
+      if (newVal === current || (newVal === null && !current)) {
+        assigneeValueEl.textContent = current ? current : '-- nincs --'
+        return
+      }
+      try {
+        const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...card, assignee: newVal }),
+        })
+        if (!r.ok) throw new Error('PUT failed')
+        card.assignee = newVal
+        assigneeValueEl.textContent = newVal ? newVal : '-- nincs --'
+        showToast(t('kanban.toast.assignee_updated'))
+        loadKanban && loadKanban()
+      } catch {
+        assigneeValueEl.textContent = current ? current : '-- nincs --'
+        showToast(t('kanban.toast.save_error'))
+      }
+    }
+    sel.addEventListener('change', save)
+    sel.addEventListener('blur', () => {
+      if (assigneeValueEl.querySelector('select')) {
+        assigneeValueEl.textContent = card.assignee ? card.assignee : '-- nincs --'
+      }
+    })
+  })
+
   document.getElementById('cardDetailDesc').textContent = card.description || ''
+
+  renderCardLabelsSection(card)
+
+  // #115: Parent meta row — dropdown replaces the old read-only display; shown only when editable
+  const parentMetaItem = document.getElementById('parentMetaItem')
+  const parentSelect = document.getElementById('parentSelect')
+  const canModifyParent = card.status === 'planned' || card.status === 'waiting'
+  if (card.parent_id && canModifyParent) {
+    // Build the parent-select dropdown: null option + all top-level non-done tasks
+    parentSelect.innerHTML = `<option value="">${t('kanban.parent.empty')}</option>`
+    const availableParents = kanbanCards.filter(c =>
+      !c.parent_id && c.id !== card.id && !c.archived_at &&
+      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'testing' || c.status === 'waiting')
+    )
+    for (const p of availableParents) {
+      const opt = document.createElement('option')
+      opt.value = p.id
+      const fullLabel = (p.seq != null ? `#${p.seq} ` : '') + p.title
+      opt.title = fullLabel
+      opt.textContent = fullLabel.length > 33 ? fullLabel.slice(0, 32) + '…' : fullLabel
+      if (p.id === card.parent_id) opt.selected = true
+      parentSelect.appendChild(opt)
+    }
+    parentSelect.onchange = async () => {
+      const newParentId = parentSelect.value || null
+      const label = newParentId ? t('kanban.toast.parent_updated') : t('kanban.toast.parent_unset')
+      const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...card, parent_id: newParentId }),
+      })
+      if (r.ok) { card.parent_id = newParentId; showToast(label); loadKanban(); showCardDetail(card) }
+      else showToast(t('kanban.toast.save_error'))
+    }
+    parentMetaItem.style.display = ''
+  } else {
+    parentMetaItem.style.display = 'none'
+  }
 
   // Load comments
   try {
@@ -461,31 +1738,48 @@ async function showCardDetail(card) {
     }
   } catch { /* ignore */ }
 
-  // Author select for new comment
-  populateAssigneeSelect('commentAuthor', 'Marveen')
+  // Author select for new comment. Default to the bot assignee resolved by
+  // type (never a hard-coded display name -- BOT_NAME differs per deployment),
+  // falling back to the first assignee. The old literal 'Marveen' never matched
+  // on non-Marveen installs, so the select stayed on "-- Nincs --" and the
+  // comment submit silently no-opped (addCommentBtn returns when !author).
+  // (Resolution of the #254/#241 overlap: keep #241's type-resolved default
+  // over #254's hard-coded "Gábor" -- same deployment-agnostic reasoning.)
+  const defaultCommentAuthor =
+    (kanbanAssignees.find((a) => a.type === 'owner') || kanbanAssignees[0] || {}).name || ''
+  populateAssigneeSelect('commentAuthor', defaultCommentAuthor)
 
   // Add comment
   document.getElementById('addCommentBtn').onclick = async () => {
     const content = document.getElementById('commentContent').value.trim()
     const author = document.getElementById('commentAuthor').value
-    if (!content || !author) return
+    if (!content) { document.getElementById('commentContent').focus(); return }
+    if (!author) { showToast(t('kanban.toast.comment_no_author')); return }
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
+      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ author, content }),
       })
+      // Without this check an HTTP error (e.g. 400) still cleared the textarea
+      // and "refreshed", so the comment looked sent but was never saved.
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`
+        try { msg = (await res.json()).error || msg } catch {}
+        showToast(t('kanban.toast.comment_failed', { msg }))
+        return
+      }
       document.getElementById('commentContent').value = ''
       showCardDetail(card) // refresh
     } catch {
-      showToast('Hiba a megjegyzés mentése során')
+      showToast(t('kanban.toast.comment_error'))
     }
   }
 
   // Edit button
   document.getElementById('cardEditBtn').onclick = () => {
     closeModal(cardDetailOverlay)
-    document.getElementById('cardModalTitle').textContent = 'Kártya szerkesztése'
+    document.getElementById('cardModalTitle').textContent = t('kanban.modal.title_edit')
     document.getElementById('cardTitle').value = card.title
     document.getElementById('cardDesc').value = card.description || ''
     document.getElementById('cardPriority').value = card.priority
@@ -505,62 +1799,117 @@ async function showCardDetail(card) {
     try {
       await fetch(`/api/kanban/${encodeURIComponent(card.id)}/archive`, { method: 'POST' })
       closeModal(cardDetailOverlay)
-      showToast('Kártya archiválva')
+      showToast(t('kanban.toast.card_archived'))
       loadKanban()
     } catch {
-      showToast('Hiba az archiválás során')
+      showToast(t('kanban.toast.archive_error'))
     }
   }
 
   // Delete
   document.getElementById('cardDeleteBtn').onclick = async () => {
-    if (!confirm('Biztosan törlöd ezt a kártyát?')) return
+    if (!confirm(t('kanban.confirm.delete'))) return
     try {
       await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, { method: 'DELETE' })
       closeModal(cardDetailOverlay)
-      showToast('Kártya törölve')
+      showToast(t('kanban.toast.card_deleted'))
       loadKanban()
     } catch {
-      showToast('Hiba a törlés során')
+      showToast(t('common.error_delete'))
     }
   }
 
-  // Load children (subtasks)
+  // Load children (subtasks) — only top-level tasks have children (no subtask of subtask)
   try {
     const childRes = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/children`)
     const children = await childRes.json()
     const section = document.getElementById('cardChildrenSection')
     const list = document.getElementById('cardChildrenList')
-    if (children.length > 0) {
+    const addSubtaskSection = document.getElementById('cardAddSubtaskSection')
+    const isTask = !card.parent_id
+
+    // #113: Show add-subtask form only for top-level tasks that are not done
+    if (isTask && card.status !== 'done') {
+      addSubtaskSection.style.display = ''
+      const titleInput = document.getElementById('newSubtaskTitle')
+      titleInput.value = ''
+      document.getElementById('addSubtaskBtn').onclick = async () => {
+        const title = titleInput.value.trim()
+        if (!title) { titleInput.focus(); return }
+        try {
+          const r = await fetch('/api/kanban', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title, parent_id: card.id, status: card.status, priority: card.priority, project: card.project || null, assignee: null }),
+          })
+          if (!r.ok) { showToast(t('kanban.toast.subtask_error')); return }
+          showToast(t('kanban.toast.subtask_created'))
+          loadKanban()
+          showCardDetail(card)
+        } catch { showToast(t('kanban.toast.subtask_error')) }
+      }
+    } else {
+      addSubtaskSection.style.display = 'none'
+    }
+
+    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
+    if (children.length > 0 || isTask) {
       section.style.display = ''
       list.innerHTML = ''
-      const statusLabelsShort = { planned: 'Tervezett', in_progress: 'Folyamatban', waiting: 'Vár', done: 'Kész' }
+      // #114: Delete button per subtask — only shown when the parent card is not done
+      const canDeleteChild = card.status !== 'done'
       for (const ch of children) {
         const div = document.createElement('div')
         div.className = 'comment-item'
-        div.style.cursor = 'pointer'
-        div.innerHTML = `<div><strong>${escapeHtml(ch.title)}</strong> <span style="color:var(--text-muted)">[${statusLabelsShort[ch.status] || ch.status}]</span></div>
-          <div style="font-size:0.85em; color:var(--text-muted)">${ch.assignee ? escapeHtml(ch.assignee) : ''} ${ch.description ? '-- ' + escapeHtml(ch.description).slice(0, 80) : ''}</div>`
-        div.onclick = () => { closeModal(cardDetailOverlay); showCardDetail(ch) }
+        div.style.cssText = 'cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px'
+        const info = document.createElement('div')
+        info.style.flex = '1'
+        info.innerHTML = `<div><strong>${escapeHtml(ch.title)}</strong> <span style="color:var(--text-muted)">[${statusLabelsShort[ch.status] || ch.status}]</span></div>
+          <div style="font-size:0.85em;color:var(--text-muted)">${ch.assignee ? escapeHtml(ch.assignee) : ''}${ch.description ? ' -- ' + escapeHtml(ch.description).slice(0, 80) : ''}</div>`
+        info.onclick = () => { closeModal(cardDetailOverlay); showCardDetail(ch) }
+        div.appendChild(info)
+        if (canDeleteChild) {
+          const delBtn = document.createElement('button')
+          delBtn.className = 'btn-danger btn-compact'
+          delBtn.style.flexShrink = '0'
+          delBtn.textContent = t('kanban.modal.delete_btn')
+          delBtn.onclick = async (e) => {
+            e.stopPropagation()
+            if (!confirm(t('kanban.confirm.delete_subtask', { title: ch.title }))) return
+            try {
+              const r = await fetch(`/api/kanban/${encodeURIComponent(ch.id)}`, { method: 'DELETE' })
+              if (!r.ok) { showToast(t('common.error_delete')); return }
+              showToast(t('kanban.toast.subtask_deleted'))
+              loadKanban()
+              showCardDetail(card)
+            } catch { showToast(t('common.error_delete')) }
+          }
+          div.appendChild(delBtn)
+        }
         list.appendChild(div)
       }
     } else {
       section.style.display = 'none'
     }
-  } catch { document.getElementById('cardChildrenSection').style.display = 'none' }
+  } catch {
+    document.getElementById('cardChildrenSection').style.display = 'none'
+    document.getElementById('cardAddSubtaskSection').style.display = 'none'
+  }
 
   // Breakdown button
   document.getElementById('cardBreakdownBtn').onclick = async () => {
     const btn = document.getElementById('cardBreakdownBtn')
     btn.disabled = true
-    btn.textContent = 'Generálás...'
+    btn.textContent = t('kanban.breakdown.generating')
     try {
       const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) { showToast(data.error || 'Hiba'); btn.disabled = false; btn.textContent = 'Breakdown'; return }
+      breakdownMode = 'kanban'
       breakdownCardId = card.id
       breakdownSubtasks = data.subtasks
       showBreakdownModal(data.subtasks, card)
+      const dodSec = document.getElementById('breakdownDoDSection')
+      if (dodSec) dodSec.style.display = 'none'
     } catch (err) {
       showToast('Breakdown hiba')
     } finally {
@@ -579,6 +1928,7 @@ async function triggerBreakdown(card) {
     const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
+    breakdownMode = 'kanban'
     breakdownCardId = card.id
     breakdownSubtasks = data.subtasks
     showBreakdownModal(data.subtasks, card)
@@ -590,13 +1940,13 @@ async function triggerBreakdown(card) {
 }
 
 function showBreakdownModal(subtasks, parentCard) {
-  document.getElementById('breakdownProvider').textContent = `Szülő: ${escapeHtml(parentCard.title)}`
+  document.getElementById('breakdownProvider').textContent = t('kanban.breakdown.parent_label', { title: escapeHtml(parentCard.title) })
   const list = document.getElementById('breakdownList')
   list.innerHTML = ''
 
-  const priorityLabels = { low: 'Alacsony', normal: 'Normál', high: 'Magas', urgent: 'Sürgős' }
+  const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
   const assigneeOptions = kanbanAssignees
-    .map((a) => `<option value="${escapeHtml(a.name)}">${escapeHtml(a.name)}</option>`)
+    .map((a) => `<option value="${escapeHtml(a.name)}">${escapeHtml(a.displayName || a.name)}</option>`)
     .join('')
 
   subtasks.forEach((st, i) => {
@@ -639,10 +1989,25 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
     const title = item.querySelector('.breakdown-title-input')?.value.trim() || breakdownSubtasks[idx]?.title
     const assignee = item.querySelector('.breakdown-assignee-select')?.value || breakdownSubtasks[idx]?.assignee
     const priority = breakdownSubtasks[idx]?.priority || 'normal'
-    accepted.push({ title, assignee, priority })
+    const description = breakdownSubtasks[idx]?.description || ''
+    accepted.push({ title, assignee, priority, description })
   })
-  if (accepted.length === 0) { showToast('Válassz legalább egy subtask-ot'); return }
+  if (accepted.length === 0) { showToast(t('kanban.breakdown.select_one')); return }
   try {
+    if (breakdownMode === 'idea') {
+      const successCriteria = document.getElementById('breakdownSuccessCriteria')?.value.trim() || undefined
+      const res = await fetch(`/api/ideas/${encodeURIComponent(breakdownIdeaId)}/promote-breakdown`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subtasks: accepted, success_criteria: successCriteria }),
+      })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Hiba'); return }
+      closeModal(breakdownOverlay)
+      showToast(t('kanban.breakdown.promoted', { count: data.child_count }))
+      loadIdeasPage()
+      return
+    }
     const res = await fetch(`/api/kanban/${encodeURIComponent(breakdownCardId)}/breakdown/accept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -652,16 +2017,16 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
     if (!res.ok) { showToast(data.error || 'Hiba'); return }
     closeModal(breakdownOverlay)
     closeModal(cardDetailOverlay)
-    showToast(`${data.created.length} subtask létrehozva`)
+    showToast(t('kanban.breakdown.created_count', { count: data.created.length }))
     loadKanban()
   } catch {
-    showToast('Hiba a subtask-ok mentése során')
+    showToast(t('common.error_save'))
   }
 })
 
 document.getElementById('breakdownRejectBtn').addEventListener('click', () => {
   closeModal(breakdownOverlay)
-  showToast('Breakdown elvetve')
+  showToast(t('kanban.toast.breakdown_rejected'))
 })
 
 document.getElementById('breakdownClose').addEventListener('click', () => closeModal(breakdownOverlay))
@@ -686,8 +2051,16 @@ const AVATARS = [
 ]
 
 let selectedAvatar = null
+let selectedAvatarFile = null // custom upload chosen in the create wizard (deferred until the agent exists)
 let agents = []
 let currentAgent = null
+// API-safe agent id for the currently open detail modal. Sub-agents key off
+// their name; the main agent's detail object carries name:'marveen' for legacy
+// UI checks but its real agent-dir id is agentId (MAIN_AGENT_ID, e.g.
+// 'gorcsevivan') -- the /api/agents/<id>/skills endpoints need that real id.
+function agentApiName() {
+  return currentAgent ? (currentAgent.agentId || currentAgent.name) : ''
+}
 let wizardStep = 1
 let generatedClaudeMd = ''
 let generatedSoulMd = ''
@@ -745,6 +2118,9 @@ function populateAvatarGrid() {
       grid.querySelectorAll('.avatar-grid-item').forEach(i => i.classList.remove('selected'))
       item.classList.add('selected')
       selectedAvatar = avatar
+      // Gallery pick and custom upload are mutually exclusive.
+      selectedAvatarFile = null
+      resetCreateAvatarUpload()
     })
     grid.appendChild(item)
   }
@@ -767,7 +2143,7 @@ function populateProfileSelect(selectEl, descEl, selected) {
     for (const p of profiles) {
       const opt = document.createElement('option')
       opt.value = p.id
-      const tag = p.permissionMode === 'strict' ? ' (szigorú)' : ''
+      const tag = p.permissionMode === 'strict' ? ` (${t('agents.strict_mode')})` : ''
       opt.textContent = `${p.label}${tag}`
       if (p.id === selected) opt.selected = true
       selectEl.appendChild(opt)
@@ -788,7 +2164,9 @@ function resetWizard() {
   agentModel.value = 'inherit'
   loadAvailableModels()
   selectedAvatar = null
+  selectedAvatarFile = null
   document.querySelectorAll('#avatarGrid .avatar-grid-item').forEach(i => i.classList.remove('selected'))
+  resetCreateAvatarUpload()
   generatedClaudeMd = ''
   generatedSoulMd = ''
   wizardCreatedName = ''
@@ -826,7 +2204,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
   updateWizardUI()
 
   const statusEl = document.getElementById('wizardGenStatus')
-  statusEl.textContent = 'CLAUDE.md generálás...'
+  statusEl.textContent = t('agents.claude_md_generating')
 
   try {
     // Create agent via API (returns generated content)
@@ -852,7 +2230,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
     // like "étrendíró" still resolves to the real agent dir "etrendiro".
     const createdName = result.name || name
     wizardCreatedName = createdName
-    statusEl.textContent = 'SOUL.md generálás...'
+    statusEl.textContent = t('agents.soul_md_generating')
 
     // Fetch full agent details to get generated content
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(createdName)}`)
@@ -862,10 +2240,18 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       generatedSoulMd = detail.soulMd || ''
     }
 
-    statusEl.textContent = 'Kész!'
+    statusEl.textContent = t('kanban.breakdown.running')
 
-    // Set gallery avatar if selected
-    if (selectedAvatar) {
+    // Apply the chosen avatar. Custom upload wins over a gallery pick; both go
+    // to the same endpoint (FormData for a file, JSON for a gallery name).
+    if (selectedAvatarFile) {
+      const form = new FormData()
+      form.append('avatar', selectedAvatarFile, selectedAvatarFile.name)
+      await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
+        method: 'POST',
+        body: form,
+      })
+    } else if (selectedAvatar) {
       await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -952,10 +2338,66 @@ async function loadAgents() {
       fetch('/api/marveen'),
     ])
     agents = await agentsRes.json()
-    if (marveenRes.ok) window._marveen = await marveenRes.json()
+    if (marveenRes.ok) {
+      window._marveen = await marveenRes.json()
+      // A backend CHANNEL_PROVIDER-éhez igazitsuk a kliens-default-ot,
+      // hogy ne 'telegram' jelenjen meg amikor a backend discord-on van.
+      if (window._marveen?.channelProvider) {
+        currentChannelProvider = window._marveen.channelProvider
+        const sel = document.getElementById('chProviderSelect')
+        if (sel) sel.value = currentChannelProvider
+        if (typeof updateProviderUI === 'function') updateProviderUI()
+      }
+    }
     renderAgents()
   } catch (err) {
     console.error('Betöltés hiba:', err)
+  }
+}
+
+// Format a context-token count for display (e.g. 699884 -> "≈700k token").
+function formatContextTokens(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n <= 0) return '-'
+  if (n < 1000) return `${n} token`
+  const k = n / 1000
+  return `≈${k < 10 ? k.toFixed(1) : Math.round(k)}k token`
+}
+
+// Populate the auto-restart controls + context display from an agent payload.
+// Works for sub-agents (agent.name) and the main session (agent.autoRestartId).
+function setupAutoRestartUI(agent) {
+  const ctxEl = document.getElementById('agentDetailContext')
+  if (ctxEl) ctxEl.textContent = formatContextTokens(agent && agent.contextTokens)
+
+  const ar = (agent && agent.autoRestart) || { enabled: false, mode: 'continue', dailyTime: null, intervalHours: null }
+  const enabled = document.getElementById('arEnabled')
+  const mode = document.getElementById('arMode')
+  const schedKind = document.getElementById('arSchedKind')
+  const dailyWrap = document.getElementById('arDailyWrap')
+  const dailyTime = document.getElementById('arDailyTime')
+  const intervalWrap = document.getElementById('arIntervalWrap')
+  const intervalHours = document.getElementById('arIntervalHours')
+  if (!enabled || !mode || !schedKind) return
+
+  enabled.checked = ar.enabled === true
+  mode.value = ar.mode === 'fresh' ? 'fresh' : 'continue'
+  if (ar.intervalHours) {
+    schedKind.value = 'interval'
+    intervalHours.value = ar.intervalHours
+  } else {
+    schedKind.value = 'daily'
+    if (ar.dailyTime) dailyTime.value = ar.dailyTime
+  }
+  const syncSched = () => {
+    const isInterval = schedKind.value === 'interval'
+    intervalWrap.hidden = !isInterval
+    dailyWrap.hidden = isInterval
+  }
+  syncSched()
+  // Attach the show/hide listener once.
+  if (schedKind.dataset.wired !== '1') {
+    schedKind.addEventListener('change', syncSched)
+    schedKind.dataset.wired = '1'
   }
 }
 
@@ -964,7 +2406,8 @@ async function openMarveenDetail() {
   if (!m) return
 
   // Reuse the agent detail modal for Marveen
-  currentAgent = { ...m, name: 'marveen', claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
+  currentAgent = { ...m, name: mainAgentId(), claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
+  setupAutoRestartUI(currentAgent)
 
   const displayName = m.name || 'Marveen'
   document.getElementById('agentDetailTitle').textContent = displayName
@@ -973,16 +2416,24 @@ async function openMarveenDetail() {
   avatar.innerHTML = `<img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}">`
   document.getElementById('agentDetailName').textContent = displayName
   document.getElementById('agentDetailDesc').textContent = m.description || ''
-  document.getElementById('agentDetailModel').textContent = 'claude-opus-4-6'
-  document.getElementById('agentDetailChStatus').innerHTML = '<span class="tg-status"><span class="tg-dot connected"></span>Csatlakozva</span>'
-  document.getElementById('agentDetailSkillCount').textContent = '-'
+  document.getElementById('agentDetailModel').textContent = m.model || '-'
+  document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot connected"></span>${t('agents.channel.connected')}</span>`
+  // Populate the Skills tab for the main agent too: the endpoint returns the
+  // global ~/.claude/skills under its real id (agentId), which every agent
+  // inherits. Previously this was hard-set to '-' and loadSkills was never
+  // called, so the main agent's Skills tab always looked empty.
+  loadSkills(agentApiName())
 
   // Process control for Marveen - always running, no start/stop
   document.getElementById('processDot').className = 'process-dot running'
-  document.getElementById('processLabel').textContent = 'Fut'
-  document.getElementById('processUptime').textContent = 'tmux: marveen-channels'
+  document.getElementById('processLabel').textContent = t('agents.status.running')
+  document.getElementById('processUptime').textContent = `tmux: ${m.tmuxSession || '-'}`
   document.getElementById('agentStartBtn').hidden = true
   document.getElementById('agentStopBtn').hidden = true
+  // Sync the settings tab model select with Marveen's actual model so it
+  // doesn't carry over the previously opened sub-agent's selection.
+  const marveenModelSelect = document.getElementById('editAgentModel')
+  if (marveenModelSelect) marveenModelSelect.value = m.activeModel || m.model || ''
   // Surface the "channels restart" button -- destructive, but mobile-safe
   // when the Telegram plugin wedges and you're away from a terminal.
   document.getElementById('marveenRestartBtn').hidden = false
@@ -1007,8 +2458,10 @@ async function openMarveenDetail() {
   // Telegram tab -- without this the tab stays in the default "not connected"
   // view even though the bot is running and receiving messages.
   updateChannelTab({
-    name: 'marveen',
+    name: mainAgentId(),
     hasTelegram: mFull.hasTelegram !== undefined ? mFull.hasTelegram : true,
+    hasDiscord: mFull.hasDiscord,
+    hasSlack: mFull.hasSlack,
     telegramBotUsername: mFull.telegramBotUsername,
     running: true,
   })
@@ -1023,7 +2476,12 @@ async function openMarveenDetail() {
 
 function applyMarveenReadonlyMode(readOnly) {
   const textareaIds = ['editClaudeMd', 'editSoulMd', 'editMcpJson']
-  const saveButtonIds = ['saveClaudeMdBtn', 'saveSoulMdBtn', 'saveMcpJsonBtn', 'saveModelBtn', 'saveAuthModeBtn']
+  // saveModelBtn stays VISIBLE but disabled for Marveen, so the settings tab
+  // doesn't look like the row is missing -- the other save buttons (tied to
+  // readonly textareas) are hidden because the textareas are also hidden by
+  // the readonly note flow.
+  const hideButtonIds = ['saveClaudeMdBtn', 'saveSoulMdBtn', 'saveMcpJsonBtn', 'saveAuthModeBtn']
+  const disableButtonIds = ['saveModelBtn']
   for (const id of textareaIds) {
     const el = document.getElementById(id)
     if (!el) continue
@@ -1032,12 +2490,18 @@ function applyMarveenReadonlyMode(readOnly) {
   }
   const modelSelect = document.getElementById('editAgentModel')
   if (modelSelect) modelSelect.disabled = readOnly
-  for (const id of saveButtonIds) {
+  for (const id of hideButtonIds) {
     const btn = document.getElementById(id)
     if (btn) btn.hidden = readOnly
   }
+  for (const id of disableButtonIds) {
+    const btn = document.getElementById(id)
+    if (btn) { btn.hidden = false; btn.disabled = readOnly }
+  }
   const authModeGroup = document.getElementById('authModeGroup')
   if (authModeGroup) authModeGroup.hidden = readOnly
+  const memoryIsolationGroup = document.getElementById('memoryIsolationGroup')
+  if (memoryIsolationGroup) memoryIsolationGroup.hidden = readOnly
   const note = document.getElementById('marveenReadonlyNote')
   if (note) note.hidden = !readOnly
 }
@@ -1048,6 +2512,56 @@ function getAvatarGradient(name) {
   return 'gradient-' + ((hash % 3) + 1)
 }
 
+// Tooltip text for the "Fut" / "Leállva" footer indicator (process state).
+function processTip(isRunning) {
+  return isRunning
+    ? t('agents.running_tip')
+    : t('agents.stopped_tip')
+}
+
+// Tooltip text for the "Online" / "Offline" footer indicator (channel state).
+function channelTip(isConnected) {
+  return isConnected
+    ? t('agents.online_tip')
+    : t('agents.offline_tip')
+}
+
+// Build the copy-paste tmux attach command for an agent live session. A local
+// agent session runs on the orchestrator host (a direct `tmux attach`); a remote
+// agent session runs on its configured remoteHost, reached over ssh. Only
+// meaningful for running agents.
+function tmuxAttachCommand(agent) {
+  const session = agent.session || ('agent-' + agent.name)
+  const direct = 'tmux attach -t ' + session
+  const remoteHost = agent.remoteHost || null
+  return remoteHost ? 'ssh ' + remoteHost + " -t '" + direct + "'" : direct
+}
+
+// Append a single "copy tmux attach command" button to a running agent card.
+// Clicks copy to clipboard and never bubble to the card open-detail handler.
+function attachTmuxCopyButtons(card, agent) {
+  const cmd = tmuxAttachCommand(agent)
+  const row = document.createElement('div')
+  row.className = 'agent-tmux-cmds'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'tmux-copy-btn'
+  btn.setAttribute('aria-label', t('agents.tmux_copy_aria'))
+  btn.title = cmd
+  btn.innerHTML = '<span class="tmux-copy-ico">⧉</span>tmux'
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    navigator.clipboard.writeText(cmd).then(() => {
+      const orig = btn.innerHTML
+      btn.classList.add('copied')
+      btn.innerHTML = '<span class="tmux-copy-ico">✓</span>' + t('agents.tmux_copied')
+      setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('copied') }, 1400)
+    }).catch(() => showToast(t('agents.tmux_copy_failed')))
+  })
+  row.appendChild(btn)
+  card.appendChild(row)
+}
+
 function renderAgents() {
   agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((el) => el.remove())
 
@@ -1055,22 +2569,44 @@ function renderAgents() {
   if (window._marveen) {
     const m = window._marveen
     const displayName = m.name || 'Marveen'
+    // The model is no longer hardcoded: /api/marveen reports the configured
+    // model (readActiveModelFromProjectDir). Mirror the sub-agent card, which
+    // uses the model value as both the badge label and class. Fall back to
+    // 'opus' only before /api/marveen has resolved (or on a legacy backend).
+    const mainModelLabel = m.model || 'opus'
+    const mainModelClass = m.model || 'opus'
     const mCard = document.createElement('div')
     mCard.className = 'agent-card marveen-card'
     mCard.innerHTML = `
       <div class="agent-card-top">
         <div class="agent-avatar gradient-1"><img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}"></div>
         <div class="agent-card-info">
-          <div class="agent-name">${escapeHtml(displayName)} <span class="marveen-badge">fo asszisztens</span></div>
+          <div class="agent-name">${escapeHtml(displayName)} <span class="marveen-badge">${t('agents.main_badge')}</span></div>
           <div class="agent-desc">${escapeHtml(m.description || '')}</div>
         </div>
       </div>
       <div class="agent-card-footer">
-        <span class="agent-model-badge opus">opus</span>
-        <span class="process-indicator"><span class="process-dot running"></span>Fut</span>
-        <span class="tg-status"><span class="tg-dot connected"></span>Online</span>
+        <span class="agent-model-badge ${escapeHtml(mainModelClass)}">${escapeHtml(mainModelLabel)}</span>
+        <span class="process-indicator" title="${t('agents.marveen_process_tip')}"><span class="process-dot running"></span>${t('agents.status.running')}</span>
+        <span class="tg-status" title="${t('agents.marveen_channel_tip')}"><span class="tg-dot connected"></span>${t('agents.status.online')}</span>
+      </div>
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact agent-conversation-btn" title="${t('agents.btn.conversation')}">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          ${t('agents.btn.conversation')}
+        </button>
+        <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          Terminal
+        </button>
       </div>
     `
+    mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openTerminalModal(mainAgentId())
+    })
+    mCard.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openConversationModal(mainAgentId(), t('agents.marveen_boss'))
+    })
     mCard.addEventListener('click', () => openMarveenDetail())
     agentsGrid.insertBefore(mCard, addBtn)
   }
@@ -1090,12 +2626,12 @@ function renderAgents() {
 
     const modelClass = agent.model && agent.model !== 'inherit' ? agent.model : ''
     const modelLabel = agent.model || 'inherit'
-    const chConnected = agent.hasTelegram || false
+    const chConnected = agentIsConnected(agent)
     const chDotClass = chConnected ? 'connected' : 'disconnected'
-    const chLabel = chConnected ? 'Online' : 'Offline'
+    const chLabel = chConnected ? t('agents.status.online') : t('agents.status.offline')
     const isRunning = agent.running || false
     const runDotClass = isRunning ? 'running' : 'stopped'
-    const runLabel = isRunning ? 'Fut' : 'Leállva'
+    const runLabel = isRunning ? t('agents.status.running') : t('agents.status.stopped')
 
     card.innerHTML = `
       <div class="agent-card-top">
@@ -1107,11 +2643,41 @@ function renderAgents() {
       </div>
       <div class="agent-card-footer">
         <span class="agent-model-badge ${escapeHtml(modelClass)}">${escapeHtml(modelLabel)}</span>
-        <span class="process-indicator"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
-        <span class="tg-status"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
+        <span class="process-indicator" title="${escapeHtml(processTip(isRunning))}"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
+        <span class="tg-status" title="${escapeHtml(channelTip(chConnected))}"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
+      </div>
+      ${agent.needsReauth ? `
+        <div class="agent-reauth-banner">
+          <span class="agent-reauth-reason">${escapeHtml(agent.reauthReason || t('agents.reauth.reason'))}</span>
+          <button class="btn-danger btn-compact agent-login-btn" data-phase="start">${t('agents.btn.login')}</button>
+        </div>` : ''}
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact agent-conversation-btn" title="${t('agents.btn.conversation')}">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          ${t('agents.btn.conversation')}
+        </button>
+        <button class="btn-secondary btn-compact agent-terminal-btn" title="Terminal">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          Terminal
+        </button>
       </div>
     `
+    // Login button handler (start → confirm flow)
+    card.querySelectorAll('.agent-login-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => { e.stopPropagation(); handleAgentLogin(agent.name, btn) })
+    })
+    // Terminal button
+    card.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openTerminalModal(agent.name)
+    })
+    // Conversation (readable transcript) button
+    card.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation(); openConversationModal(agent.name, label)
+    })
     card.addEventListener('click', () => openAgentDetail(agent.name))
+    // Only running agents have a live session to look at, so only they get the
+    // copy-the-tmux-command buttons.
+    if (isRunning) attachTmuxCopyButtons(card, agent)
     agentsGrid.insertBefore(card, addBtn)
   }
 }
@@ -1120,10 +2686,10 @@ function renderAgents() {
 async function openAgentDetail(agentName) {
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}`)
-    if (!res.ok) throw new Error('Nem található')
+    if (!res.ok) throw new Error('Not found')
     currentAgent = await res.json()
   } catch (err) {
-    showToast('Ügynök betöltése sikertelen')
+    showToast(t('agents.toast.load_failed'))
     return
   }
 
@@ -1142,15 +2708,16 @@ async function openAgentDetail(agentName) {
     : initial
   document.getElementById('agentDetailName').textContent = detailLabel
   document.getElementById('agentDetailDesc').textContent = currentAgent.description || ''
-  document.getElementById('agentDetailModel').textContent = currentAgent.model || 'inherit'
+  document.getElementById('agentDetailModel').textContent = currentAgent.activeModel || currentAgent.model || 'inherit'
+  document.getElementById('agentDetailModelRestarting').hidden = true
 
-  const chConnected = currentAgent.hasTelegram || false
-  document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot ${chConnected ? 'connected' : 'disconnected'}"></span>${chConnected ? 'Csatlakozva' : 'Nincs bekötve'}</span>`
+  const chConnected = agentIsConnected(currentAgent)
+  document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot ${chConnected ? 'connected' : 'disconnected'}"></span>${chConnected ? t('agents.channel.connected') : t('agents.channel.disconnected')}</span>`
 
   // Settings tab - load Ollama + DeepSeek models then set value
   loadAvailableModels()
   loadOllamaModels().then(() => {
-    document.getElementById('editAgentModel').value = currentAgent.model || 'claude-sonnet-4-6'
+    document.getElementById('editAgentModel').value = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
   })
   populateProfileSelect(
     document.getElementById('editAgentProfile'),
@@ -1159,9 +2726,15 @@ async function openAgentDetail(agentName) {
   )
   renderTeamEditor(currentAgent, agents)
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
+  const memIsoToggle = document.getElementById('memoryIsolationToggle')
+  if (memIsoToggle) memIsoToggle.checked = currentAgent.memoryIsolation === true
+  loadVoiceConfig(currentAgent.name)
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
   document.getElementById('editMcpJson').value = currentAgent.mcpJson || ''
+
+  // Auto-restart settings + live context size
+  setupAutoRestartUI(currentAgent)
 
   // Telegram tab
   updateChannelTab(currentAgent)
@@ -1181,14 +2754,14 @@ async function openAgentDetail(agentName) {
   // Delete button (restore visibility for normal agents)
   document.getElementById('deleteAgentBtn').style.display = ''
   document.getElementById('deleteAgentBtn').onclick = async () => {
-    if (!confirm(`Biztosan törlöd: ${currentAgent.name}?`)) return
+    if (!confirm(t('agents.confirm.delete', { name: currentAgent.name }))) return
     try {
       await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, { method: 'DELETE' })
       closeModal(agentDetailOverlay)
-      showToast('Ügynök törölve')
+      showToast(t('agents.toast.deleted'))
       loadAgents()
     } catch (err) {
-      showToast('Hiba a törlés során')
+      showToast(t('common.error_delete'))
     }
   }
 
@@ -1218,13 +2791,13 @@ function populateDetailAvatarGrid() {
           body: JSON.stringify({ galleryAvatar: avatar }),
         })
         if (!res.ok) throw new Error()
-        showToast('Avatar frissítve')
+        showToast(t('agents.toast.avatar_updated'))
         // Update the detail avatar display
         document.getElementById('agentDetailAvatar').innerHTML = `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}" alt="">`
         document.getElementById('detailAvatarGallery').hidden = true
         loadAgents()
       } catch {
-        showToast('Hiba az avatar mentése során')
+        showToast(t('agents.toast.avatar_error'))
       }
     })
     grid.appendChild(item)
@@ -1252,13 +2825,13 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
             body: JSON.stringify({ galleryAvatar: avatar }),
           })
           if (!res.ok) throw new Error()
-          showToast('Avatar frissítve')
+          showToast(t('agents.toast.avatar_updated'))
           const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
           document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
           gallery.hidden = true
           loadAgents()
         } catch {
-          showToast('Hiba az avatar mentése során')
+          showToast(t('agents.toast.avatar_error'))
         }
       })
       grid.appendChild(item)
@@ -1304,11 +2877,11 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
 
   async function handleAvatarFile(file) {
     if (!file.type.match(/^image\/(png|jpe?g|webp)$/)) {
-      showToast('Csak png/jpg/webp formátum')
+      showToast(t('agents.toast.avatar_format'))
       return
     }
     if (file.size > MAX_SIZE) {
-      showToast('Max 1 MB méretű kép')
+      showToast(t('agents.toast.avatar_size'))
       return
     }
     previewImg.src = URL.createObjectURL(file)
@@ -1326,16 +2899,79 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
     try {
       const res = await fetch(endpoint, { method: 'POST', body: form })
       if (!res.ok) throw new Error()
-      showToast('Avatar feltöltve, kép elküldve Telegramon')
+      showToast(t('agents.toast.avatar_uploaded'))
       const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
       document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
       document.getElementById('detailAvatarGallery').hidden = true
       resetAvatarUpload()
       loadAgents()
     } catch {
-      showToast('Hiba a feltöltés során')
+      showToast(t('common.error_save'))
       resetAvatarUpload()
     }
+  }
+})()
+
+// === Create-wizard avatar upload ===
+// Mirrors the detail-modal uploader, but the agent does not exist yet, so the
+// file is held in `selectedAvatarFile` and POSTed after creation (see the
+// wizard create flow). Hoisted so populateAvatarGrid()/resetWizard() can reset.
+function resetCreateAvatarUpload() {
+  const fileInput = document.getElementById('createAvatarFileInput')
+  const content = document.getElementById('createAvatarUploadContent')
+  const preview = document.getElementById('createAvatarUploadPreview')
+  if (!fileInput || !content || !preview) return
+  fileInput.value = ''
+  content.hidden = false
+  preview.hidden = true
+}
+;(() => {
+  const zone = document.getElementById('createAvatarUploadZone')
+  if (!zone) return
+  const fileInput = document.getElementById('createAvatarFileInput')
+  const content = document.getElementById('createAvatarUploadContent')
+  const preview = document.getElementById('createAvatarUploadPreview')
+  const previewImg = document.getElementById('createAvatarPreviewImg')
+  const clearBtn = document.getElementById('createAvatarPreviewClear')
+  const MAX_SIZE = 1024 * 1024
+
+  zone.addEventListener('click', (e) => {
+    if (e.target === clearBtn || clearBtn.contains(e.target)) return
+    fileInput.click()
+  })
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over') })
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'))
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault()
+    zone.classList.remove('drag-over')
+    const file = e.dataTransfer.files[0]
+    if (file) handleCreateAvatarFile(file)
+  })
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleCreateAvatarFile(fileInput.files[0])
+  })
+  clearBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    selectedAvatarFile = null
+    resetCreateAvatarUpload()
+  })
+
+  function handleCreateAvatarFile(file) {
+    if (!file.type.match(/^image\/(png|jpe?g|webp)$/)) {
+      showToast(t('agents.toast.avatar_format'))
+      return
+    }
+    if (file.size > MAX_SIZE) {
+      showToast(t('agents.toast.avatar_size'))
+      return
+    }
+    // Custom upload and gallery pick are mutually exclusive.
+    selectedAvatar = null
+    document.querySelectorAll('#avatarGrid .avatar-grid-item').forEach(i => i.classList.remove('selected'))
+    selectedAvatarFile = file
+    previewImg.src = URL.createObjectURL(file)
+    content.hidden = true
+    preview.hidden = false
   }
 })()
 
@@ -1349,7 +2985,7 @@ function updateProcessControl(agent) {
   const stopBtn = document.getElementById('agentStopBtn')
 
   dot.className = 'process-dot ' + (running ? 'running' : 'stopped')
-  label.textContent = running ? 'Fut' : 'Leállva'
+  label.textContent = running ? t('agents.status.running') : t('agents.status.stopped')
   startBtn.hidden = running
   stopBtn.hidden = !running
 
@@ -1361,16 +2997,16 @@ function updateProcessControl(agent) {
 }
 
 document.getElementById('marveenRestartBtn').addEventListener('click', async () => {
-  if (!confirm('Hard restart a marveen-channels session-ön. A folyamatban lévő Marveen beszélgetés elveszik (memória megmarad). Folytatod?')) return
+  if (!confirm(t('agents.confirm.hard_restart'))) return
   const btn = document.getElementById('marveenRestartBtn')
   btn.disabled = true
   try {
     const res = await fetch('/api/marveen/restart', { method: 'POST' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || 'Restart sikertelen')
+      throw new Error(err.error || t('agents.toast.restart_failed'))
     }
-    showToast('Marveen channels újraindítva')
+    showToast(t('agents.toast.marveen_restarted'))
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
   } finally {
@@ -1389,9 +3025,9 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/start`, { method: 'POST' })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Indítási hiba')
+      throw new Error(err.error || t('agents.toast.start_failed'))
     }
-    showToast('Ügynök elindítva!')
+    showToast(t('agents.toast.started'))
     // Refresh
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
@@ -1410,15 +3046,15 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
 
 document.getElementById('agentStopBtn').addEventListener('click', async () => {
   if (!currentAgent) return
-  if (!confirm('Biztosan leállítod az ügynököt?')) return
+  if (!confirm(t('agents.confirm.stop'))) return
 
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/stop`, { method: 'POST' })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Leállítási hiba')
+      throw new Error(err.error || t('agents.toast.stop_failed'))
     }
-    showToast('Ügynök leállítva')
+    showToast(t('agents.toast.stopped'))
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
       currentAgent = await detailRes.json()
@@ -1438,6 +3074,21 @@ document.getElementById('agentTabNav').addEventListener('click', (e) => {
 })
 
 let currentChannelProvider = 'telegram'
+// Az induláskor a backend CHANNEL_PROVIDER-jét lekérjük, és a dropdown +
+// state default-ot ahhoz igazitjuk -- igy ha a backend discord-on van,
+// a UI nem hardcode-olt 'telegram'-mal indul barmelyik oldalra is navigal a user.
+;(async function initChannelProviderDefault() {
+  try {
+    const res = await fetch('/api/marveen')
+    if (!res.ok) return
+    const data = await res.json()
+    if (!data.channelProvider || data.channelProvider === currentChannelProvider) return
+    currentChannelProvider = data.channelProvider
+    const sel = document.getElementById('chProviderSelect')
+    if (sel) sel.value = currentChannelProvider
+    if (typeof updateProviderUI === 'function') updateProviderUI()
+  } catch { /* ignore -- a kepernyo default-on marad */ }
+})()
 let channelAutoPollTimer = null
 function startChannelAutoPoll() {
   if (channelAutoPollTimer) return
@@ -1518,17 +3169,323 @@ async function loadAvailableModels() {
   } catch { /* dashboard not available */ }
 }
 
+let modelRestartPollTimer = null
+let modelRestartPollName = null
+
+function stopModelRestartPolling() {
+  if (modelRestartPollTimer) { clearInterval(modelRestartPollTimer); modelRestartPollTimer = null }
+  modelRestartPollName = null
+}
+
+function startModelRestartPolling(name, expectedModel, triggeredAt) {
+  stopModelRestartPolling()
+  modelRestartPollName = name
+  const badge = document.getElementById('agentDetailModelRestarting')
+  const display = document.getElementById('agentDetailModel')
+  const processLabel = document.getElementById('processLabel')
+  const processDot = document.getElementById('processDot')
+  const deadline = Date.now() + 60000
+  modelRestartPollTimer = setInterval(async () => {
+    if (modelRestartPollName !== name || !currentAgent || currentAgent.name !== name) {
+      stopModelRestartPolling(); return
+    }
+    if (Date.now() > deadline) {
+      stopModelRestartPolling()
+      badge.hidden = true
+      if (currentAgent) updateProcessControl(currentAgent)
+      showToast(t('agents.toast.restart_state_error'))
+      return
+    }
+    try {
+      const r = await fetch(`/api/agents/${encodeURIComponent(name)}`)
+      if (!r.ok) return
+      const data = await r.json()
+      // The new tmux session's creation timestamp is the reliable "restart
+      // complete" signal. Claude Code writes the "model" field into the
+      // session jsonl only when it answers a message, so activeModel may
+      // stay null/old until the agent receives its first prompt -- waiting
+      // for that match would time out on idle agents. The configured model
+      // is what the agent was just started with via --model.
+      const restarted = data.runningSince && data.runningSince >= triggeredAt
+      if (restarted) {
+        const displayModel = data.activeModel || data.model
+        if (currentAgent && currentAgent.name === name) {
+          currentAgent.activeModel = data.activeModel
+          currentAgent.runningSince = data.runningSince
+          currentAgent.model = data.model
+          currentAgent.running = !!data.running
+          currentAgent.session = data.session
+          display.textContent = displayModel
+        }
+        badge.hidden = true
+        processDot.className = 'process-dot running'
+        processLabel.textContent = t('agents.status.running')
+        stopModelRestartPolling()
+        const liveMatched = data.activeModel === expectedModel
+        showToast(liveMatched
+          ? t('agents.model.toast_active', { model: displayModel })
+          : t('agents.model.toast_restarted', { model: displayModel }))
+      }
+    } catch { /* network blip, keep polling */ }
+  }, 2000)
+}
+
 document.getElementById('saveModelBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
+  const newModel = document.getElementById('editAgentModel').value
+  const name = currentAgent.name
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: document.getElementById('editAgentModel').value }),
+      body: JSON.stringify({ model: newModel }),
     })
     if (!res.ok) throw new Error()
-    showToast('Modell mentve (újraindítás szükséges)')
+    currentAgent.model = newModel
+    const triggeredAt = Math.floor(Date.now() / 1000)
+    document.getElementById('agentDetailModelRestarting').hidden = false
+    document.getElementById('processLabel').textContent = t('agents.process_label')
+    document.getElementById('processDot').className = 'process-dot restarting'
+    showToast(t('agents.toast.model_save_restart'))
     loadAgents()
+    const restartRes = await fetch(`/api/agents/${encodeURIComponent(name)}/restart`, { method: 'POST' })
+    if (!restartRes.ok) {
+      document.getElementById('agentDetailModelRestarting').hidden = true
+      if (currentAgent) updateProcessControl(currentAgent)
+      showToast(t('agents.restart_failed'))
+      return
+    }
+    startModelRestartPolling(name, newModel, triggeredAt)
+  } catch { showToast(t('common.error_save')) }
+})
+
+document.getElementById('modelSuggestBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const resultDiv = document.getElementById('modelSuggestionResult')
+  resultDiv.style.display = 'block'
+  resultDiv.textContent = t('agents.model.analyzing')
+  try {
+    const res = await fetch('/api/agents/model-suggest', { method: 'POST' })
+    if (!res.ok) throw new Error()
+    const { results } = await res.json()
+    const entry = results.find(r => r.agent === currentAgent.name)
+    if (!entry) {
+      resultDiv.textContent = t('agents.model.no_data')
+      return
+    }
+    resultDiv.style.color = entry.changeAdvised ? 'var(--warning, #e6a817)' : 'var(--success)'
+    resultDiv.style.whiteSpace = 'pre-wrap'
+    resultDiv.style.fontFamily = 'monospace'
+    resultDiv.style.fontSize = '12px'
+    resultDiv.textContent = entry.reason
+  } catch { resultDiv.textContent = t('agents.model.error') }
+})
+
+document.getElementById('analyzeAllModelsBtn').addEventListener('click', async () => {
+  const panel = document.getElementById('agentsModelAnalysis')
+  panel.style.display = 'block'
+  panel.innerHTML = '<p style="color:var(--text-muted);font-size:13px">' + t('agents.model.analyzing_all') + '</p>'
+  try {
+    const res = await fetch('/api/agents/model-suggest', { method: 'POST' })
+    if (!res.ok) throw new Error()
+    const { results } = await res.json()
+    const changes = results.filter(r => r.changeAdvised)
+    const ok = results.filter(r => !r.changeAdvised)
+    let html = '<div style="font-size:13px;padding:12px 14px;background:var(--surface-hover);border-radius:8px;border:1px solid var(--border)">'
+    html += `<p style="margin:0 0 8px;font-weight:600">${t('agents.model.title', { n: results.length })}</p>`
+    if (changes.length === 0) {
+      html += '<p style="color:var(--success);margin:0">' + t('agents.model.all_ok') + '</p>'
+    } else {
+      html += `<p style="color:var(--warning, #e6a817);margin:0 0 8px">${t('agents.model.changes_n', { n: changes.length })}</p>`
+      html += '<ul style="margin:0 0 10px;padding-left:18px">'
+      for (const r of changes) {
+        const safeReason = r.reason.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        html += `<li style="margin-bottom:6px"><strong>${r.agent}</strong>: ${r.currentModel} &rarr; ${r.suggestedModel}`
+        html += ` <details style="display:inline-block;vertical-align:top;margin-left:4px"><summary style="cursor:pointer;font-size:11px;color:var(--text-muted)">${t('agents.model.details')}</summary>`
+        html += `<pre style="white-space:pre-wrap;font-size:11px;margin:4px 0 0;background:var(--surface);padding:6px 8px;border-radius:4px;color:var(--text-muted)">${safeReason}</pre></details></li>`
+      }
+      html += '</ul>'
+      if (ok.length > 0) {
+        html += `<p style="color:var(--text-muted);margin:0;font-size:12px">${t('agents.model.ok_agents', { list: ok.map(r => r.agent).join(', ') })}</p>`
+      }
+      html += `<button class="btn-secondary btn-compact" id="createModelChangeCardsBtn" style="margin-top:10px">${t('agents.model.create_cards_btn')}</button>`
+    }
+    html += '</div>'
+    panel.innerHTML = html
+    const createBtn = document.getElementById('createModelChangeCardsBtn')
+    if (createBtn) {
+      createBtn.addEventListener('click', async () => {
+        if (!confirm(t('agents.model.cards_confirm', { n: changes.length }))) return
+        createBtn.disabled = true
+        createBtn.textContent = t('agents.model.creating_cards')
+        let created = 0
+        for (const r of changes) {
+          try {
+            await fetch('/api/kanban', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title: t('agents.model.card_title', { agent: r.agent }),
+                description: t('agents.model.card_desc', { current: r.currentModel, suggested: r.suggestedModel, reason: r.reason }),
+                assignee: 'marveen',
+                priority: 'normal',
+                status: 'planned',
+              }),
+            })
+            created++
+          } catch { /* skip failed card */ }
+        }
+        showToast(t('agents.model.cards_created', { n: created }))
+        createBtn.textContent = t('agents.model.cards_created', { n: created })
+      })
+    }
+  } catch { panel.innerHTML = '<p style="color:var(--error);font-size:13px">' + t('agents.model.error') + '</p>' }
+})
+
+document.getElementById('saveAutoRestartBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  // Auto-restart applies to the main session too, so (unlike model/profile) we
+  // do NOT skip role === 'main'. The store key is autoRestartId for the main
+  // session, the sanitized name for sub-agents.
+  const id = currentAgent.autoRestartId || currentAgent.name
+  const schedKind = document.getElementById('arSchedKind').value
+  const cfg = {
+    enabled: document.getElementById('arEnabled').checked,
+    mode: document.getElementById('arMode').value === 'fresh' ? 'fresh' : 'continue',
+    dailyTime: schedKind === 'daily' ? document.getElementById('arDailyTime').value : null,
+    intervalHours: schedKind === 'interval' ? Number(document.getElementById('arIntervalHours').value) : null,
+    handoff: false,
+  }
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}/auto-restart`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    })
+    if (!res.ok) throw new Error()
+    const body = await res.json()
+    if (currentAgent) currentAgent.autoRestart = body.autoRestart
+    showToast(t('agents.toast.auto_restart_saved'))
+  } catch { showToast(t('common.error_save')) }
+})
+
+// ---- voice config UI -------------------------------------------------------
+
+async function loadVoiceConfig(agentName) {
+  const voiceModelSel = document.getElementById('editAgentVoiceModel')
+  if (!voiceModelSel) return
+  const banner = document.getElementById('voiceNotInstalledBanner')
+  const controls = document.getElementById('voiceInstalledControls')
+  try {
+    // Check toolkit installation first
+    const statusR = await fetch('/api/voice/status')
+    if (!statusR.ok) return
+    const status = await statusR.json()
+
+    if (!status.installed) {
+      if (banner) banner.hidden = false
+      if (controls) controls.hidden = true
+      return
+    }
+    if (banner) banner.hidden = true
+    if (controls) controls.hidden = false
+
+    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
+    if (!r.ok) return
+    const cfg = await r.json()
+    voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
+      `<option value="${v}"${v === cfg.voiceModel ? ' selected' : ''}>${v}</option>`
+    ).join('')
+    const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${cfg.responseMode || 'text'}"]`)
+    if (modeInput) modeInput.checked = true
+  } catch { /* silent */ }
+}
+
+let _voiceInstallPollTimer = null
+
+document.getElementById('voiceInstallBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('voiceInstallBtn')
+  const sudoHint = document.getElementById('voiceInstallSudoHint')
+  const progress = document.getElementById('voiceInstallProgress')
+
+  if (sudoHint) sudoHint.hidden = true
+  btn.disabled = true
+  btn.textContent = 'Indítás...'
+
+  try {
+    const r = await fetch('/api/voice/install', { method: 'POST' })
+    if (!r.ok) throw new Error(await r.text())
+    const data = await r.json()
+
+    if (data.needsSudo) {
+      // Show sudo command -- user must run it then click again
+      if (sudoHint) {
+        sudoHint.hidden = false
+        sudoHint.innerHTML = 'A rendszercsomagok telepítéséhez futtasd terminálon:<br><code style="display:block;margin-top:4px;word-break:break-all">' + escapeHtml(data.sudoCommand) + '</code><br>Ezután kattints újra a Telepítés gombra.'
+      }
+      btn.disabled = false
+      btn.textContent = 'Telepítés'
+      return
+    }
+
+    if (data.alreadyInstalled) {
+      if (currentAgent) loadVoiceConfig(currentAgent.name)
+      return
+    }
+
+    // Install started -- poll /api/voice/status until installed=true.
+    // Max 4 minutes (80 × 3s); on timeout show a hint and re-enable the button
+    // so the user can retry (the only failure signal from a fire-and-forget spawn).
+    if (progress) progress.hidden = false
+    btn.textContent = 'Telepítés...'
+    clearInterval(_voiceInstallPollTimer)
+    let _voiceInstallPollCount = 0
+    const VOICE_INSTALL_MAX_POLLS = 80 // 80 × 3s = 4 min
+    _voiceInstallPollTimer = setInterval(async () => {
+      _voiceInstallPollCount++
+      try {
+        const sr = await fetch('/api/voice/status')
+        const s = await sr.json()
+        if (s.installed) {
+          clearInterval(_voiceInstallPollTimer)
+          _voiceInstallPollTimer = null
+          if (progress) progress.hidden = true
+          if (currentAgent) loadVoiceConfig(currentAgent.name)
+          return
+        }
+      } catch { /* keep polling */ }
+      if (_voiceInstallPollCount >= VOICE_INSTALL_MAX_POLLS) {
+        clearInterval(_voiceInstallPollTimer)
+        _voiceInstallPollTimer = null
+        if (progress) progress.hidden = true
+        if (sudoHint) {
+          sudoHint.hidden = false
+          sudoHint.textContent = 'A telepítés tovább tart vagy elakadt. Ellenőrizd a dashboard logjait, majd próbáld újra.'
+        }
+        btn.disabled = false
+        btn.textContent = 'Újrapróbálás'
+      }
+    }, 3000)
+  } catch {
+    btn.disabled = false
+    btn.textContent = 'Telepítés'
+    showToast('Hiba a telepítés során')
+  }
+})
+
+document.getElementById('saveVoiceConfigBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const modeEl = document.querySelector('input[name="voiceResponseMode"]:checked')
+  const modelEl = document.getElementById('editAgentVoiceModel')
+  if (!modeEl || !modelEl) return
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/voice-config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ responseMode: modeEl.value, voiceModel: modelEl.value }),
+    })
+    if (!r.ok) throw new Error()
+    showToast('Hangbeállítás mentve')
   } catch { showToast('Hiba a mentés során') }
 })
 
@@ -1543,9 +3500,9 @@ document.getElementById('saveProfileBtn').addEventListener('click', async () => 
     })
     if (!res.ok) throw new Error()
     const body = await res.json()
-    showToast(body.requiresRestart ? 'Profil mentve (újraindítás szükséges)' : 'Profil mentve')
+    showToast(body.requiresRestart ? t('agents.toast.profile_saved_restart') : t('agents.toast.profile_saved'))
     loadAgents()
-  } catch { showToast('Hiba a profil mentésekor') }
+  } catch { showToast(t('agents.toast.profile_error')) }
 })
 
 // === Auth Mode ===
@@ -1569,7 +3526,7 @@ function updateAuthModeUI(mode, hasApiKey) {
   keyInput.value = ''
   if (mode === 'api') {
     const statusEl = document.getElementById('authModeApiKeyStatus')
-    statusEl.textContent = hasApiKey ? 'API kulcs konfigurálva a vault-ban' : 'Nincs API kulcs beállítva'
+    statusEl.textContent = hasApiKey ? t('agents.api_key.ok') : t('agents.api_key.missing')
     statusEl.style.color = hasApiKey ? 'var(--success)' : 'var(--warning)'
   }
 }
@@ -1604,12 +3561,12 @@ document.getElementById('authSharedApplyBtn').addEventListener('click', async ()
       const startRes = await fetch(`${base}/start`, { method: 'POST' })
       const startData = await startRes.json()
       if (!startRes.ok) {
-        errorDiv.textContent = startData.error || 'Agent újraindítása sikertelen'
+        errorDiv.textContent = startData.error || t('agents.error.restart')
         errorDiv.hidden = false
         return
       }
     }
-    showToast('Agent újraindítva host OAuth-tal')
+    showToast(t('agents.toast.host_oauth_restart'))
     loadAgents()
     const detailRes = await fetch(base)
     if (detailRes.ok) {
@@ -1618,7 +3575,7 @@ document.getElementById('authSharedApplyBtn').addEventListener('click', async ()
       updateProcessControl(currentAgent)
     }
   } catch {
-    errorDiv.textContent = 'Hiba az alkalmazás során'
+    errorDiv.textContent = t('agents.error.apply')
     errorDiv.hidden = false
   } finally {
     btnText.hidden = false
@@ -1655,7 +3612,7 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
       errorDiv.hidden = false
     }
   } catch {
-    errorDiv.textContent = 'Hálózati hiba az auth-flow indításakor'
+    errorDiv.textContent = t('agents.error.auth_network')
     errorDiv.hidden = false
   } finally {
     btnText.hidden = false
@@ -1667,6 +3624,24 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
 document.getElementById('authFlowCopyBtn').addEventListener('click', () => {
   const url = document.getElementById('authFlowUrl').textContent
   navigator.clipboard.writeText(url).then(() => showToast('URL masolva'))
+})
+
+document.getElementById('memoryIsolationToggle').addEventListener('change', async (e) => {
+  if (!currentAgent || currentAgent.role === 'main') return
+  const enabled = e.target.checked
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memoryIsolation: enabled }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.memoryIsolation = enabled
+    showToast(t(enabled ? 'agents.toast.memory_isolation_on' : 'agents.toast.memory_isolation_off'))
+  } catch {
+    e.target.checked = !enabled
+    showToast(t('common.error_save'))
+  }
 })
 
 document.getElementById('saveAuthModeBtn').addEventListener('click', async () => {
@@ -1684,7 +3659,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
       body: JSON.stringify(payload),
     })
     if (!res.ok) throw new Error()
-    showToast('Hitelesítési mód mentve (újraindítás szukseges)')
+    showToast(t('agents.toast.auth_mode_saved'))
     loadAgents()
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
@@ -1692,7 +3667,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
       currentAgent = updated
       updateAuthModeUI(updated.authMode || 'shared', updated.hasApiKey || false)
     }
-  } catch { showToast('Hiba a mentes soran') }
+  } catch { showToast(t('common.error_save')) }
 })
 
 document.getElementById('saveClaudeMdBtn').addEventListener('click', async () => {
@@ -1704,8 +3679,8 @@ document.getElementById('saveClaudeMdBtn').addEventListener('click', async () =>
       body: JSON.stringify({ claudeMd: document.getElementById('editClaudeMd').value }),
     })
     if (!res.ok) throw new Error()
-    showToast('CLAUDE.md mentve')
-  } catch { showToast('Hiba a mentés során') }
+    showToast(t('agents.claude_md_saved'))
+  } catch { showToast(t('common.error_save')) }
 })
 
 document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
@@ -1717,8 +3692,8 @@ document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
       body: JSON.stringify({ soulMd: document.getElementById('editSoulMd').value }),
     })
     if (!res.ok) throw new Error()
-    showToast('SOUL.md mentve')
-  } catch { showToast('Hiba a mentés során') }
+    showToast(t('agents.soul_md_saved'))
+  } catch { showToast(t('common.error_save')) }
 })
 
 document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => {
@@ -1731,10 +3706,39 @@ document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => 
     })
     if (!res.ok) throw new Error()
     showToast('.mcp.json mentve')
-  } catch { showToast('Hiba a mentés során') }
+  } catch { showToast(t('common.error_save')) }
 })
 
 // === Channel tab ===
+// Provider-aware "connected" check: a sub-agent record carries hasTelegram /
+// hasDiscord / hasSlack flags from the backend, Marveen carries the same
+// shape from /api/marveen. Falls back to hasTelegram for legacy callers.
+function agentIsConnected(agent) {
+  if (!agent) return false
+  if (currentChannelProvider === 'discord') return !!agent.hasDiscord
+  if (currentChannelProvider === 'slack') return !!agent.hasSlack
+  if (currentChannelProvider === 'teams') return !!agent.hasTeams
+  return !!agent.hasTelegram
+}
+
+function getProviderLabel() {
+  if (currentChannelProvider === 'discord') return 'Discord'
+  if (currentChannelProvider === 'slack') return 'Slack'
+  if (currentChannelProvider === 'teams') return 'Microsoft Teams'
+  return 'Telegram'
+}
+
+// Connected-view help text per provider. Returns innerHTML for the
+// #chHowtoContent <div> -- swapped on every updateProviderUI() call so the
+// "Hogyan adj hozzá több embert vagy csoportot?" panel matches the active
+// channel provider.
+function buildHowtoHtml() {
+  if (currentChannelProvider === 'discord') return t('channel.howto.discord')
+  if (currentChannelProvider === 'slack') return t('channel.howto.slack')
+  if (currentChannelProvider === 'teams') return t('channel.howto.teams')
+  return t('channel.howto.telegram')
+}
+
 function updateProviderUI() {
   const isTg = currentChannelProvider === 'telegram'
   const title = document.getElementById('chSetupTitle')
@@ -1745,39 +3749,63 @@ function updateProviderUI() {
   const manifestBtnGroup = document.getElementById('chSlackManifestBtnGroup')
   const smokeTestBtn = document.getElementById('chSmokeTestBtn')
   const reconnectBtn = document.getElementById('chReconnectBtn')
+  const howto = document.getElementById('chHowtoContent')
+  const pairingInfo = document.getElementById('chPairingInfo')
+  const discordChannelGroup = document.getElementById('chDiscordChannelIdGroup')
+  const tokenGroup = document.getElementById('chTokenGroup')
+  // Teams config is terminal-driven (creds land in the .env via setup-azure-bot.sh),
+  // not a dashboard token paste -- default the token field visible, hide it for teams.
+  if (tokenGroup) tokenGroup.hidden = false
 
   if (isTg) {
-    if (title) title.textContent = 'Telegram bot bekotese'
-    if (steps) steps.innerHTML = '<li>Nyisd meg a <strong>@BotFather</strong>-t a Telegramban</li><li>Hozz letre egy uj botot a <code>/newbot</code> paranccsal</li><li>Masold be az API tokent ide</li>'
+    if (title) title.textContent = t('channel.setup.tg_title')
+    if (steps) steps.innerHTML = t('channel.setup.tg_steps')
     if (label) label.textContent = 'Bot API Token'
     if (input) input.placeholder = '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'
     if (slackGroup) slackGroup.hidden = true
     if (manifestBtnGroup) manifestBtnGroup.hidden = true
     if (smokeTestBtn) smokeTestBtn.hidden = true
+    if (discordChannelGroup) discordChannelGroup.hidden = true
+    if (pairingInfo) pairingInfo.textContent = t('channel.setup.tg_pairing')
   } else if (currentChannelProvider === 'discord') {
-    if (title) title.textContent = 'Discord bot bekotese'
-    if (steps) steps.innerHTML = '<li>Menj a <strong>Discord Developer Portal</strong>-ra (discord.com/developers)</li><li>Hozz letre egy uj Application-t es Bot-ot</li><li>Masold be a Bot Token-t ide</li>'
+    if (title) title.textContent = t('channel.setup.discord_title')
+    if (steps) steps.innerHTML = t('channel.setup.discord_steps')
     if (label) label.textContent = 'Bot Token'
     if (input) input.placeholder = 'MTIzNDU2Nzg5MDEyMzQ1Njc4OQ...'
     if (slackGroup) slackGroup.hidden = true
     if (manifestBtnGroup) manifestBtnGroup.hidden = true
     if (smokeTestBtn) smokeTestBtn.hidden = true
+    if (discordChannelGroup) discordChannelGroup.hidden = false
+    if (pairingInfo) pairingInfo.textContent = t('channel.setup.discord_pairing')
+  } else if (currentChannelProvider === 'teams') {
+    if (title) title.textContent = t('channel.setup.teams_title')
+    if (steps) steps.innerHTML = t('channel.setup.teams_steps')
+    if (slackGroup) slackGroup.hidden = true
+    if (manifestBtnGroup) manifestBtnGroup.hidden = true
+    if (smokeTestBtn) smokeTestBtn.hidden = true
+    if (discordChannelGroup) discordChannelGroup.hidden = true
+    // No dashboard token entry for Teams -- creds come from the terminal setup.
+    if (tokenGroup) tokenGroup.hidden = true
+    if (pairingInfo) pairingInfo.textContent = t('channel.setup.teams_pairing')
   } else {
-    if (title) title.textContent = 'Slack app bekötése'
-    if (steps) steps.innerHTML = '<li>Hozz létre egy Slack App-ot, vagy használd a manifest gombot lent</li><li>Másold be a Bot Token-t (xoxb-...) és az App Token-t (xapp-...)</li>'
+    if (title) title.textContent = t('channel.setup.slack_title')
+    if (steps) steps.innerHTML = t('channel.setup.slack_steps')
     if (label) label.textContent = 'Bot Token (xoxb-...)'
     if (input) input.placeholder = 'xoxb-...'
     if (slackGroup) slackGroup.hidden = false
     if (manifestBtnGroup) manifestBtnGroup.hidden = false
     if (smokeTestBtn) smokeTestBtn.hidden = false
+    if (discordChannelGroup) discordChannelGroup.hidden = true
+    if (pairingInfo) pairingInfo.textContent = t('channel.setup.slack_pairing')
   }
+  if (howto) howto.innerHTML = buildHowtoHtml()
   if (reconnectBtn) {
-    reconnectBtn.hidden = !(currentAgent && currentAgent.running && currentAgent.hasTelegram)
+    reconnectBtn.hidden = !(currentAgent && currentAgent.running && agentIsConnected(currentAgent))
   }
 }
 
 function updateChannelTab(agent) {
-  const connected = agent.hasTelegram || false
+  const connected = agentIsConnected(agent)
   const running = agent.running || false
   document.getElementById('chNotConnected').hidden = connected
   document.getElementById('chConnected').hidden = !connected
@@ -1789,6 +3817,8 @@ function updateChannelTab(agent) {
   document.getElementById('chTokenInput').value = ''
   const slackInput = document.getElementById('chSlackAppToken')
   if (slackInput) slackInput.value = ''
+  const discordChanInput = document.getElementById('chDiscordChannelId')
+  if (discordChanInput) discordChanInput.value = ''
   updateProviderUI()
   if (connected && running) {
     refreshChannelHealth()
@@ -1842,6 +3872,9 @@ document.getElementById('chConnectBtn').addEventListener('click', async () => {
   if (currentChannelProvider === 'slack') {
     const appToken = document.getElementById('chSlackAppToken').value.trim()
     if (appToken) payload.appToken = appToken
+  } else if (currentChannelProvider === 'discord') {
+    const channelId = document.getElementById('chDiscordChannelId').value.trim()
+    if (channelId) payload.channelId = channelId
   }
 
   const btn = document.getElementById('chConnectBtn')
@@ -1867,7 +3900,7 @@ document.getElementById('chConnectBtn').addEventListener('click', async () => {
       throw new Error(err.error || 'Kapcsolodasi hiba')
     }
     const result = await res.json()
-    showToast(`${currentChannelProvider === 'telegram' ? 'Telegram' : 'Slack'} sikeresen csatlakoztatva!`)
+    showToast(`${getProviderLabel()} sikeresen csatlakoztatva!`)
     // Refresh detail
     await openAgentDetail(currentAgent.name)
     loadAgents()
@@ -1887,7 +3920,7 @@ document.getElementById('chTestBtn').addEventListener('click', async () => {
     if (!res.ok) throw new Error()
     showToast('Kapcsolat rendben!')
   } catch {
-    showToast('Kapcsolat tesztelése sikertelen')
+    showToast(t('channel.toast.smoke_failed'))
   }
 })
 
@@ -1896,7 +3929,7 @@ document.getElementById('chReconnectBtn').addEventListener('click', async () => 
   const btn = document.getElementById('chReconnectBtn')
   const origText = btn.textContent
   btn.disabled = true
-  btn.textContent = 'Újracsatlakozás...'
+  btn.textContent = t('agents.btn.reconnect')
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel/reconnect`, { method: 'POST' })
     const data = await res.json()
@@ -1919,7 +3952,7 @@ document.getElementById('chSmokeTestBtn').addEventListener('click', async () => 
   const btn = document.getElementById('chSmokeTestBtn')
   const origText = btn.textContent
   btn.disabled = true
-  btn.textContent = 'Futtatás...'
+  btn.textContent = t('agents.btn.running')
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent)}/channels/slack/smoke-test`, { method: 'POST' })
     const data = await res.json()
@@ -1941,10 +3974,10 @@ function showSmokeTestResult(output) {
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `
     <div class="modal-content" style="max-width:600px">
-      <h3>Slack smoke-test eredmény</h3>
+      <h3>${t('channel.smoke_test.title')}</h3>
       <pre style="background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:6px;overflow-x:auto;font-size:13px;max-height:400px;white-space:pre-wrap">${output.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
       <div style="text-align:right;margin-top:12px">
-        <button class="btn-secondary" id="smokeTestCloseBtn">Bezárás</button>
+        <button class="btn-secondary" id="smokeTestCloseBtn">${t('common.btn.close')}</button>
       </div>
     </div>`
   document.body.appendChild(overlay)
@@ -1962,7 +3995,7 @@ async function refreshPendingPairings() {
     const pending = await res.json()
     listEl.innerHTML = ''
     if (pending.length === 0) {
-      listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:6px 0;">Nincs várakozó párosítás</div>'
+      listEl.innerHTML = `<div style="font-size:12px; color:var(--text-muted); padding:6px 0;">${t('channel.pending.empty')}</div>`
       return
     }
     for (const p of pending) {
@@ -1974,7 +4007,7 @@ async function refreshPendingPairings() {
           <span class="tg-pending-code">${escapeHtml(p.code)}</span>
           <span class="tg-pending-sender">Sender: ${escapeHtml(p.senderId)}</span>
         </div>
-        <button class="btn-primary btn-compact" style="padding:5px 12px; font-size:12px; margin:0" data-code="${escapeHtml(p.code)}">Jóváhagyás</button>
+        <button class="btn-primary btn-compact" style="padding:5px 12px; font-size:12px; margin:0" data-code="${escapeHtml(p.code)}">${t('common.btn.approve')}</button>
       `
       item.querySelector('button').addEventListener('click', async () => {
         await approvePairing(p.code)
@@ -1994,9 +4027,9 @@ async function approvePairing(code) {
     })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Jóváhagyási hiba')
+      throw new Error(err.error || t('channel.toast.approve_error'))
     }
-    showToast('Párosítás jóváhagyva!')
+    showToast(t('channel.toast.pairing_approved'))
     refreshPendingPairings()
     refreshAllowedList()
   } catch (err) {
@@ -2016,7 +4049,7 @@ async function refreshAllowedList() {
     const users = data.users || []
     const groups = data.groups || []
     if (users.length === 0 && groups.length === 0) {
-      listEl.innerHTML = '<div class="tg-allowed-empty">Még nincs bekötött chat. Lent add hozzá az elsőt.</div>'
+      listEl.innerHTML = `<div class="tg-allowed-empty">${t('channel.allowed.empty')}</div>`
       return
     }
     listEl.innerHTML = ''
@@ -2028,7 +4061,7 @@ async function refreshAllowedList() {
           <span class="tg-allowed-kind">DM</span>
           <span class="tg-allowed-id">${escapeHtml(id)}</span>
         </div>
-        <button class="btn-icon-danger" title="Eltávolítás" data-kind="user" data-id="${escapeHtml(id)}">&times;</button>
+        <button class="btn-icon-danger" title="${t('common.btn.remove')}" data-kind="user" data-id="${escapeHtml(id)}">&times;</button>
       `
       item.querySelector('button').addEventListener('click', () => removeAllowed('user', id))
       listEl.appendChild(item)
@@ -2038,10 +4071,10 @@ async function refreshAllowedList() {
       item.className = 'tg-allowed-item'
       item.innerHTML = `
         <div class="tg-allowed-meta">
-          <span class="tg-allowed-kind tg-allowed-kind-group">CSOPORT</span>
+          <span class="tg-allowed-kind tg-allowed-kind-group">${t('channel.badge.group')}</span>
           <span class="tg-allowed-id">${escapeHtml(g.id)}</span>
         </div>
-        <button class="btn-icon-danger" title="Eltávolítás" data-kind="group" data-id="${escapeHtml(g.id)}">&times;</button>
+        <button class="btn-icon-danger" title="${t('common.btn.remove')}" data-kind="group" data-id="${escapeHtml(g.id)}">&times;</button>
       `
       item.querySelector('button').addEventListener('click', () => removeAllowed('group', g.id))
       listEl.appendChild(item)
@@ -2051,15 +4084,15 @@ async function refreshAllowedList() {
 
 async function removeAllowed(kind, id) {
   if (!currentAgent) return
-  const label = kind === 'user' ? 'felhasználót' : 'csoportot'
-  if (!confirm(`Biztosan eltávolítod ezt a ${label} (${id})?`)) return
+  const label = kind === 'user' ? t('channel.kind.user') : t('channel.kind.group')
+  if (!confirm(t('channel.confirm.remove', { label, id }))) return
   try {
     const res = await fetch(`${channelApiBase()}/allowed/${kind}/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || 'Eltávolítási hiba')
+      throw new Error(err.error || t('channel.toast.remove_error'))
     }
-    showToast('Eltávolítva')
+    showToast(t('common.toast.removed'))
     refreshAllowedList()
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2076,7 +4109,7 @@ async function refreshInvites() {
     if (!res.ok) return
     const items = await res.json()
     if (!items.length) {
-      listEl.innerHTML = '<div class="tg-allowed-empty">Nincs aktív meghívó link.</div>'
+      listEl.innerHTML = `<div class="tg-allowed-empty">${t('channel.invite.empty')}</div>`
       return
     }
     listEl.innerHTML = ''
@@ -2085,27 +4118,27 @@ async function refreshInvites() {
       item.className = 'tg-allowed-item'
       const expiresIn = Math.max(0, Math.floor((inv.expiresAt - Date.now()) / 60000))
       const status = inv.used
-        ? `<span class="tg-allowed-kind" style="background:rgba(180,180,180,0.15); color:var(--text-muted);">FELHASZNÁLT</span>`
-        : `<span class="tg-allowed-kind tg-allowed-kind-group">AKTÍV (${expiresIn}p)</span>`
+        ? `<span class="tg-allowed-kind" style="background:rgba(180,180,180,0.15); color:var(--text-muted);">${t('channel.invite.used_badge')}</span>`
+        : `<span class="tg-allowed-kind tg-allowed-kind-group">${t('channel.invite.active_badge', { min: expiresIn })}</span>`
       const linkHtml = inv.deepLink
         ? `<a href="${escapeHtml(inv.deepLink)}" target="_blank" class="tg-allowed-id" style="text-decoration:underline;">${escapeHtml(inv.deepLink)}</a>`
-        : `<span class="tg-allowed-id">(bot username nélkül)</span>`
+        : `<span class="tg-allowed-id">${t('channel.invite.no_username')}</span>`
       item.innerHTML = `
         <div class="tg-allowed-meta" style="flex-wrap:wrap; gap:6px;">
           ${status}
           ${linkHtml}
         </div>
         <div style="display:flex; gap:6px;">
-          ${inv.deepLink && !inv.used ? `<button class="btn-secondary btn-compact" data-link="${escapeHtml(inv.deepLink)}" style="padding:4px 10px; font-size:11px; margin:0;">Másol</button>` : ''}
-          <button class="btn-icon-danger" title="Visszavonás" data-token="${escapeHtml(inv.token)}">&times;</button>
+          ${inv.deepLink && !inv.used ? `<button class="btn-secondary btn-compact" data-link="${escapeHtml(inv.deepLink)}" style="padding:4px 10px; font-size:11px; margin:0;">${t('common.btn.copy_btn')}</button>` : ''}
+          <button class="btn-icon-danger" title="${t('channel.btn.revoke')}" data-token="${escapeHtml(inv.token)}">&times;</button>
         </div>
       `
       const copyBtn = item.querySelector('button[data-link]')
       if (copyBtn) {
         copyBtn.addEventListener('click', async (e) => {
           const link = e.currentTarget.getAttribute('data-link')
-          try { await navigator.clipboard.writeText(link); showToast('Vágólapra másolva') }
-          catch { showToast('Másolás sikertelen') }
+          try { await navigator.clipboard.writeText(link); showToast(t('common.toast.copied')) }
+          catch { showToast(t('common.toast.copy_failed')) }
         })
       }
       const revokeBtn = item.querySelector('button[data-token]')
@@ -2121,7 +4154,7 @@ async function generateInvite() {
   if (!currentAgent) return
   const btn = document.getElementById('chGenerateInviteBtn')
   btn.disabled = true
-  btn.textContent = 'Generálás...'
+  btn.textContent = t('channel.btn.invite_gen')
   try {
     const res = await fetch(`${channelApiBase()}/invites`, { method: 'POST' })
     if (!res.ok) {
@@ -2130,30 +4163,30 @@ async function generateInvite() {
     }
     const data = await res.json()
     if (data.deepLink) {
-      try { await navigator.clipboard.writeText(data.deepLink); showToast('Meghívó link létrehozva és vágólapra másolva') }
-      catch { showToast('Meghívó link létrehozva — kattints a Másol gombra') }
+      try { await navigator.clipboard.writeText(data.deepLink); showToast(t('channel.toast.invite_copied')) }
+      catch { showToast(t('channel.toast.invite_created')) }
     } else {
-      showToast('Meghívó létrejött (bot username pending — frissítés)')
+      showToast(t('channel.toast.invite_pending'))
     }
     refreshInvites()
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
   } finally {
     btn.disabled = false
-    btn.textContent = 'Új meghívó link'
+    btn.textContent = t('channel.btn.invite_new')
   }
 }
 
 async function revokeInviteToken(token) {
   if (!currentAgent) return
-  if (!confirm('Biztosan visszavonod ezt a meghívó linket?')) return
+  if (!confirm(t('channel.confirm.revoke'))) return
   try {
     const res = await fetch(`${channelApiBase()}/invites/${encodeURIComponent(token)}`, { method: 'DELETE' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.error || 'Sikertelen')
     }
-    showToast('Meghívó visszavonva')
+    showToast(t('channel.toast.invite_revoked'))
     refreshInvites()
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2199,8 +4232,8 @@ async function refreshChannelRequests() {
           <span class="tg-allowed-id" style="font-size:11px;color:var(--text-muted)">${ts}</span>
         </div>
         <div style="display:flex;gap:6px">
-          <button class="btn-primary btn-compact" data-approve="${req.id}" style="padding:4px 10px;font-size:11px;margin:0">Jóváhagyás</button>
-          <button class="btn-icon-danger" data-deny="${req.id}" title="Elutasítás">&times;</button>
+          <button class="btn-primary btn-compact" data-approve="${req.id}" style="padding:4px 10px;font-size:11px;margin:0">${t('common.btn.approve')}</button>
+          <button class="btn-icon-danger" data-deny="${req.id}" title="${t('channel.btn.deny')}">&times;</button>
         </div>
       `
       item.dataset.reqId = req.id
@@ -2216,8 +4249,8 @@ let _approveReqId = null
 function openApproveModal(id, channelName, userId) {
   _approveReqId = id
   const desc = document.getElementById('chApproveModalDesc')
-  const userNote = userId ? ` (kérő: ${escapeHtml(userId)})` : ''
-  desc.textContent = `#${escapeHtml(channelName)}${userNote} csatorna engedélyezési beállításai:`
+  const userNote = userId ? t('channel.approve.requester', { user: escapeHtml(userId) }) : ''
+  desc.textContent = t('channel.approve.desc', { channel: escapeHtml(channelName), requester: userNote })
   document.getElementById('chApproveRequireMention').checked = true
   document.getElementById('chApproveAllowFromAll').checked = false
   document.getElementById('chApproveModalOverlay').hidden = false
@@ -2242,7 +4275,7 @@ async function submitApproveModal() {
     document.getElementById('chApproveModalOverlay').hidden = true
     const item = document.querySelector(`[data-req-id="${id}"]`)
     if (item) item.remove()
-    showToast('Csatorna engedélyezve')
+    showToast(t('channel.toast.approved'))
     refreshChannelRequests()
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2260,7 +4293,7 @@ async function denyChannelRequest(id, itemEl) {
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/deny`, { method: 'POST' })
     if (!res.ok) throw new Error('Hiba')
-    showToast('Kérés elutasítva')
+    showToast(t('channel.toast.denied'))
     refreshChannelRequests()
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2291,7 +4324,7 @@ document.getElementById('chApproveBtn').addEventListener('click', async () => {
 
 document.getElementById('chDisconnectBtn').addEventListener('click', async () => {
   if (!currentAgent) return
-  const provLabel = currentChannelProvider === 'telegram' ? 'Telegram' : 'Slack'
+  const provLabel = getProviderLabel()
   if (!confirm(`Biztosan levalasztod a ${provLabel} csatornat?`)) return
   try {
     await fetch(`${channelApiBase()}`, { method: 'DELETE' })
@@ -2299,7 +4332,7 @@ document.getElementById('chDisconnectBtn').addEventListener('click', async () =>
     await openAgentDetail(currentAgent.name)
     loadAgents()
   } catch {
-    showToast('Hiba a leválasztás során')
+    showToast(t('channel.toast.disconnect_error'))
   }
 })
 
@@ -2320,25 +4353,36 @@ async function loadSkills(agentName) {
     for (const skill of skills) {
       const item = document.createElement('div')
       item.className = 'skill-item'
+      // Inherited global skills (~/.claude/skills) are shared across every
+      // agent, so they get a badge and no per-agent delete button -- only the
+      // agent's own local skills are deletable from this view.
+      const isGlobal = skill.source === 'global'
+      const badge = isGlobal
+        ? `<span class="skill-item-badge" title="${t('skills.badge.global')}">${t('skills.badge.global')}</span>`
+        : ''
+      const deletable = skill.deletable !== false
       item.innerHTML = `
         <div class="skill-item-info">
-          <div class="skill-item-name">${escapeHtml(skill.name)}</div>
+          <div class="skill-item-name">${escapeHtml(skill.name)}${badge}</div>
           ${skill.description ? `<div class="skill-item-desc">${escapeHtml(skill.description)}</div>` : ''}
         </div>
         <div class="skill-item-actions">
-          <button class="btn-icon btn-icon-danger" title="Törlés">${trashIcon()}</button>
+          ${deletable ? `<button class="btn-icon btn-icon-danger" title="${t('skills.btn.delete')}">${trashIcon()}</button>` : ''}
         </div>
       `
-      item.querySelector('.btn-icon-danger').addEventListener('click', async () => {
-        if (!confirm(`Skill törlése: ${skill.name}?`)) return
-        try {
-          await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
-          showToast('Skill törölve')
-          loadSkills(agentName)
-        } catch {
-          showToast('Hiba a törlés során')
-        }
-      })
+      const delBtn = item.querySelector('.btn-icon-danger')
+      if (delBtn) {
+        delBtn.addEventListener('click', async () => {
+          if (!confirm(t('skills.confirm.delete', { name: skill.name }))) return
+          try {
+            await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
+            showToast(t('skills.toast.deleted'))
+            loadSkills(agentName)
+          } catch {
+            showToast(t('common.error_delete'))
+          }
+        })
+      }
       listEl.appendChild(item)
     }
   } catch {
@@ -2405,7 +4449,7 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
   try {
     const url = isGlobal
       ? '/api/skills'
-      : `/api/agents/${encodeURIComponent(currentAgent.name)}/skills`
+      : `/api/agents/${encodeURIComponent(agentApiName())}/skills`
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2419,11 +4463,11 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
       throw new Error(err.error || 'Hiba')
     }
     closeModal(skillModalOverlay)
-    showToast('Skill hozzáadva')
+    showToast(t('skills.toast.added'))
     if (isGlobal) {
       loadGlobalSkills()
     } else {
-      loadSkills(currentAgent.name)
+      loadSkills(agentApiName())
     }
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2437,8 +4481,8 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
 // Import skill
 document.getElementById('importSkillBtn').addEventListener('click', async () => {
   const isGlobal = skillModalScope === 'global'
-  if (!skillFile) { showToast('Válassz egy .skill fájlt'); return }
-  if (!isGlobal && !currentAgent) { showToast('Válassz egy .skill fájlt'); return }
+  if (!skillFile) { showToast(t('skills.toast.select_file')); return }
+  if (!isGlobal && !currentAgent) { showToast(t('skills.toast.select_file')); return }
 
   const btn = document.getElementById('importSkillBtn')
   btn.disabled = true
@@ -2450,7 +4494,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     formData.append('file', skillFile)
     const url = isGlobal
       ? '/api/skills/import'
-      : `/api/agents/${encodeURIComponent(currentAgent.name)}/skills/import`
+      : `/api/agents/${encodeURIComponent(agentApiName())}/skills/import`
     const res = await fetch(url, {
       method: 'POST',
       body: formData,
@@ -2462,13 +4506,13 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     const result = await res.json()
     closeModal(skillModalOverlay)
     const importedList = Array.isArray(result.imported) ? result.imported : []
-    showToast(`Skill importálva: ${importedList.join(', ')}`)
+    showToast(t('skills.toast.imported', { list: importedList.join(', ') }))
     skillFile = null
     document.getElementById('skillFileName').textContent = ''
     if (isGlobal) {
       loadGlobalSkills()
     } else {
-      loadSkills(currentAgent.name)
+      loadSkills(agentApiName())
     }
   } catch (err) {
     showToast(`Hiba: ${err.message}`)
@@ -2498,7 +4542,7 @@ let currentScheduleView = 'list'
 // Modal wiring
 document.getElementById('addScheduleBtn').addEventListener('click', () => {
   resetScheduleForm()
-  document.getElementById('scheduleModalTitle').textContent = 'Új ütemezett feladat'
+  document.getElementById('scheduleModalTitle').textContent = t('tasks.modal.new_title')
   document.getElementById('scheduleName').disabled = false
   openModal(scheduleModalOverlay)
   loadScheduleAgents().then(() => {
@@ -2525,22 +4569,22 @@ document.getElementById('scheduleType').addEventListener('change', () => {
 // Heartbeat templates
 const HEARTBEAT_TEMPLATES = {
   calendar: {
-    desc: 'Naptár figyelő',
+    desc: () => t('tasks.heartbeat.tpl.calendar'),
     prompt: 'Ellenorizd a naptaramat (list-events a mai napra). Ha van meeting 1 oran belul, szolj Telegramon es 10 perccel a meeting elott is emlekeztetess. Ha nincs kozelgo esemeny, ne irj semmit.',
     schedule: '*/15 * * * *',
   },
   email: {
-    desc: 'Email figyelő',
+    desc: () => t('tasks.heartbeat.tpl.email'),
     prompt: 'Ellenorizd az emailjeimet (search_emails newer_than:1h). Ha surgos vagy fontos levelet talalsz (pl. ugyfeltol, fonokotol, fizetessel kapcsolatos), szolj Telegramon. Ha csak promo/newsletter, ne irj semmit.',
     schedule: '*/30 * * * *',
   },
   kanban: {
-    desc: 'Kanban határidő figyelő',
+    desc: () => t('tasks.heartbeat.tpl.kanban'),
     prompt: 'Ellenorizd a kanban tablat (curl -s http://localhost:3420/api/kanban). Ha van olyan kartya aminek ma jar le a hatrideje vagy urgent prioritasu es meg nincs done, szolj Telegramon. Ha minden rendben, ne irj semmit.',
     schedule: '0 */2 * * *',
   },
   full: {
-    desc: 'Teljes ellenőrzés',
+    desc: () => t('tasks.heartbeat.tpl.full'),
     prompt: 'Ellenorizd: 1) Naptar - van-e meeting 1 oran belul? 2) Email - jott-e surgos level az elmult oraban? 3) Kanban - van-e mai hataridovel kartya? Ha BARMIT talalsz ami fontos, szolj Telegramon tomoren. Ha minden csendes, ne irj semmit.',
     schedule: '*/15 * * * *',
   },
@@ -2549,7 +4593,7 @@ const HEARTBEAT_TEMPLATES = {
 document.getElementById('heartbeatTemplate').addEventListener('change', () => {
   const tpl = HEARTBEAT_TEMPLATES[document.getElementById('heartbeatTemplate').value]
   if (!tpl) return
-  document.getElementById('scheduleDesc').value = tpl.desc
+  document.getElementById('scheduleDesc').value = typeof tpl.desc === 'function' ? tpl.desc() : tpl.desc
   document.getElementById('schedulePrompt').value = tpl.prompt
   document.getElementById('scheduleCustomCron').value = tpl.schedule
   scheduleFrequency.value = 'custom'
@@ -2584,6 +4628,9 @@ function resetScheduleForm() {
   document.getElementById('scheduleName').value = ''
   document.getElementById('scheduleDesc').value = ''
   document.getElementById('schedulePrompt').value = ''
+  document.getElementById('scheduleSkipIfBusy').checked = false
+  document.getElementById('scheduleForceSend').checked = false
+  document.getElementById('scheduleTargetSession').value = ''
   scheduleFrequency.value = 'daily'
   document.getElementById('scheduleTime').value = '09:00'
   document.getElementById('scheduleCustomCron').value = ''
@@ -2659,20 +4706,19 @@ function describeCron(cron) {
   const [minute, hour, dom, month, dow] = parts
 
   // Interval patterns
-  if (minute.startsWith('*/')) return `${minute.split('/')[1]} percenként`
-  if (hour.startsWith('*/')) return `${hour.split('/')[1]} óránként`
-  if (minute === '0' && hour === '*') return 'Minden órában'
+  if (minute.startsWith('*/')) return t('tasks.cron.every_n_min', { n: minute.split('/')[1] })
+  if (hour.startsWith('*/')) return t('tasks.cron.every_n_hour', { n: hour.split('/')[1] })
+  if (minute === '0' && hour === '*') return t('tasks.cron.every_hour')
 
   // Time-based
   const h = parseInt(hour); const m = parseInt(minute)
   if (!isNaN(h) && !isNaN(m)) {
     const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
-    const dowNames = { '1': 'Hétfőn', '2': 'Kedden', '3': 'Szerdán', '4': 'Csütörtökön', '5': 'Pénteken', '6': 'Szombaton', '0': 'Vasárnap', '7': 'Vasárnap' }
-    if (dow === '1-5') return `Hétköznap ${timeStr}`
-    if (dow === '0,6' || dow === '6,0') return `Hétvégén ${timeStr}`
-    if (dowNames[dow]) return `${dowNames[dow]} ${timeStr}`
-    if (dow === '*' && dom === '*') return `Naponta ${timeStr}`
-    if (dom !== '*') return `Minden hónap ${dom}. napján ${timeStr}`
+    if (dow === '1-5') return t('tasks.cron.weekdays', { time: timeStr })
+    if (dow === '0,6' || dow === '6,0') return t('tasks.cron.weekends', { time: timeStr })
+    if (t(`tasks.cron.dow.${dow}`) !== `tasks.cron.dow.${dow}`) return `${t(`tasks.cron.dow.${dow}`)} ${timeStr}`
+    if (dow === '*' && dom === '*') return t('tasks.cron.daily', { time: timeStr })
+    if (dom !== '*') return t('tasks.cron.monthly', { dom, time: timeStr })
   }
 
   return cron
@@ -2754,11 +4800,11 @@ async function loadPendingRetries() {
 
 function formatPendingAge(ms) {
   const mins = Math.floor(ms / 60000)
-  if (mins < 1) return 'kevesebb, mint 1 perce'
-  if (mins < 60) return `${mins} perce`
+  if (mins < 1) return t('common.time.less_than_min')
+  if (mins < 60) return t('common.time.minutes', { n: mins })
   const hours = Math.floor(mins / 60)
   const remMins = mins % 60
-  return remMins ? `${hours} ó ${remMins} p-e` : `${hours} órája`
+  return remMins ? t('common.time.hours_mins', { h: hours, m: remMins }) : t('common.time.hours', { h: hours })
 }
 
 function renderPendingRetries(container, rows) {
@@ -2775,17 +4821,17 @@ function renderPendingRetries(container, rows) {
           ${escapeHtml(r.taskName)}
           <span class="badge badge-paused">${escapeHtml(r.agentName)}</span>
           ${r.alertSentAt
-            ? '<span class="badge badge-heartbeat" title="Telegram riasztás elküldve">⚠️ riasztás elküldve</span>'
+            ? `<span class="badge badge-heartbeat" title="${t('tasks.heartbeat.alert_badge_sent')}">⚠️ ${t('tasks.heartbeat.alert_sent')}</span>`
             : r.alertDue
-              ? '<span class="badge badge-heartbeat" title="Riasztás esedékes, a következő tick küldi">⏳ riasztás esedékes</span>'
+              ? `<span class="badge badge-heartbeat" title="${t('tasks.heartbeat.alert_badge_pending')}">⏳ ${t('tasks.heartbeat.alert_pending')}</span>`
               : ''}
         </div>
         <div class="pending-retry-meta">
-          <span>${formatPendingAge(r.ageMs)} vár (${r.attemptCount} próbálkozás)</span>
+          <span>${t('tasks.retries.meta', { age: formatPendingAge(r.ageMs), n: r.attemptCount })}</span>
           ${r.lastReason ? `<span>ok: ${escapeHtml(r.lastReason)}</span>` : ''}
         </div>
       </div>
-      <button class="btn-icon btn-icon-danger" data-action="cancel-pending" title="Visszavonás">
+      <button class="btn-icon btn-icon-danger" data-action="cancel-pending" title="${t('common.btn.remove')}">
         ${trashIcon()}
       </button>
     </div>
@@ -2793,8 +4839,8 @@ function renderPendingRetries(container, rows) {
   container.innerHTML = `
     <div class="pending-retries-banner">
       <div class="pending-retries-header">
-        <span class="pending-retries-title">Függőben lévő ütemezett feladatok (${rows.length})</span>
-        <span class="pending-retries-hint">Busy cél-session, a rendszer tovább próbálkozik. Nyilvánvaló hibánál visszavonhatod.</span>
+        <span class="pending-retries-title">${t('tasks.retries.title', { n: rows.length })}</span>
+        <span class="pending-retries-hint">${t('tasks.retries.hint')}</span>
       </div>
       <div class="pending-retries-list">${items}</div>
     </div>
@@ -2805,7 +4851,7 @@ function renderPendingRetries(container, rows) {
       const row = e.currentTarget.closest('.pending-retry-row')
       const id = row?.dataset.id
       if (!id) return
-      if (!confirm('Biztosan visszavonod ezt a várakozó ütemezett feladatot?')) return
+      if (!confirm(t('tasks.confirm.cancel_pending'))) return
       try {
         const res = await fetch(`/api/schedules/pending/${encodeURIComponent(id)}`, { method: 'DELETE' })
         if (!res.ok) throw new Error('cancel failed')
@@ -2817,14 +4863,24 @@ function renderPendingRetries(container, rows) {
   })
 }
 
-function renderScheduleList(tasks) {
-  scheduleList.innerHTML = ''
-  scheduleEmpty.hidden = tasks.length > 0
+// Classify a cron expression into a cadence bucket for grouping the list.
+function cronCadence(cron) {
+  const p = (cron || '').trim().split(/\s+/)
+  if (p.length < 5) return { order: 5, label: t('tasks.cadence.other') }
+  const [min, hour, , mon, dow] = p
+  const dom = p[2]
+  if (mon !== '*' || dom !== '*') return { order: 3, label: t('tasks.cadence.monthly') }
+  if (dow !== '*' && dow !== '1-5') return { order: 2, label: t('tasks.cadence.weekly') }
+  const multiDaily = /[\/,\-]/.test(min) || /[\/,\-]/.test(hour)
+  if (multiDaily) return { order: 0, label: t('tasks.cadence.sub_hourly') }
+  return { order: 1, label: t('tasks.cadence.daily') }
+}
+const CADENCE_ICON = { 0: '⚡', 1: '☀️', 2: '📅', 3: '🗓️', 5: '•' }
 
-  for (const task of tasks) {
+function makeScheduleRow(task) {
     const row = document.createElement('div')
     row.className = 'schedule-row'
-    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || 'marveen', avatar: '/api/marveen/avatar', label: task.agent || 'marveen' }
+    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar', label: task.agent || mainAgentId() }
 
     row.innerHTML = `
       <div class="schedule-agent-avatar">
@@ -2834,7 +4890,7 @@ function renderScheduleList(tasks) {
         <div class="schedule-title">
           ${escapeHtml(task.description || task.name)}
           ${task.type === 'heartbeat' ? '<span class="badge badge-heartbeat">💓 heartbeat</span>' : ''}
-          <span class="badge ${task.enabled ? 'badge-active' : 'badge-paused'}">${task.enabled ? 'aktív' : 'szünet'}</span>
+          <span class="badge ${task.enabled ? 'badge-active' : 'badge-paused'}">${task.enabled ? t('tasks.status.active') : t('tasks.status.paused')}</span>
         </div>
         <div class="schedule-meta">
           <span class="schedule-cron">${escapeHtml(task.schedule)}</span>
@@ -2843,10 +4899,16 @@ function renderScheduleList(tasks) {
         </div>
       </div>
       <div class="schedule-actions">
-        <button class="btn-icon" data-action="toggle" title="${task.enabled ? 'Szüneteltetés' : 'Folytatás'}">
+        <button class="btn-icon" data-action="run" title="${t('tasks.btn.run_now')}">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+        </button>
+        <button class="btn-icon" data-action="toggle" title="${task.enabled ? t('tasks.btn.toggle_pause') : t('tasks.btn.toggle_resume')}">
           ${task.enabled ? pauseIcon() : playIcon()}
         </button>
-        <button class="btn-icon btn-icon-danger" data-action="delete" title="Törlés">
+        <button class="btn-icon" data-action="history" title="${t('tasks.btn.history')}">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+        </button>
+        <button class="btn-icon btn-icon-danger" data-action="delete" title="${t('tasks.btn.delete')}">
           ${trashIcon()}
         </button>
       </div>
@@ -2859,27 +4921,117 @@ function renderScheduleList(tasks) {
     })
 
     // Action buttons
+    row.querySelector('[data-action="run"]').addEventListener('click', async (e) => {
+      e.stopPropagation()
+      try {
+        const r = await fetch(`/api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
+        const data = await r.json().catch(() => ({}))
+        if (r.ok) showToast(t('tasks.toast.run_started') + (data.result ? ': ' + data.result : ''))
+        else showToast('Hiba: ' + (data.error || r.status))
+        loadSchedules()
+      } catch { showToast(t('tasks.toast.run_error')) }
+    })
+
     row.querySelector('[data-action="toggle"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
         await fetch(`/api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
-        showToast(task.enabled ? 'Feladat szüneteltetve' : 'Feladat újraindult')
+        showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'))
         loadSchedules()
-      } catch { showToast('Hiba történt') }
+      } catch { showToast(t('common.error')) }
     })
 
     row.querySelector('[data-action="delete"]').addEventListener('click', async (e) => {
       e.stopPropagation()
-      if (!confirm('Biztosan törlöd ezt a feladatot?')) return
+      if (!confirm(t('tasks.confirm.task_delete'))) return
       try {
         await fetch(`/api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
-        showToast('Feladat törölve')
+        showToast(t('tasks.toast.deleted'))
         loadSchedules()
-      } catch { showToast('Hiba a törlés során') }
+      } catch { showToast(t('common.error_delete')) }
     })
 
-    scheduleList.appendChild(row)
+    row.querySelector('[data-action="history"]').addEventListener('click', async (e) => {
+      e.stopPropagation()
+      openScheduleRunHistory(task.name)
+    })
+
+    return row
+}
+
+function renderScheduleList(tasks) {
+  scheduleList.innerHTML = ''
+  scheduleEmpty.hidden = tasks.length > 0
+  const groups = new Map()
+  for (const task of tasks) {
+    const c = cronCadence(task.schedule)
+    if (!groups.has(c.order)) groups.set(c.order, { label: c.label, tasks: [] })
+    groups.get(c.order).tasks.push(task)
   }
+  for (const o of [0, 1, 2, 3, 5]) {
+    const g = groups.get(o)
+    if (!g) continue
+    const header = document.createElement('div')
+    header.className = 'schedule-section'
+    header.innerHTML = `<span class="schedule-section-icon">${CADENCE_ICON[o] || ''}</span><span class="schedule-section-label">${escapeHtml(g.label)}</span><span class="schedule-section-count">${g.tasks.length}</span>`
+    scheduleList.appendChild(header)
+    for (const task of g.tasks) scheduleList.appendChild(makeScheduleRow(task))
+  }
+}
+
+const scheduleRunHistoryOverlay = document.getElementById('scheduleRunHistoryOverlay')
+document.getElementById('scheduleRunHistoryClose').addEventListener('click', () => closeModal(scheduleRunHistoryOverlay))
+scheduleRunHistoryOverlay.addEventListener('click', (e) => { if (e.target === scheduleRunHistoryOverlay) closeModal(scheduleRunHistoryOverlay) })
+
+const RUN_STATUS_LABEL = {
+  fired: () => t('tasks.run_status.fired'),
+  error: () => t('tasks.run_status.error'),
+  skipped: () => t('tasks.run_status.skipped'),
+}
+const RUN_STATUS_CLASS = {
+  fired: 'badge-active',
+  error: 'badge-danger',
+  skipped: 'badge-paused',
+}
+
+async function openScheduleRunHistory(taskName) {
+  document.getElementById('scheduleRunHistoryTitle').textContent = t('tasks.history.title', { name: taskName })
+  const body = document.getElementById('scheduleRunHistoryBody')
+  body.innerHTML = '<p>' + t('common.loading') + '</p>'
+  openModal(scheduleRunHistoryOverlay)
+  try {
+    const r = await fetch(`/api/schedules/${encodeURIComponent(taskName)}/runs`)
+    const runs = await r.json()
+    if (!Array.isArray(runs) || runs.length === 0) {
+      body.innerHTML = '<p class="hint">' + t('tasks.history.empty') + '</p>'
+      return
+    }
+    const rows = runs.map(run => {
+      const d = new Date(run.ts)
+      const date = d.toLocaleDateString('hu-HU', { month: 'short', day: 'numeric' })
+      const time = d.toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      const labelRaw = RUN_STATUS_LABEL[run.status]
+      const label = labelRaw ? (typeof labelRaw === 'function' ? labelRaw() : labelRaw) : run.status
+      const cls = RUN_STATUS_CLASS[run.status] || 'badge-paused'
+      const tokens = run.tokens_est !== null ? `~${run.tokens_est.toLocaleString()}` : '-'
+      return `<tr>
+        <td style="white-space:nowrap">${date} ${time}</td>
+        <td><span class="badge ${cls}">${escapeHtml(label)}</span></td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums">${tokens}</td>
+      </tr>`
+    }).join('')
+    body.innerHTML = `<table style="width:100%;border-collapse:collapse">
+      <thead><tr>
+        <th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">${t('tasks.history.time')}</th>
+        <th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">${t('tasks.history.status')}</th>
+        <th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">${t('tasks.history.tokens')}</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`
+    body.querySelectorAll('tbody tr').forEach(tr => {
+      tr.querySelectorAll('td').forEach(td => { td.style.padding = '5px 8px'; td.style.borderBottom = '1px solid var(--border-light, #eee)' })
+    })
+  } catch { body.innerHTML = '<p class="hint">' + t('tasks.history.error') + '</p>' }
 }
 
 function renderTimeline(tasks) {
@@ -2899,14 +5051,14 @@ function renderTimeline(tasks) {
   // Group tasks by agent
   const agentTasks = {}
   for (const task of tasks) {
-    const agentName = task.agent || 'marveen'
+    const agentName = task.agent || mainAgentId()
     if (!agentTasks[agentName]) agentTasks[agentName] = []
     agentTasks[agentName].push(task)
   }
 
   // If no tasks, show empty state
   if (Object.keys(agentTasks).length === 0) {
-    bodyEl.innerHTML = '<div class="schedule-empty" style="padding:40px;text-align:center;color:var(--text-muted)">Nincsenek ütemezett feladatok</div>'
+    bodyEl.innerHTML = `<div class="schedule-empty" style="padding:40px;text-align:center;color:var(--text-muted)">${t('tasks.schedule_empty')}</div>`
     return
   }
 
@@ -2979,9 +5131,11 @@ function renderWeekView(data) {
   const grid = document.getElementById('weekGrid')
   grid.innerHTML = ''
 
-  const dayNames = ['H', 'K', 'Sze', 'Cs', 'P', 'Szo', 'V']
-  const dayNamesFull = ['Hétfő', 'Kedd', 'Szerda', 'Csütörtök', 'Péntek', 'Szombat', 'Vasárnap']
+  const locale = _lang === 'en' ? 'en-US' : 'hu-HU'
   const dayNums = [1, 2, 3, 4, 5, 6, 0]
+  // Jan 6 2025 = Mon; offset by dayNums index to get each weekday
+  const dayNames = dayNums.map(dow => new Date(2025, 0, 6 + (dow === 0 ? 6 : dow - 1)).toLocaleDateString(locale, { weekday: 'narrow' }))
+  const dayNamesFull = dayNums.map(dow => new Date(2025, 0, 6 + (dow === 0 ? 6 : dow - 1)).toLocaleDateString(locale, { weekday: 'long' }))
 
   const today = new Date()
   const todayDow = today.getDay()
@@ -3054,7 +5208,7 @@ function renderWeekView(data) {
       const count = tasks.length
 
       tasks.forEach((task, idx) => {
-        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || 'marveen', avatar: '/api/marveen/avatar' }
+        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar' }
 
         const card = document.createElement('div')
         card.className = 'week-task-card'
@@ -3101,18 +5255,22 @@ function renderWeekView(data) {
 }
 
 function openEditSchedule(task) {
-  // Reset expand state
-  document.getElementById('expandQuestions').hidden = true
-  document.getElementById('expandStatus').textContent = ''
-  expandAnswers = []
-
   loadScheduleAgents().then(() => {
-    document.getElementById('scheduleModalTitle').textContent = 'Feladat szerkesztése'
+    resetScheduleForm()
+    document.getElementById('scheduleModalTitle').textContent = t('tasks.modal.edit_title')
     document.getElementById('scheduleName').value = task.name
     document.getElementById('scheduleName').disabled = true
     document.getElementById('scheduleDesc').value = task.description || ''
     document.getElementById('schedulePrompt').value = task.prompt || ''
     document.getElementById('scheduleEditName').value = task.name
+    document.getElementById('scheduleSkipIfBusy').checked = !!task.skipIfBusy
+    document.getElementById('scheduleForceSend').checked = !!task.forceSend
+    document.getElementById('scheduleTargetSession').value = task.targetSession || ''
+
+    // Set type (heartbeat or task; custom types fall back to task)
+    const typeEl = document.getElementById('scheduleType')
+    typeEl.value = (task.type === 'heartbeat') ? 'heartbeat' : 'task'
+    document.getElementById('heartbeatTemplateGroup').hidden = typeEl.value !== 'heartbeat'
 
     // Set agent
     const agentSel = document.getElementById('scheduleAgent')
@@ -3140,7 +5298,7 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
   const btn = document.getElementById('expandPromptBtn')
 
   btn.disabled = true
-  statusEl.textContent = 'Kérdések generálása...'
+  statusEl.textContent = t('tasks.expand.generating')
   expandAnswers = []
 
   try {
@@ -3193,9 +5351,9 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
     const applyBtn = document.createElement('button')
     applyBtn.type = 'button'
     applyBtn.className = 'btn-primary btn-compact'
-    applyBtn.innerHTML = '<span class="btn-text">Prompt kibővítése</span><span class="btn-loading" hidden><span class="spinner"></span></span>'
+    applyBtn.innerHTML = `<span class="btn-text">${t('tasks.expand.apply_btn')}</span><span class="btn-loading" hidden><span class="spinner"></span></span>`
     applyBtn.addEventListener('click', async () => {
-      if (expandAnswers.length === 0) { showToast('Válaszolj legalább egy kérdésre'); return }
+      if (expandAnswers.length === 0) { showToast(t('tasks.expand.need_answer')); return }
       applyBtn.disabled = true
       applyBtn.querySelector('.btn-text').hidden = true
       applyBtn.querySelector('.btn-loading').hidden = false
@@ -3209,9 +5367,9 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
         const { prompt: expanded } = await res2.json()
         document.getElementById('schedulePrompt').value = expanded
         questionsEl.hidden = true
-        showToast('Prompt kibővítve!')
+        showToast(t('tasks.expand.done'))
       } catch {
-        showToast('Hiba a kibővítés során')
+        showToast(t('tasks.expand.error'))
       } finally {
         applyBtn.disabled = false
         applyBtn.querySelector('.btn-text').hidden = false
@@ -3221,7 +5379,7 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
     applyRow.appendChild(applyBtn)
     questionsEl.appendChild(applyRow)
   } catch {
-    statusEl.textContent = 'Hiba a kérdések generálásakor'
+    statusEl.textContent = t('kanban.breakdown.error')
   } finally {
     btn.disabled = false
   }
@@ -3235,10 +5393,16 @@ saveScheduleBtn.addEventListener('click', async () => {
   const schedule = getScheduleCron()
   const agent = document.getElementById('scheduleAgent').value
   const type = document.getElementById('scheduleType').value
+  // Advanced options -- the backend already persists these; expose them here.
+  const skipIfBusy = document.getElementById('scheduleSkipIfBusy').checked
+  const forceSend = document.getElementById('scheduleForceSend').checked
+  const targetSession = document.getElementById('scheduleTargetSession').value.trim()
+  const advanced = { skipIfBusy, forceSend }
+  if (targetSession) advanced.targetSession = targetSession
 
   if (!name) { document.getElementById('scheduleName').focus(); return }
   if (!prompt) { document.getElementById('schedulePrompt').focus(); return }
-  if (!schedule) { showToast('Válassz ütemezést'); return }
+  if (!schedule) { showToast(t('tasks.toast.select_schedule')); return }
 
   saveScheduleBtn.disabled = true
   saveScheduleBtn.querySelector('.btn-text').hidden = true
@@ -3250,25 +5414,25 @@ saveScheduleBtn.addEventListener('click', async () => {
       const res = await fetch(`/api/schedules/${encodeURIComponent(editName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description, prompt, schedule, agent, type }),
+        body: JSON.stringify({ description, prompt, schedule, agent, type, ...advanced }),
       })
       if (!res.ok) {
         const err = await res.json()
         throw new Error(err.error || 'Hiba')
       }
-      showToast('Feladat frissítve')
+      showToast(t('tasks.toast.updated'))
     } else {
       // Create
       const res = await fetch('/api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, description, prompt, schedule, agent, type }),
+        body: JSON.stringify({ name, description, prompt, schedule, agent, type, ...advanced }),
       })
       if (!res.ok) {
         const err = await res.json()
         throw new Error(err.error || 'Ismeretlen hiba')
       }
-      showToast('Feladat létrehozva!')
+      showToast(t('tasks.toast.created'))
     }
     closeModal(scheduleModalOverlay)
     loadSchedules()
@@ -3306,7 +5470,7 @@ async function loadMemAgents() {
     const agents = await res.json()
     const sel = document.getElementById('memAgentFilter')
     const memSel = document.getElementById('memAgent')
-    sel.innerHTML = '<option value="">Minden ügynök</option>'
+    sel.innerHTML = `<option value="">${t('memories.agent_all')}</option>`
     memSel.innerHTML = ''
     for (const a of agents) {
       sel.innerHTML += `<option value="${a.name}">${a.label}</option>`
@@ -3365,7 +5529,7 @@ document.getElementById('memTabs').addEventListener('click', (e) => {
 
 // Add memory button
 document.getElementById('memAddBtn').addEventListener('click', () => {
-  document.getElementById('memModalTitle').textContent = 'Uj emlek'
+  document.getElementById('memModalTitle').textContent = t('memories.modal.title_new')
   document.getElementById('memContent').value = ''
   document.getElementById('memTier').value = (currentMemTier === 'log' || currentMemTier === 'graph') ? 'warm' : currentMemTier
   document.getElementById('memKeywords').value = ''
@@ -3395,20 +5559,20 @@ document.getElementById('saveMemBtn').addEventListener('click', async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, tier, agent_id: agentId, keywords }),
       })
-      showToast('Emlék frissítve')
+      showToast(t('memories.toast.updated'))
     } else {
       await fetch('/api/memories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_id: agentId, content, tier, keywords }),
       })
-      showToast('Emlék létrehozva')
+      showToast(t('memories.toast.created'))
     }
     closeModal(memModalOverlay)
     loadMemories()
     loadMemStats()
   } catch {
-    showToast('Hiba a mentes soran')
+    showToast(t('common.error_save'))
   }
 })
 
@@ -3419,22 +5583,22 @@ async function loadMemStats() {
     const embCount = stats.withEmbedding || 0
     const embPct = stats.total > 0 ? Math.round(embCount / stats.total * 100) : 0
     memStats.innerHTML = `
-      <div class="stat-card"><div class="stat-value">${stats.total}</div><div class="stat-label">Osszes</div></div>
+      <div class="stat-card"><div class="stat-value">${stats.total}</div><div class="stat-label">${t('memories.stat.total')}</div></div>
       ${Object.entries(stats.byTier || {}).map(([tier, count]) =>
         `<div class="stat-card"><div class="stat-value" style="color:${tierColors[tier] || 'var(--accent)'}">${count}</div><div class="stat-label">${tierLabels[tier] || tier}</div></div>`
       ).join('')}
-      <div class="stat-card"><div class="stat-value">${embCount}</div><div class="stat-label">Vektorok (${embPct}%)</div></div>
-      <button class="btn-secondary btn-compact" id="memBackfillBtn" style="margin-left:auto;font-size:11px;padding:6px 12px;align-self:center">Vektorok generalasa</button>
+      <div class="stat-card"><div class="stat-value">${embCount}</div><div class="stat-label">${t('memories.stat.vectors_pct', { pct: embPct })}</div></div>
+      <button class="btn-secondary btn-compact" id="memBackfillBtn" style="margin-left:auto;font-size:11px;padding:6px 12px;align-self:center">${t('memories.stat.vectors_btn')}</button>
     `
     document.getElementById('memBackfillBtn')?.addEventListener('click', async () => {
       const btn = document.getElementById('memBackfillBtn')
-      if (btn) { btn.textContent = 'Generálás...'; btn.disabled = true }
+      if (btn) { btn.textContent = t('memories.stat.vectors_gen'); btn.disabled = true }
       try {
         const r = await fetch('/api/memories/backfill', { method: 'POST' })
         const data = await r.json()
-        showToast(`${data.count} emlekhez vektor generalva`)
+        showToast(t('memories.toast.vector_count', { count: data.count }))
         loadMemStats()
-      } catch { showToast('Hiba a vektor generálás során') }
+      } catch { showToast(t('memories.toast.vector_error')) }
     })
   } catch (err) {
     console.error('Stats hiba:', err)
@@ -3476,7 +5640,7 @@ function renderMemories(memories) {
     const tierBadge = tierLabels[tier] || tier
     const badgeClass = 'badge-' + tier
     const shortContent = mem.content.length > 120 ? mem.content.slice(0, 120) + '...' : mem.content
-    const agentLabel = mem.agent_id || 'marveen'
+    const agentLabel = mem.agent_id || mainAgentId()
 
     // Build keywords HTML
     let keywordsHtml = ''
@@ -3498,8 +5662,8 @@ function renderMemories(memories) {
       <div class="mem-content-full">${escapeHtml(mem.content)}</div>
       ${keywordsHtml}
       <div class="mem-item-footer">
-        <button class="btn-secondary" data-edit-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">Szerkesztés</button>
-        <button class="btn-danger" data-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">Törlés</button>
+        <button class="btn-secondary" data-edit-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">${t('common.btn.edit')}</button>
+        <button class="btn-danger" data-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">${t('common.btn.delete')}</button>
       </div>
     `
 
@@ -3513,7 +5677,7 @@ function renderMemories(memories) {
     const editBtn = item.querySelector('[data-edit-memid]')
     editBtn.addEventListener('click', (e) => {
       e.stopPropagation()
-      document.getElementById('memModalTitle').textContent = 'Emlék szerkesztése'
+      document.getElementById('memModalTitle').textContent = t('memories.modal.title_edit')
       document.getElementById('memContent').value = mem.content
       document.getElementById('memTier').value = tier
       document.getElementById('memKeywords').value = mem.keywords || ''
@@ -3529,11 +5693,11 @@ function renderMemories(memories) {
       if (!confirm('Biztosan torlod ezt az emleket?')) return
       try {
         await fetch(`/api/memories/${mem.id}`, { method: 'DELETE' })
-        showToast('Emlék törölve')
+        showToast(t('memories.toast.deleted'))
         loadMemories()
         loadMemStats()
       } catch {
-        showToast('Hiba a törlés során')
+        showToast(t('common.error_delete'))
       }
     })
 
@@ -3652,7 +5816,7 @@ function buildGraph(memories) {
       connectionCount: 0,
       label: label,
       tier: mem.tier || mem.category || 'warm',
-      agent: mem.agent_id || 'marveen',
+      agent: mem.agent_id || mainAgentId(),
       keywords: keywords,
       mem: mem,
       searchMatch: true,
@@ -4098,8 +6262,8 @@ function hideGraphPanel() {
 }
 
 function openEditMemory(mem) {
-  document.getElementById('memModalTitle').textContent = 'Emlék szerkesztése'
-  document.getElementById('memAgent').value = mem.agent_id || 'marveen'
+  document.getElementById('memModalTitle').textContent = t('memories.modal.title_edit')
+  document.getElementById('memAgent').value = mem.agent_id || mainAgentId()
   document.getElementById('memTier').value = mem.tier || mem.category || 'warm'
   document.getElementById('memContent').value = mem.content || ''
   document.getElementById('memKeywords').value = mem.keywords || ''
@@ -4412,9 +6576,9 @@ document.getElementById('connectorRefreshBtn').addEventListener('click', async (
     const res = await fetch('/api/connectors/refresh', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
-      showToast('Frissítés sikertelen: ' + (data.error || 'HTTP ' + res.status))
+      showToast(t('updates.error', {msg: data.error || 'HTTP ' + res.status}))
     } else {
-      showToast('MCP lista frissítve (' + (data.count || 0) + ' globális connector)')
+      showToast(t('connectors.toast.mcp_refreshed', { n: data.count || 0 }))
     }
     await loadConnectors()
     // Reload catalog only if the Gallery tab is currently active so we
@@ -4423,7 +6587,7 @@ document.getElementById('connectorRefreshBtn').addEventListener('click', async (
       await loadCatalog()
     }
   } catch (err) {
-    showToast('Hiba: ' + (err.message || err))
+    showToast(t('updates.toast.error', {msg: err.message || err}))
   } finally {
     btn.disabled = false
   }
@@ -4445,14 +6609,14 @@ catalogInstallOverlay.addEventListener('click', (e) => { if (e.target === catalo
 
 async function loadCatalog() {
   const grid = document.getElementById('catalogGrid')
-  grid.innerHTML = '<div class="connector-loading"><span class="spinner"></span> Katalógus betöltése...</div>'
+  grid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('connectors.catalog_loading')}</div>`
   try {
     const res = await fetch('/api/mcp-catalog')
     catalogItems = await res.json()
     renderCatalog()
   } catch (err) {
     console.error('Catalog load error:', err)
-    grid.innerHTML = '<div class="connector-loading">Hiba a katalógus betöltésekor</div>'
+    grid.innerHTML = `<div class="connector-loading">${t('connectors.catalog_error')}</div>`
   }
 }
 
@@ -4461,7 +6625,7 @@ function renderCatalog() {
   grid.innerHTML = ''
   const filtered = catalogFilter === 'all' ? catalogItems : catalogItems.filter(i => i.category === catalogFilter)
   if (filtered.length === 0) {
-    grid.innerHTML = '<div class="connector-loading">Nincs találat ebben a kategóriában</div>'
+    grid.innerHTML = `<div class="connector-loading">${t('connectors.catalog_empty')}</div>`
     return
   }
   for (const item of filtered) {
@@ -4475,15 +6639,15 @@ function renderCatalog() {
           <div class="catalog-card-name">
             ${escapeHtml(item.name)}
             <span class="catalog-card-type ${item.type}">${item.type}</span>
-            ${item.infoUrl ? `<a href="${escapeHtml(item.infoUrl)}" target="_blank" rel="noopener" class="catalog-card-link" title="Dokumentáció megnyitása" onclick="event.stopPropagation()">&#x2197;</a>` : ''}
+            ${item.infoUrl ? `<a href="${escapeHtml(item.infoUrl)}" target="_blank" rel="noopener" class="catalog-card-link" title="${t('connectors.tooltip.docs')}" onclick="event.stopPropagation()">&#x2197;</a>` : ''}
           </div>
           <div class="catalog-card-desc">${escapeHtml(item.description)}</div>
         </div>
       </div>
       <div class="catalog-card-footer">
         ${item.installed
-          ? `<span class="catalog-install-btn installed" title="Forrás: ${escapeHtml(item.installedSource || 'ismeretlen')}">Telepítve &#10003;${item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${item.installedSource === 'claude.ai' ? '' : `<a class="catalog-uninstall-link" data-id="${item.id}">Eltávolítás</a>`}`
-          : `<button class="catalog-install-btn install" data-id="${item.id}">Telepítés</button>${authHint}`
+          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? t('connectors.tooltip.installed_mcp') : t('connectors.tooltip.installed_src', { src: escapeHtml(item.installedSource || '') })}">Telepítve &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${item.id}">Eltávolítás</a>`}`
+          : `<button class="catalog-install-btn install" data-id="${item.id}">${t('connectors.catalog.install_btn')}</button>${authHint}`
         }
       </div>
     `
@@ -4509,7 +6673,7 @@ function renderCatalog() {
 
 function openCatalogInstall(item) {
   catalogInstallTarget = item
-  document.getElementById('catalogInstallTitle').textContent = `${item.icon} ${item.name} telepítése`
+  document.getElementById('catalogInstallTitle').textContent = t('connectors.catalog.install_title', { icon: item.icon, name: item.name })
   document.getElementById('catalogInstallDesc').textContent = item.description
 
   const envContainer = document.getElementById('catalogInstallEnvFields')
@@ -4525,7 +6689,7 @@ function openCatalogInstall(item) {
       div.className = 'catalog-env-group'
       div.innerHTML = `
         <label>${escapeHtml(key)}</label>
-        <input type="text" data-env-key="${escapeHtml(key)}" placeholder="Illeszd be a ${escapeHtml(key)} értéket">
+        <input type="text" data-env-key="${escapeHtml(key)}" placeholder="${t('connectors.catalog.env_placeholder', { key: escapeHtml(key) })}">
       `
       envContainer.appendChild(div)
     }
@@ -4557,7 +6721,7 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
     const val = input.value.trim()
     if (!val) {
       input.focus()
-      showToast(`${key} megadása kötelező`)
+      showToast(t('connectors.toast.required_field', { key }))
       return
     }
     envData[key] = val
@@ -4576,7 +6740,7 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Hiba')
     closeModal(catalogInstallOverlay)
-    showToast(data.message || 'Telepítve!')
+    showToast(data.message || t('connectors.toast.installed'))
     // Reload both views
     loadCatalog()
     loadConnectors()
@@ -4590,12 +6754,12 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
 })
 
 async function catalogUninstall(item) {
-  if (!confirm(`Biztosan eltávolítod: ${item.name}?`)) return
+  if (!confirm(t('connectors.confirm.remove', { name: item.name }))) return
   try {
     const res = await fetch(`/api/mcp-catalog/${encodeURIComponent(item.id)}/uninstall`, { method: 'DELETE' })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Hiba')
-    showToast(data.message || 'Eltávolítva')
+    showToast(data.message || t('connectors.toast.removed'))
     loadCatalog()
     loadConnectors()
   } catch (err) {
@@ -4649,7 +6813,7 @@ let connectorCacheWarming = true
 let connectorCacheError = ''
 
 async function loadConnectors() {
-  connectorGrid.innerHTML = '<div class="connector-loading"><span class="spinner"></span> Connectorok betoltese...</div>'
+  connectorGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('connectors.loading')}</div>`
   connectorStats.innerHTML = ''
   // Reset pessimistic state at the top of every load. Only an authoritative
   // positive signal (status endpoint reports cacheLastRefreshed > 0) flips
@@ -4679,7 +6843,7 @@ async function loadConnectors() {
     loadVault()
   } catch (err) {
     console.error('Connector betöltés hiba:', err)
-    connectorGrid.innerHTML = '<div class="connector-loading">Hiba a betöltés során</div>'
+    connectorGrid.innerHTML = `<div class="connector-loading">${t('connectors.load_error')}</div>`
   }
 }
 
@@ -4694,27 +6858,14 @@ const BUILTIN_MCPS = [
   {
     name: 'computer-use',
     label: 'Computer Use',
-    desc: 'Képernyő vezérlés, kattintás, gépelés',
-    detailHtml: `
-      <p>A Computer Use egy natív Claude képesség, amit nem a Marveen kezel, hanem maga a Claude Code CLI / Claude alkalmazás.
-      Nem jelenik meg a <code>claude mcp list</code> kimenetében, ezért a dashboard sem tudja automatikusan detektálni.</p>
-      <p><strong>Bekapcsolás:</strong> a pontos folyamat a Claude verziójától függ és változhat verziók között.
-      Kövesd az Anthropic hivatalos dokumentációját és a Claude Code changelogot.
-      A fő session tmux-nevét az "Ügynökök" oldalon találod -- oda <code>tmux attach</code>-al tudsz belépni manuálisan.</p>
-      <p style="color:var(--text-muted)">Ez a képesség engedélyt ad az ügynöknek a képernyő vezérlésére és kattintásra, ezért csak megbízható környezetben használd.</p>
-    `,
+    desc: () => t('connectors.builtin.computer_use'),
+    get detailHtml() { return t('connectors.builtin.computer_use_html') },
   },
   {
     name: 'chrome',
     label: 'Claude in Chrome',
-    desc: 'Böngésző automatizálás',
-    detailHtml: `
-      <p>A Claude in Chrome egy indítás-idejű flag a Claude Code CLI-n, nem egy bekapcsolható MCP szerver.
-      Ezért nem jelenik meg a <code>claude mcp list</code> kimenetében, és a dashboard sem tudja automatikusan detektálni.</p>
-      <p><strong>Bekapcsolás:</strong> indítsd a Claude-ot a <code>--chrome</code> flaggel:</p>
-      <pre style="background:var(--bg-input);padding:8px 12px;border-radius:4px;font-size:12px;overflow-x:auto">claude --chrome</pre>
-      <p style="color:var(--text-muted)">A Chrome integráció lehetővé teszi a böngészőautomatizálást. A Marveen sub-agentek indítása jelenleg nem adja át ezt a flaget, így csak a manuálisan indított fő session használhatja.</p>
-    `,
+    desc: () => t('connectors.builtin.chrome'),
+    get detailHtml() { return t('connectors.builtin.chrome_html') },
   },
 ]
 
@@ -4722,7 +6873,7 @@ function openBuiltinDetail(item) {
   const overlay = document.getElementById('builtinDetailOverlay')
   if (!overlay) return
   document.getElementById('builtinDetailTitle').textContent = item.label
-  document.getElementById('builtinDetailDesc').textContent = item.desc
+  document.getElementById('builtinDetailDesc').textContent = typeof item.desc === 'function' ? item.desc() : item.desc
   // Static strings only. Never interpolate user or server input here
   // without passing it through escapeHtml first -- detailHtml is a
   // raw HTML sink.
@@ -4764,13 +6915,19 @@ function renderConnectors() {
     connectorStats.innerHTML = ''
   } else {
     const connected = connectors.filter(c => c.status === 'connected').length
+    // 'configured' = declared in a .mcp.json (not health-checked, the backend
+    // never spawns them). These are known-good, not broken -- surface them in a
+    // positive count so file-defined servers (e.g. gmail-egov) do not look
+    // un-ready just because they never went through the claude mcp list cache.
+    const configured = connectors.filter(c => c.status === 'configured').length
     const needsAuth = connectors.filter(c => c.status === 'needs_auth').length
     const failed = connectors.filter(c => c.status === 'failed').length
     connectorStats.innerHTML = `
-      <div class="stat-card"><div class="stat-value">${connectors.length}</div><div class="stat-label">Összes</div></div>
-      <div class="stat-card"><div class="stat-value" style="color:var(--success)">${connected}</div><div class="stat-label">Aktív</div></div>
-      ${needsAuth ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${needsAuth}</div><div class="stat-label">Auth szükséges</div></div>` : ''}
-      ${failed ? `<div class="stat-card"><div class="stat-value" style="color:var(--danger)">${failed}</div><div class="stat-label">Hibás</div></div>` : ''}
+      <div class="stat-card"><div class="stat-value">${connectors.length}</div><div class="stat-label">${t('connectors.stat.total')}</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:var(--success)">${connected}</div><div class="stat-label">${t('connectors.stat.active')}</div></div>
+      ${configured ? `<div class="stat-card"><div class="stat-value" style="color:var(--info)">${configured}</div><div class="stat-label">${t('connectors.stat.configured')}</div></div>` : ''}
+      ${needsAuth ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${needsAuth}</div><div class="stat-label">${t('connectors.stat.needs_auth')}</div></div>` : ''}
+      ${failed ? `<div class="stat-card"><div class="stat-value" style="color:var(--danger)">${failed}</div><div class="stat-label">${t('connectors.stat.failed')}</div></div>` : ''}
     `
   }
 
@@ -4779,16 +6936,16 @@ function renderConnectors() {
   if (connectors.length > 0 && !connectorCacheWarming && connectorCacheError && hasClaudeAiEntries) {
     const banner = document.createElement('div')
     banner.className = 'connector-stale-banner'
-    banner.innerHTML = `Frissítés sikertelen: ${escapeHtml(connectorCacheError)} -- a claude.ai connectorok elavultak lehetnek.`
+    banner.innerHTML = t('connectors.stale_banner', { msg: escapeHtml(connectorCacheError) })
     connectorGrid.appendChild(banner)
   }
   if (connectors.length === 0 && !BUILTIN_MCPS.length) {
     if (connectorCacheWarming && connectorCacheError) {
-      connectorGrid.innerHTML = `<div class="connector-loading">MCP lista nem tölthető be: ${escapeHtml(connectorCacheError)}</div>`
+      connectorGrid.innerHTML = `<div class="connector-loading">${t('connectors.mcp_load_failed', { msg: escapeHtml(connectorCacheError) })}</div>`
     } else if (connectorCacheWarming) {
-      connectorGrid.innerHTML = '<div class="connector-loading">MCP lista még nem töltődött be. Kattints a Frissítés gombra, vagy várj egy percet a dashboard indulása után.</div>'
+      connectorGrid.innerHTML = `<div class="connector-loading">${t('connectors.mcp_not_loaded')}</div>`
     } else {
-      connectorGrid.innerHTML = '<div class="connector-loading">Nincsenek MCP connectorok</div>'
+      connectorGrid.innerHTML = `<div class="connector-loading">${t('connectors.no_mcps')}</div>`
     }
     return
   }
@@ -4832,7 +6989,7 @@ function renderConnectors() {
     const sourceTag = c.source ? `<span class="connector-source-badge">${escapeHtml(sourceLabels[c.source] || c.source)}</span>` : ''
     const readOnly = c.source === 'claude.ai'
     if (readOnly) card.classList.add('connector-card-readonly')
-    const readonlyHint = readOnly ? '<div class="connector-readonly-hint">Kezelhető: claude.ai</div>' : ''
+    const readonlyHint = readOnly ? `<div class="connector-readonly-hint">${t('connectors.readonly_hint')}</div>` : ''
     card.innerHTML = `
       <div class="connector-status-dot ${c.status}"></div>
       <div class="connector-info">
@@ -4870,7 +7027,7 @@ function renderConnectors() {
   // === Claude globális ===
   const globalHeading = document.createElement('div')
   globalHeading.className = 'connector-group-heading'
-  globalHeading.textContent = 'Claude globális'
+  globalHeading.textContent = t('connectors.heading.global')
   connectorGrid.appendChild(globalHeading)
 
   const builtinGrid = document.createElement('div')
@@ -4879,9 +7036,9 @@ function renderConnectors() {
     const div = document.createElement('div')
     div.className = 'connector-builtin'
     div.innerHTML = `
-      <div class="connector-status-dot unknown" title="A dashboard nem tudja automatikusan detektálni ezt a képességet"></div>
-      <div class="connector-builtin-name">${escapeHtml(b.label)}<br><span style="font-size:11px;color:var(--text-muted);font-weight:400">${escapeHtml(b.desc)}</span></div>
-      <button type="button" class="connector-builtin-action btn-link" data-builtin="${escapeHtml(b.name)}">Részletek</button>
+      <div class="connector-status-dot unknown" title="${t('connectors.tooltip.auto_detect')}"></div>
+      <div class="connector-builtin-name">${escapeHtml(b.label)}<br><span style="font-size:11px;color:var(--text-muted);font-weight:400">${escapeHtml(typeof b.desc === 'function' ? b.desc() : b.desc)}</span></div>
+      <button type="button" class="connector-builtin-action btn-link" data-builtin="${escapeHtml(b.name)}">${t('connectors.builtin.details')}</button>
     `
     const btn = div.querySelector('button[data-builtin]')
     if (btn) btn.addEventListener('click', () => openBuiltinDetail(b))
@@ -4900,7 +7057,7 @@ function renderConnectors() {
   if (agentScopes.length > 0) {
     const agentHeading = document.createElement('div')
     agentHeading.className = 'connector-group-heading'
-    agentHeading.textContent = 'Ügynökök'
+    agentHeading.textContent = t('connectors.heading.agents')
     connectorGrid.appendChild(agentHeading)
 
     for (const ag of agentScopes) {
@@ -4913,7 +7070,7 @@ function renderConnectors() {
   if (internalProjectScopes.length > 0) {
     const projectHeading = document.createElement('div')
     projectHeading.className = 'connector-group-heading'
-    projectHeading.textContent = 'Projektek'
+    projectHeading.textContent = t('connectors.heading.projects')
     connectorGrid.appendChild(projectHeading)
 
     for (const ps of internalProjectScopes) {
@@ -4927,7 +7084,7 @@ function renderConnectors() {
   if (externalProjectScopes.length > 0 || _extPathsPanel) {
     const extHeading = document.createElement('div')
     extHeading.className = 'connector-group-heading'
-    extHeading.textContent = 'Külső projektek'
+    extHeading.textContent = t('connectors.heading.external')
     connectorGrid.appendChild(extHeading)
 
     if (_extPathsPanel) connectorGrid.appendChild(_extPathsPanel)
@@ -4995,7 +7152,7 @@ async function loadGitHubRepos() {
     addBtn.textContent = 'Telepites...'
     status.hidden = false
     status.className = 'github-repo-status loading'
-    status.textContent = 'Klónozás és telepítés...'
+    status.textContent = t('connectors.cloning')
     try {
       const res = await fetch('/api/connectors/github-repos', {
         method: 'POST',
@@ -5010,18 +7167,25 @@ async function loadGitHubRepos() {
       }
       if (data.requiredEnvVars && data.requiredEnvVars.length > 0) {
         status.className = 'github-repo-status loading'
-        status.textContent = 'API kulcsok megadása szükséges...'
+        status.textContent = t('connectors.api_keys_needed')
         const envValues = await showEnvVarModal(data.requiredEnvVars)
         if (envValues && Object.keys(envValues).length > 0) {
+          let vaultAllOk = true
           for (const [key, value] of Object.entries(envValues)) {
-            await fetch('/api/vault', {
+            const r = await fetch('/api/vault', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: `github-env-${data.repo.name}-${key}`, label: `${key} (${data.repo.name.replace('--', '/')})`, value }),
             })
+            if (!r.ok) vaultAllOk = false
           }
-          status.className = 'github-repo-status success'
-          status.textContent = 'Telepitve, kulcsok mentve a Vault-ba!'
+          if (vaultAllOk) {
+            status.className = 'github-repo-status success'
+            status.textContent = 'Telepitve, kulcsok mentve a Vault-ba!'
+          } else {
+            status.className = 'github-repo-status error'
+            status.textContent = 'Telepitve, de néhány kulcs mentése sikertelen. Add meg újra a Vault-ban.'
+          }
           loadVault()
         } else {
           status.className = 'github-repo-status success'
@@ -5063,7 +7227,8 @@ async function loadVault() {
       item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(s.label)}</span><span class="github-repo-date">${escapeHtml(s.id)} &middot; ${date}</span></div><button title="Torles" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:14px;padding:2px 6px">&times;</button>`
       item.querySelector('button').addEventListener('click', async () => {
         if (!confirm(`Torlod: ${s.label}?`)) return
-        await fetch(`/api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
+        const res = await fetch(`/api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
+        if (!res.ok) { showToast('Törlés sikertelen'); return }
         loadVault()
       })
       list.appendChild(item)
@@ -5087,11 +7252,16 @@ async function loadVault() {
     const id = idInput.value.trim()
     const val = valInput.value
     if (!id || !val) return
-    await fetch('/api/vault', {
+    const res = await fetch('/api/vault', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, label: id, value: val }),
     })
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}))
+      showToast('Mentés sikertelen: ' + (e.error || res.status))
+      return
+    }
     idInput.value = ''
     valInput.value = ''
     loadVault()
@@ -5141,6 +7311,580 @@ function showEnvVarModal(envVars) {
   })
 })()
 
+// --- SSH Vault ---
+let _sshServers = []
+let _sshKeys = []
+let _sshView = 'table'
+let _sshEditingId = null
+
+async function loadSshServers() {
+  try {
+    const res = await fetch('/api/vault/ssh-servers')
+    const data = await res.json()
+    _sshServers = data.servers || []
+    renderSshServers()
+  } catch { /* ignore */ }
+}
+
+async function loadSshKeys() {
+  try {
+    const res = await fetch('/api/vault/ssh-keys')
+    if (!res.ok) return
+    const data = await res.json()
+    _sshKeys = data.keys || []
+    renderSshKeys()
+    _refreshKeySelects()
+  } catch { /* ignore */ }
+}
+
+function renderSshKeys() {
+  const tbody = document.getElementById('sshKeysTableBody')
+  const keysView = document.getElementById('sshKeysView')
+  const emptyEl = document.getElementById('sshKeysEmpty')
+  if (!tbody) return
+  if (_sshKeys.length === 0) {
+    keysView.hidden = true
+    emptyEl.hidden = false
+    return
+  }
+  keysView.hidden = false
+  emptyEl.hidden = true
+  tbody.innerHTML = _sshKeys.map(k => `
+    <tr>
+      <td class="ssh-table-name">${escapeHtml(k.label || k.id)}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.username || '')}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.keyType || 'ed25519')}</td>
+      <td class="ssh-table-mono" style="font-size:11px">${k.fingerprint ? escapeHtml(k.fingerprint.slice(0,28)) + '…' : ''}</td>
+      <td class="ssh-table-mono">${k.createdAt ? new Date(k.createdAt).toLocaleDateString('hu-HU') : ''}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-key-copy-btn" data-id="${escapeHtml(k.id)}" title="Publikus kulcs másolása">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-key-delete-btn" data-id="${escapeHtml(k.id)}" title="Törlés">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+  tbody.querySelectorAll('.ssh-key-copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = _sshKeys.find(k => k.id === btn.dataset.id)
+      if (!key) return
+      try {
+        const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}/public-key`)
+        if (res.ok) {
+          const data = await res.json()
+          await navigator.clipboard.writeText(data.publicKey || '')
+          btn.textContent = '✓'
+          setTimeout(() => { btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' }, 1500)
+        }
+      } catch { /* ignore */ }
+    })
+  })
+  tbody.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Biztosan törlöd ezt a kulcsot?')) return
+      await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      await loadSshKeys()
+    })
+  })
+}
+
+function _refreshKeySelects() {
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  document.querySelectorAll('.ssh-key-select').forEach(sel => {
+    const prev = sel.value
+    sel.innerHTML = opts
+    sel.value = prev
+  })
+}
+
+function _sshKeyBadge(status) {
+  const labels = { ok: 'OK', missing: 'Hiányzó', expired: 'Lejárt' }
+  const icons = {
+    ok: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
+    missing: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    expired: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  }
+  return `<span class="ssh-key-badge ${status}">${icons[status] || ''} ${labels[status] || status}</span>`
+}
+
+function _sshKeyAssignSelect(s) {
+  const currentKeyId = s.sshKeyId || s.assignedKeyId || s.vaultKeyId || ''
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => {
+      const sel = (currentKeyId && currentKeyId === k.id) ? ' selected' : ''
+      return `<option value="${escapeHtml(k.id)}"${sel}>${escapeHtml(k.label || k.id)}</option>`
+    })
+  ].join('')
+  return `<select class="ssh-key-assign ssh-key-select" data-id="${escapeHtml(s.id)}" title="Kulcs hozzárendelése">${opts}</select>`
+}
+
+function _sshInfoBtn(s) {
+  return `<button class="ssh-info-btn" data-id="${escapeHtml(s.id)}" data-user="${escapeHtml(s.user)}" title="Telepítési útmutató">i</button>`
+}
+
+function renderSshServers() {
+  const cardsEl = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+  const tableBody = document.getElementById('sshTableBody')
+  const emptyEl = document.getElementById('sshEmpty')
+  if (!cardsEl || !tableBody || !emptyEl) return
+
+  // Sync view state with _sshView
+  const isTable = _sshView === 'table'
+  cardsEl.hidden = isTable
+  if (tableView) tableView.hidden = !isTable
+  document.getElementById('sshViewCards')?.classList.toggle('active', !isTable)
+  document.getElementById('sshViewTable')?.classList.toggle('active', isTable)
+
+  if (_sshServers.length === 0) {
+    cardsEl.innerHTML = ''
+    tableBody.innerHTML = ''
+    emptyEl.hidden = false
+    return
+  }
+  emptyEl.hidden = true
+
+  // Cards
+  cardsEl.innerHTML = _sshServers.map(s => `
+    <div class="ssh-card" data-id="${escapeHtml(s.id)}">
+      <div class="ssh-card-head">
+        <div class="ssh-card-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <div class="ssh-card-title">
+          <div class="ssh-card-name">${escapeHtml(s.name)}</div>
+          ${s.desc ? `<div class="ssh-card-desc">${escapeHtml(s.desc)}</div>` : ''}
+        </div>
+      </div>
+      <div class="ssh-card-meta">
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          <span>${escapeHtml(s.host)}</span>
+        </div>
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span>${escapeHtml(s.user)}${s.port !== 22 ? ` :${s.port}` : ''}</span>
+        </div>
+        ${s.fingerprint ? `<div class="ssh-card-row"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>${escapeHtml(s.keyType || '')} ${escapeHtml(s.fingerprint.slice(0,24))}…</span></div>` : ''}
+      </div>
+      <div class="ssh-card-footer">
+        <div style="display:flex;align-items:center;gap:4px;width:100%">
+          ${_sshKeyAssignSelect(s)}
+          <div class="ssh-card-actions">
+            <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+            </button>
+            <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join('')
+
+  // Table
+  tableBody.innerHTML = _sshServers.map(s => `
+    <tr data-id="${escapeHtml(s.id)}">
+      <td class="ssh-table-name">${escapeHtml(s.name)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.host)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.user)}</td>
+      <td class="ssh-table-mono">${s.port}</td>
+      <td>${_sshKeyAssignSelect(s)}</td>
+      <td style="color:var(--text-muted)">${escapeHtml(s.desc || '')}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+
+  // Delete handlers
+  document.querySelectorAll('.ssh-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.getAttribute('data-id')
+      if (!confirm(`Törlöd: ${id}?`)) return
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        await loadSshServers()
+      } catch { showToast('Törlés sikertelen') }
+    })
+  })
+
+  // Edit handlers -- open the add-server panel pre-filled, switch it to edit mode
+  document.querySelectorAll('.ssh-edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-id')
+      const server = _sshServers.find(s => s.id === id)
+      if (!server) return
+      _sshEditingId = id
+
+      document.getElementById('sshNameInput').value = server.name || ''
+      document.getElementById('sshHostInput').value = server.host || ''
+      document.getElementById('sshUserInput').value = server.user || ''
+      document.getElementById('sshPortInput').value = server.port || 22
+      document.getElementById('sshDescInput').value = server.desc || ''
+      const keySel = document.getElementById('sshKeySelectInput')
+      if (keySel) keySel.value = server.sshKeyId || server.assignedKeyId || server.vaultKeyId || ''
+
+      const titleEl = document.getElementById('sshAddPanelTitle')
+      if (titleEl) titleEl.textContent = `Szerver szerkesztése – ${server.name}`
+
+      const panel = document.getElementById('sshAddPanel')
+      panel.hidden = false
+      document.getElementById('sshNameInput').focus()
+    })
+  })
+
+  // Key assign select handlers
+  document.querySelectorAll('.ssh-key-assign').forEach(sel => {
+    sel.addEventListener('change', async () => {
+      const id = sel.getAttribute('data-id')
+      const sshKeyId = sel.value || null
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    })
+  })
+
+}
+
+// --- SSH Keygen modal (standalone key creation for Kulcstároló) ---
+let _sshKeygenCallback = null  // called with new key after successful generation
+
+function openSshKeygenModal(callback) {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  document.getElementById('sshKeygenLabelInput').value = ''
+  document.getElementById('sshKeygenUserInput').value = ''
+  document.getElementById('sshKeygenSpinner').hidden = true
+  document.getElementById('sshKeygenResult').hidden = true
+  document.getElementById('sshKeygenFooter').hidden = false
+  document.getElementById('sshKeygenForm').hidden = false
+  document.getElementById('sshKeygenPubkeyBox').value = ''
+  _sshKeygenCallback = callback || null
+  openModal(overlay)
+  document.getElementById('sshKeygenLabelInput').focus()
+}
+
+;(function wireSshKeygenModal() {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  const closeBtn = document.getElementById('sshKeygenClose')
+  const submitBtn = document.getElementById('sshKeygenSubmitBtn')
+  const copyBtn = document.getElementById('sshKeygenCopyBtn')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  submitBtn.addEventListener('click', async () => {
+    const label = document.getElementById('sshKeygenLabelInput').value.trim()
+    const username = document.getElementById('sshKeygenUserInput').value.trim()
+    if (!label || !username) { showToast('Cimke és felhasználónév megadása kötelező'); return }
+
+    document.getElementById('sshKeygenForm').hidden = true
+    document.getElementById('sshKeygenSpinner').hidden = false
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = true
+
+    try {
+      const res = await fetch('/api/vault/ssh-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, username }),
+      })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Generálás sikertelen'); resetKeygenForm(); return }
+
+      const pubkey = data.publicKey || (data.key && data.key.publicKey) || ''
+      document.getElementById('sshKeygenPubkeyBox').value = pubkey
+      document.getElementById('sshKeygenSpinner').hidden = true
+      document.getElementById('sshKeygenResult').hidden = false
+
+      await loadSshKeys()
+      if (_sshKeygenCallback) _sshKeygenCallback(data.key || data)
+    } catch { showToast('Hálózati hiba'); resetKeygenForm() }
+  })
+
+  copyBtn?.addEventListener('click', () => {
+    const val = document.getElementById('sshKeygenPubkeyBox').value
+    navigator.clipboard.writeText(val).then(() => {
+      copyBtn.textContent = 'Másolva!'
+      setTimeout(() => { copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Másolás' }, 2000)
+    }).catch(() => {})
+  })
+
+  function resetKeygenForm() {
+    document.getElementById('sshKeygenForm').hidden = false
+    document.getElementById('sshKeygenSpinner').hidden = true
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = false
+  }
+})()
+
+// --- SSH Info modal ---
+let _sshInfoServerId = null
+
+async function _sshInfoLoadKey(keyId, serverUser) {
+  const installSection = document.getElementById('sshInfoInstallSection')
+  const noKeyEl = document.getElementById('sshInfoNoKey')
+  if (!keyId) {
+    installSection.hidden = true
+    noKeyEl.hidden = false
+    return
+  }
+  installSection.hidden = false
+  noKeyEl.hidden = true
+
+  let pubkey = ''
+  try {
+    const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(keyId)}/public-key`)
+    if (res.ok) { const d = await res.json(); pubkey = d.publicKey || '' }
+  } catch {}
+
+  const targetUser = serverUser || 'root'
+  document.getElementById('sshInfoUser').textContent = targetUser
+
+  // root always exists -- only show the "create user" step for a real,
+  // non-root target user (e.g. a fresh server that needs the account first).
+  const step0 = document.getElementById('sshInfoStep0')
+  if (targetUser === 'root') {
+    step0.hidden = true
+  } else {
+    step0.hidden = false
+    document.getElementById('sshInfoCmd0').textContent = `useradd -m -s /bin/bash ${targetUser}`
+  }
+
+  const cmd2text = pubkey
+    ? `echo "${pubkey}" >> ~/.ssh/authorized_keys`
+    : `echo "<publikus kulcs ide>" >> ~/.ssh/authorized_keys`
+  document.getElementById('sshInfoCmd2').textContent = cmd2text
+  document.getElementById('sshInfoPubkey').textContent = pubkey || '(kulcs nem elérhető)'
+
+  const overlay = document.getElementById('sshInfoOverlay')
+  overlay.querySelectorAll('.ssh-code-copy').forEach(btn => {
+    const clone = btn.cloneNode(true)
+    btn.parentNode.replaceChild(clone, btn)
+    clone.addEventListener('click', () => {
+      const text = document.getElementById(clone.getAttribute('data-target'))?.textContent || ''
+      navigator.clipboard.writeText(text).then(() => {
+        clone.classList.add('copied')
+        setTimeout(() => clone.classList.remove('copied'), 2000)
+      }).catch(() => {})
+    })
+  })
+}
+
+function _sshInfoLoadServer(serverId) {
+  _sshInfoServerId = serverId
+  const server = _sshServers.find(s => s.id === serverId)
+
+  document.getElementById('sshInfoServerName').textContent = server ? server.name : (serverId || '')
+
+  const keySel = document.getElementById('sshInfoKeySelect')
+  keySel.innerHTML = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  const assignedKeyId = (server && (server.sshKeyId || server.assignedKeyId || server.vaultKeyId)) || ''
+  keySel.value = assignedKeyId
+  return { server, assignedKeyId }
+}
+
+function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const serverSection = overlay.querySelector('.ssh-info-server-section')
+
+  if (keyOnly) {
+    // Key-only mode: hide server selector, reset server context
+    serverSection.hidden = true
+    _sshInfoServerId = null
+    document.getElementById('sshInfoServerName').textContent = 'Új szerver'
+
+    // Populate key selector without a pre-selected key
+    const keySel = document.getElementById('sshInfoKeySelect')
+    keySel.innerHTML = ['<option value="">-- Válassz kulcsot --</option>',
+      ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+    ].join('')
+    // Pre-select whatever is chosen in the form's key dropdown
+    const formKeyId = document.getElementById('sshKeySelectInput')?.value || ''
+    keySel.value = formKeyId
+
+    // Use the username typed into the new-server form, not a hardcoded root
+    const formUser = document.getElementById('sshUserInput')?.value.trim() || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(formKeyId, formUser)
+  } else {
+    // Normal mode: show server selector, pick first server by default
+    serverSection.hidden = false
+    const serverSel = document.getElementById('sshInfoServerSelect')
+    serverSel.innerHTML = ['<option value="">-- Válassz szervert --</option>',
+      ..._sshServers.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`)
+    ].join('')
+
+    const firstId = preselectedServerId || (_sshServers[0] && _sshServers[0].id) || ''
+    serverSel.value = firstId
+
+    const { server, assignedKeyId } = _sshInfoLoadServer(firstId)
+    const targetUser = (server && server.user) || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(assignedKeyId, targetUser)
+  }
+}
+
+;(function wireSshInfoModal() {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const closeBtn = document.getElementById('sshInfoClose')
+  const serverSel = document.getElementById('sshInfoServerSelect')
+  const keySel = document.getElementById('sshInfoKeySelect')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  serverSel?.addEventListener('change', () => {
+    const { server, assignedKeyId } = _sshInfoLoadServer(serverSel.value)
+    _sshInfoLoadKey(assignedKeyId, (server && server.user) || 'root')
+  })
+
+  keySel?.addEventListener('change', async () => {
+    const keyId = keySel.value || null
+    // Key-only mode (new-server flow) has no _sshInfoServerId -- read the
+    // username from the new-server form instead of falling back to root.
+    const targetUser = _sshInfoServerId
+      ? ((_sshServers.find(s => s.id === _sshInfoServerId) || {}).user || 'root')
+      : (document.getElementById('sshUserInput')?.value.trim() || 'root')
+
+    if (_sshInfoServerId) {
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(_sshInfoServerId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId: keyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    }
+    await _sshInfoLoadKey(keyId, targetUser)
+  })
+})()
+
+;(function wireSshSection() {
+  const newBtn = document.getElementById('sshNewBtn')
+  const panel = document.getElementById('sshAddPanel')
+  const closeBtn = document.getElementById('sshAddPanelClose')
+  const addBtn = document.getElementById('sshAddBtn')
+  const cardViewBtn = document.getElementById('sshViewCards')
+  const tableViewBtn = document.getElementById('sshViewTable')
+  const cardsView = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+
+  if (!newBtn) return
+
+  function resetSshAddForm() {
+    _sshEditingId = null
+    const titleEl = document.getElementById('sshAddPanelTitle')
+    if (titleEl) titleEl.textContent = 'Szerver hozzáadása'
+    document.getElementById('sshNameInput').value = ''
+    document.getElementById('sshHostInput').value = ''
+    document.getElementById('sshUserInput').value = ''
+    document.getElementById('sshPortInput').value = '22'
+    document.getElementById('sshDescInput').value = ''
+    if (document.getElementById('sshKeySelectInput')) document.getElementById('sshKeySelectInput').value = ''
+  }
+
+  newBtn.addEventListener('click', () => {
+    if (panel.hidden) resetSshAddForm()
+    panel.hidden = !panel.hidden
+    if (!panel.hidden) document.getElementById('sshNameInput').focus()
+  })
+  closeBtn?.addEventListener('click', () => { panel.hidden = true; resetSshAddForm() })
+
+  // (i) install guide button inside the "new server" form -- key-only mode
+  document.getElementById('sshKeyInstallFromFormBtn')?.addEventListener('click', () => {
+    openSshInfoModal(null, { keyOnly: true })
+  })
+
+  // "+ Új kulcs" button inside the "new server" form
+  document.getElementById('sshKeyNewFromFormBtn')?.addEventListener('click', () => {
+    openSshKeygenModal(newKey => {
+      // After key created, select it in the form dropdown
+      if (newKey && newKey.id) {
+        const sel = document.getElementById('sshKeySelectInput')
+        if (sel) sel.value = newKey.id
+      }
+    })
+  })
+
+  addBtn?.addEventListener('click', async () => {
+    const name = document.getElementById('sshNameInput').value.trim()
+    const host = document.getElementById('sshHostInput').value.trim()
+    const user = document.getElementById('sshUserInput').value.trim()
+    const port = parseInt(document.getElementById('sshPortInput').value, 10) || 22
+    const desc = document.getElementById('sshDescInput').value.trim()
+    const sshKeyId = document.getElementById('sshKeySelectInput')?.value || null
+    if (!name || !host || !user) { showToast('Név, IP és felhasználó megadása kötelező'); return }
+    const isEdit = !!_sshEditingId
+    try {
+      const res = await fetch(
+        isEdit ? `/api/vault/ssh-servers/${encodeURIComponent(_sshEditingId)}` : '/api/vault/ssh-servers',
+        {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, host, user, port, desc, sshKeyId: sshKeyId || undefined }),
+        }
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        showToast(err.error || 'Hiba a mentéskor'); return
+      }
+      resetSshAddForm()
+      panel.hidden = true
+      await loadSshServers()
+      showToast(isEdit ? 'Szerver frissítve' : 'Szerver hozzáadva')
+    } catch { showToast('Hálózati hiba') }
+  })
+
+  cardViewBtn?.addEventListener('click', () => {
+    _sshView = 'cards'
+    cardViewBtn.classList.add('active')
+    tableViewBtn.classList.remove('active')
+    cardsView.hidden = false
+    tableView.hidden = true
+  })
+
+  tableViewBtn?.addEventListener('click', () => {
+    _sshView = 'table'
+    tableViewBtn.classList.add('active')
+    cardViewBtn.classList.remove('active')
+    cardsView.hidden = true
+    tableView.hidden = false
+  })
+
+  // Kulcstároló "Új kulcs generálása" button
+  document.getElementById('sshKeyNewBtn')?.addEventListener('click', () => {
+    openSshKeygenModal()
+  })
+
+  // Global (i) info button in section header
+  document.getElementById('sshInfoGlobalBtn')?.addEventListener('click', () => {
+    openSshInfoModal()
+  })
+})()
+
 // --- Vault Page ---
 let _vaultSecrets = []
 
@@ -5159,6 +7903,7 @@ async function loadVaultPage() {
     document.getElementById('vaultStatTotal').textContent = String(_vaultSecrets.length)
     document.getElementById('vaultStatBindings').textContent = String(_vaultBindings.length)
     renderVaultGrid(_vaultSecrets)
+    await Promise.all([loadSshKeys(), loadSshServers()])
   } catch { /* ignore */ }
 }
 
@@ -5174,7 +7919,7 @@ function renderVaultGrid(secrets) {
     const date = new Date(s.updatedAt).toLocaleDateString('hu-HU')
     const bindingCount = _vaultBindings.filter(b => b.vaultSecretId === s.id).length
     const bindingBadge = bindingCount > 0 ? `<span class="vault-binding-badge" title="${bindingCount} kotes">${bindingCount} kotes</span>` : ''
-    card.innerHTML = `<div class="vault-card-header"><div class="vault-card-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div class="vault-card-title"><div class="vault-card-id">${escapeHtml(s.id)} ${bindingBadge}</div>${s.label !== s.id ? `<div class="vault-card-label">${escapeHtml(s.label)}</div>` : ''}</div><div class="vault-card-meta">${date}</div></div><div class="vault-card-actions"><button class="btn-secondary btn-compact vault-card-reveal" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> Mutat</button><button class="btn-secondary btn-compact vault-card-edit" data-id="${escapeHtml(s.id)}" data-label="${escapeHtml(s.label)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Modosit</button><button class="btn-secondary btn-compact vault-card-delete" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg> Torles</button></div>`
+    card.innerHTML = `<div class="vault-card-header"><div class="vault-card-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div class="vault-card-title"><div class="vault-card-id">${escapeHtml(s.id)} ${bindingBadge}</div>${s.label !== s.id ? `<div class="vault-card-label">${escapeHtml(s.label)}</div>` : ''}</div><div class="vault-card-meta">${date}</div></div><div class="vault-card-actions"><button class="btn-secondary btn-compact vault-card-reveal" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>${t('vault.btn.show')}</button><button class="btn-secondary btn-compact vault-card-edit" data-id="${escapeHtml(s.id)}" data-label="${escapeHtml(s.label)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>${t('vault.btn.edit')}</button><button class="btn-secondary btn-compact vault-card-delete" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>${t('vault.btn.delete')}</button></div>`
     list.appendChild(card)
   }
   list.querySelectorAll('.vault-card-reveal').forEach(btn => {
@@ -5182,7 +7927,7 @@ function renderVaultGrid(secrets) {
       const id = btn.getAttribute('data-id')
       const card = btn.closest('.vault-card')
       const existing = card.querySelector('.vault-card-value')
-      if (existing) { existing.remove(); btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> Mutat'; return }
+      if (existing) { existing.remove(); btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> ${t('vault.btn.show')}`; return }
       const res = await fetch(`/api/vault/${encodeURIComponent(id)}`)
       const data = await res.json()
       if (data.value) {
@@ -5190,7 +7935,7 @@ function renderVaultGrid(secrets) {
         valEl.className = 'vault-card-value'
         valEl.textContent = data.value
         card.appendChild(valEl)
-        btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg> Elrejt'
+        btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg> ${t('vault.btn.hide')}`
       }
     })
   })
@@ -5207,7 +7952,7 @@ function renderVaultGrid(secrets) {
       if (!data.value) return
       const form = document.createElement('div')
       form.className = 'vault-card-edit-form'
-      form.innerHTML = `<input type="password" class="input vault-edit-value" value="${escapeHtml(data.value)}" style="font-size:13px;margin-bottom:6px"><button class="btn-primary btn-compact vault-edit-save">Mentés</button> <button class="btn-secondary btn-compact vault-edit-cancel">Mégse</button>`
+      form.innerHTML = `<input type="password" class="input vault-edit-value" value="${escapeHtml(data.value)}" style="font-size:13px;margin-bottom:6px"><button class="btn-primary btn-compact vault-edit-save">${t('vault.btn.save')}</button> <button class="btn-secondary btn-compact vault-edit-cancel">${t('vault.btn.cancel')}</button>`
       card.appendChild(form)
       const input = form.querySelector('.vault-edit-value')
       input.focus()
@@ -5219,11 +7964,18 @@ function renderVaultGrid(secrets) {
         const saveBtn = form.querySelector('.vault-edit-save')
         saveBtn.disabled = true
         saveBtn.textContent = '...'
-        await fetch('/api/vault', {
+        const res = await fetch('/api/vault', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id, label, value: newVal }),
         })
+        if (!res.ok) {
+          const e = await res.json().catch(() => ({}))
+          showToast('Frissítés sikertelen: ' + (e.error || res.status))
+          saveBtn.disabled = false
+          saveBtn.textContent = 'Mentés'
+          return
+        }
         form.remove()
         showToast('Kulcs frissitve es szinkronizalva')
         loadVaultPage()
@@ -5239,7 +7991,8 @@ function renderVaultGrid(secrets) {
     btn.addEventListener('click', async () => {
       const id = btn.getAttribute('data-id')
       if (!confirm(`Torlod: ${id}?`)) return
-      await fetch(`/api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      const res = await fetch(`/api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      if (!res.ok) { showToast('Törlés sikertelen'); return }
       loadVaultPage()
       loadVault()
     })
@@ -5362,7 +8115,7 @@ function renderVaultGrid(secrets) {
     }
 
     saveBtn.disabled = true
-    saveBtn.textContent = 'Mentés...'
+    saveBtn.textContent = t('connectors.save_btn')
     try {
       const res = await fetch('/api/vault/bindings', {
         method: 'POST',
@@ -5608,7 +8361,7 @@ async function openConnectorDetail(connector) {
     const res = await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`)
     const detail = await res.json()
 
-    const statusLabels = { connected: 'Csatlakozva', needs_auth: 'Auth szükséges', failed: 'Hiba', unknown: 'Ismeretlen' }
+    const statusLabels = { connected: t('connectors.status.connected'), needs_auth: t('connectors.status.needs_auth'), failed: t('connectors.status.failed'), unknown: t('connectors.status.unknown') }
     const statusColors = { connected: 'var(--success)', needs_auth: 'var(--accent)', failed: 'var(--danger)', unknown: 'var(--text-muted)' }
 
     document.getElementById('connectorDetailInfo').innerHTML = `
@@ -5625,7 +8378,7 @@ async function openConnectorDetail(connector) {
       ${Object.keys(detail.env || {}).length ? `<div class="connector-detail-row"><span class="meta-label">Env</span><span class="meta-value" style="font-family:monospace;font-size:11px">${Object.entries(detail.env).map(([k,v]) => `${k}=${v}`).join(', ')}</span></div>` : ''}
     `
   } catch {
-    document.getElementById('connectorDetailInfo').innerHTML = '<p>Részletek betöltése sikertelen</p>'
+    document.getElementById('connectorDetailInfo').innerHTML = `<p>${t('connectors.detail_error')}</p>`
   }
 
   try {
@@ -5641,8 +8394,8 @@ async function openConnectorDetail(connector) {
         assignedAgents.add(c.scope.replace('agent:', ''))
       }
     }
-    const mainAgent = allAgents.find(a => a.name === 'marveen')
-    const subAgents = allAgents.filter(a => a.name !== 'marveen')
+    const mainAgent = allAgents.find(a => a.name === mainAgentId())
+    const subAgents = allAgents.filter(a => a.name !== mainAgentId())
 
     const listEl = document.getElementById('connectorAgentList')
     listEl.innerHTML = ''
@@ -5650,7 +8403,7 @@ async function openConnectorDetail(connector) {
       const item = document.createElement('div')
       item.className = 'connector-agent-item connector-agent-auto'
       item.innerHTML = `
-        <input type="checkbox" checked disabled title="Globálisan elérhető a fő agentnek -- nem kell külön hozzárendelni">
+        <input type="checkbox" checked disabled title="${t('connectors.tooltip.global')}">
         <label>${escapeHtml(mainAgent.label || mainAgent.name)} <span class="tag-auto">automatikus</span></label>
       `
       listEl.appendChild(item)
@@ -5666,7 +8419,7 @@ async function openConnectorDetail(connector) {
       listEl.appendChild(item)
     }
     if (subAgents.length === 0 && !mainAgent) {
-      listEl.innerHTML = '<p style="color:var(--text-muted);font-size:13px">Nincsenek hozzarendelheto ügynökök</p>'
+      listEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('connectors.no_agents')}</p>`
     }
   } catch {
     document.getElementById('connectorAgentList').innerHTML = ''
@@ -5678,10 +8431,10 @@ async function openConnectorDetail(connector) {
     try {
       await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
       closeModal(connectorDetailOverlay)
-      showToast('Connector törölve')
+      showToast(t('connectors.toast.deleted'))
       loadConnectors()
     } catch {
-      showToast('Hiba a törlés során')
+      showToast(t('common.error_delete'))
     }
   }
 
@@ -5695,11 +8448,11 @@ async function openConnectorDetail(connector) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agents: checked, allAgents: allVisible }),
       })
-      showToast('Ügynök-hozzárendelés frissítve')
+      showToast(t('connectors.toast.assignment_updated'))
       closeModal(connectorDetailOverlay)
       loadConnectors()
     } catch {
-      showToast('Hiba a hozzárendelés során')
+      showToast(t('connectors.toast.assignment_error'))
     }
   }
 
@@ -5714,7 +8467,7 @@ document.getElementById('connectorEnvAddBtn').addEventListener('click', () => {
   row.innerHTML = `
     <input type="text" class="input env-key" placeholder="KULCS" style="flex:1">
     <span style="color:var(--text-muted)">=</span>
-    <input type="text" class="input env-val" placeholder="érték" style="flex:2">
+    <input type="text" class="input env-val" placeholder="${t('connectors.env_val_placeholder')}" style="flex:2">
     <button type="button" class="btn-link" style="color:var(--danger);padding:2px 6px">&times;</button>
   `
   row.querySelector('button').addEventListener('click', () => row.remove())
@@ -5797,9 +8550,9 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
 
     closeModal(connectorModalOverlay)
     if (result.nameChanged) {
-      showToast(`Connector hozzáadva "${savedName}" néven (szóköz/speciális karakter nem engedélyezett)`)
+      showToast(t('connectors.toast.added', { name: savedName }))
     } else {
-      showToast('Connector hozzáadva!')
+      showToast(t('connectors.toast.created'))
     }
     loadConnectors()
   } catch (err) {
@@ -5822,14 +8575,14 @@ function escapeHtml(str) {
 // === Status ===
 // ============================================================
 
-const CLAUDE_SERVICES = [
-  { name: 'claude.ai', label: 'Claude.ai' },
-  { name: 'api', label: 'Claude API' },
-  { name: 'code', label: 'Claude Code' },
-  { name: 'platform', label: 'Platform' },
-  { name: 'cowork', label: 'Claude Cowork' },
-  { name: 'gov', label: 'Claude for Gov' },
-]
+// Statuspage component status -> short label for non-operational states.
+const STATUS_COMPONENT_LABELS = {
+  operational: () => t('status.comp.operational'),
+  degraded_performance: () => t('status.comp.degraded'),
+  partial_outage: () => t('status.comp.partial_outage'),
+  major_outage: () => t('status.comp.major_outage'),
+  under_maintenance: () => t('status.comp.maintenance'),
+}
 
 document.getElementById('refreshStatusBtn').addEventListener('click', loadStatus)
 
@@ -5839,7 +8592,7 @@ async function loadStatus() {
   const listEl = document.getElementById('statusIncidentList')
 
   overallEl.className = 'status-overall unknown'
-  overallEl.textContent = 'Betöltés...'
+  overallEl.textContent = t('status.loading')
   gridEl.innerHTML = ''
   listEl.innerHTML = ''
 
@@ -5849,39 +8602,45 @@ async function loadStatus() {
 
     // Overall status
     const overallLabels = {
-      operational: 'Minden szolgáltatás működik',
-      degraded: 'Aktiv incidens',
-      unknown: 'Státusz nem elérhető',
+      operational: () => t('status.overall.operational'),
+      degraded: () => t('status.overall.degraded'),
+      unknown: () => t('status.overall.unknown'),
     }
     overallEl.className = `status-overall ${data.overall}`
-    overallEl.textContent = overallLabels[data.overall] || data.overall
+    const overallLabelRaw = overallLabels[data.overall]
+    overallEl.textContent = overallLabelRaw ? (typeof overallLabelRaw === 'function' ? overallLabelRaw() : overallLabelRaw) : data.overall
 
-    // Services grid (static list with status derived from incidents)
-    const activeIssues = data.incidents.filter(i => i.status !== 'resolved')
-    for (const svc of CLAUDE_SERVICES) {
-      const affected = activeIssues.some(i =>
-        i.title.toLowerCase().includes(svc.name) ||
-        i.description.toLowerCase().includes(svc.name)
-      )
-      const div = document.createElement('div')
-      div.className = 'status-service'
-      div.innerHTML = `
-        <div class="status-service-dot ${affected ? 'degraded' : 'operational'}"></div>
-        <span class="status-service-name">${escapeHtml(svc.label)}</span>
-      `
-      gridEl.appendChild(div)
+    // Services grid: real per-service status from the Statuspage components API
+    // (data.components). No more inventing a service list and substring-matching
+    // incident text -- if the components feed is unavailable we say so honestly
+    // instead of rendering a fake all-green grid.
+    const components = Array.isArray(data.components) ? data.components : []
+    if (components.length === 0) {
+      gridEl.innerHTML = `<div class="status-service-empty" style="color:var(--text-muted);font-size:13px">${t('status.no_components')}</div>`
+    } else {
+      for (const c of components) {
+        const ok = c.status === 'operational'
+        const div = document.createElement('div')
+        div.className = 'status-service'
+        div.innerHTML = `
+          <div class="status-service-dot ${ok ? 'operational' : 'degraded'}"></div>
+          <span class="status-service-name">${escapeHtml(c.name)}</span>
+          ${ok ? '' : `<span class="status-service-state" style="margin-left:auto;font-size:11px;color:var(--text-muted)">${escapeHtml((typeof STATUS_COMPONENT_LABELS[c.status] === 'function' ? STATUS_COMPONENT_LABELS[c.status]() : STATUS_COMPONENT_LABELS[c.status]) || c.status)}</span>`}
+        `
+        gridEl.appendChild(div)
+      }
     }
 
     // Incidents
     if (data.incidents.length === 0) {
-      listEl.innerHTML = '<div class="status-loading">Nincs korabbi incidens</div>'
+      listEl.innerHTML = `<div class="status-loading">${t('status.no_incidents')}</div>`
     } else {
       for (const inc of data.incidents) {
         const statusLabels = {
-          resolved: 'Megoldva',
-          monitoring: 'Figyeles',
-          identified: 'Azonositva',
-          investigating: 'Vizsgalat',
+          resolved: () => t('status.incident.resolved'),
+          monitoring: () => t('status.incident.monitoring'),
+          identified: () => t('status.incident.identified'),
+          investigating: () => t('status.incident.investigating'),
         }
         const div = document.createElement('div')
         div.className = `status-incident ${inc.status}`
@@ -5889,7 +8648,7 @@ async function loadStatus() {
         div.innerHTML = `
           <div class="status-incident-header">
             <span class="status-incident-title">${escapeHtml(inc.title)}</span>
-            <span class="status-incident-badge ${inc.status}">${statusLabels[inc.status] || inc.status}</span>
+            <span class="status-incident-badge ${inc.status}">${(typeof statusLabels[inc.status] === 'function' ? statusLabels[inc.status]() : statusLabels[inc.status]) || inc.status}</span>
           </div>
           <div class="status-incident-desc">${escapeHtml(inc.description.slice(0, 300))}</div>
           <div class="status-incident-date">${date}</div>
@@ -5997,7 +8756,7 @@ async function parseFileToChunks(file) {
 // Import button click
 memImportSaveBtn.addEventListener('click', async () => {
   if (!memImportFiles.length) {
-    showToast('Válassz legalább egy fájlt')
+    showToast(t('memories.toast.select_files'))
     return
   }
 
@@ -6006,7 +8765,7 @@ memImportSaveBtn.addEventListener('click', async () => {
   memImportSaveBtn.disabled = true
   memImportProgress.hidden = false
   memImportResult.hidden = true
-  memImportStatus.textContent = 'Fájlok feldolgozása...'
+  memImportStatus.textContent = t('memories.import.processing')
 
   try {
     // Parse all files into chunks
@@ -6021,13 +8780,13 @@ memImportSaveBtn.addEventListener('click', async () => {
       memImportSaveBtn.querySelector('.btn-text').hidden = false
       memImportSaveBtn.querySelector('.btn-loading').hidden = true
       memImportSaveBtn.disabled = false
-      showToast('Nincs importálható tartalom a fájlokban')
+      showToast(t('memories.toast.no_content'))
       return
     }
 
-    memImportStatus.textContent = `${allChunks.length} chunk kategorizálása és importálása...`
+    memImportStatus.textContent = t('memories.import.importing', { n: allChunks.length })
 
-    const agentId = document.getElementById('memImportAgent').value || 'marveen'
+    const agentId = document.getElementById('memImportAgent').value || mainAgentId()
     const resp = await fetch('/api/memories/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -6041,13 +8800,13 @@ memImportSaveBtn.addEventListener('click', async () => {
       const s = data.stats || {}
       memImportResult.hidden = false
       memImportResult.innerHTML = `
-        <div style="color:var(--text-primary);font-weight:600;margin-bottom:8px">Költöztetés kész!</div>
+        <div style="color:var(--text-primary);font-weight:600;margin-bottom:8px">${t('memories.import.done_title')}</div>
         <div style="font-size:13px;color:var(--text-secondary)">
-          Összesen: <strong>${data.imported}</strong> emlék importálva<br>
+          ${t('memories.import.done_sub', { n: `<strong>${data.imported}</strong>` })}<br>
           Hot: ${s.hot || 0} | Warm: ${s.warm || 0} | Cold: ${s.cold || 0} | Shared: ${s.shared || 0}
         </div>
       `
-      showToast(`${data.imported} emlék importálva`)
+      showToast(t('memories.toast.imported', { n: data.imported }))
       loadMemories()
       loadMemStats()
     } else {
@@ -6055,7 +8814,7 @@ memImportSaveBtn.addEventListener('click', async () => {
     }
   } catch (err) {
     memImportProgress.hidden = true
-    showToast('Hiba a költöztetés során')
+    showToast(t('memories.toast.import_error'))
   }
 
   memImportSaveBtn.querySelector('.btn-text').hidden = false
@@ -6087,7 +8846,6 @@ async function loadMigrateAgents() {
 // Step 1: Scan
 document.getElementById('migrateScanBtn').addEventListener('click', async () => {
   const path = document.getElementById('migratePath').value.trim()
-  const type = document.getElementById('migrateType').value
   if (!path) { document.getElementById('migratePath').focus(); return }
 
   const btn = document.getElementById('migrateScanBtn')
@@ -6099,7 +8857,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
     const res = await fetch('/api/migrate/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourcePath: path, sourceType: type }),
+      body: JSON.stringify({ sourcePath: path }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Hiba')
@@ -6135,16 +8893,16 @@ function renderMigrateFindings(data) {
     'schedule': '\u23F0',
   }
   const typeLabels = {
-    'personality': 'Személyiség',
-    'profile': 'Felhasználói profil',
-    'memory': 'Memória',
-    'memory-hot': 'Hot memória',
-    'memory-warm': 'Warm memória',
-    'memory-cold': 'Cold memória',
-    'heartbeat': 'Heartbeat konfig',
-    'config': 'Konfiguráció',
-    'daily-log': 'Napi napló',
-    'schedule': 'Ütemezés',
+    'personality': () => t('migrate.type.personality'),
+    'profile': () => t('migrate.type.profile'),
+    'memory': () => t('migrate.type.memory'),
+    'memory-hot': () => t('migrate.type.memory_hot'),
+    'memory-warm': () => t('migrate.type.memory_warm'),
+    'memory-cold': () => t('migrate.type.memory_cold'),
+    'heartbeat': () => t('migrate.type.heartbeat'),
+    'config': () => t('migrate.type.config'),
+    'daily-log': () => t('migrate.type.daily_log'),
+    'schedule': () => t('migrate.type.schedule'),
   }
 
   findingsEl.innerHTML = ''
@@ -6156,7 +8914,7 @@ function renderMigrateFindings(data) {
       <span class="migrate-finding-icon">${typeIcons[f.type] || '\uD83D\uDCC4'}</span>
       <div class="migrate-finding-info">
         <div class="migrate-finding-name">${escapeHtml(f.name)}</div>
-        <div class="migrate-finding-type">${typeLabels[f.type] || f.type}</div>
+        <div class="migrate-finding-type">${(typeof typeLabels[f.type] === 'function' ? typeLabels[f.type]() : typeLabels[f.type]) || f.type}</div>
       </div>
       <span class="migrate-finding-size">${sizeKB} KB</span>
     `
@@ -6164,15 +8922,15 @@ function renderMigrateFindings(data) {
   }
 
   if (data.findings.length === 0) {
-    findingsEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;text-align:center">Nem található migrálható tartalom</div>'
+    findingsEl.innerHTML = `<div style="color:var(--text-muted);padding:20px;text-align:center">${t('migrate.empty')}</div>`
   }
 
   const s = data.summary
   summaryEl.innerHTML = `
-    <div class="stat-card"><div class="stat-value">${s.total}</div><div class="stat-label">Összesen</div></div>
-    <div class="stat-card"><div class="stat-value">${s.memory}</div><div class="stat-label">Memória</div></div>
-    <div class="stat-card"><div class="stat-value">${s.personality + s.profile}</div><div class="stat-label">Profil</div></div>
-    <div class="stat-card"><div class="stat-value">${s.config + s.heartbeat}</div><div class="stat-label">Konfig</div></div>
+    <div class="stat-card"><div class="stat-value">${s.total}</div><div class="stat-label">${t('migrate.stat.total')}</div></div>
+    <div class="stat-card"><div class="stat-value">${s.memory}</div><div class="stat-label">${t('migrate.stat.memory')}</div></div>
+    <div class="stat-card"><div class="stat-value">${s.personality + s.profile}</div><div class="stat-label">${t('migrate.stat.profile')}</div></div>
+    <div class="stat-card"><div class="stat-value">${s.config + s.heartbeat}</div><div class="stat-label">${t('migrate.stat.config')}</div></div>
   `
 }
 
@@ -6205,9 +8963,9 @@ document.getElementById('migrateRunBtn').addEventListener('click', async () => {
 
     const resultEl = document.getElementById('migrateResult')
     resultEl.innerHTML = `
-      <h4>Költöztetés kész!</h4>
+      <h4>${t('migrate.result.title')}</h4>
       <div class="migrate-result-stats">
-        <div class="migrate-result-stat"><div class="migrate-result-stat-value">${data.imported}</div><div class="migrate-result-stat-label">Importálva</div></div>
+        <div class="migrate-result-stat"><div class="migrate-result-stat-value">${data.imported}</div><div class="migrate-result-stat-label">${t('migrate.result.imported')}</div></div>
         <div class="migrate-result-stat"><div class="migrate-result-stat-value" style="color:#dc3c3c">${data.stats.hot}</div><div class="migrate-result-stat-label">Hot</div></div>
         <div class="migrate-result-stat"><div class="migrate-result-stat-value" style="color:#d97757">${data.stats.warm}</div><div class="migrate-result-stat-label">Warm</div></div>
         <div class="migrate-result-stat"><div class="migrate-result-stat-value" style="color:#6a9bcc">${data.stats.cold}</div><div class="migrate-result-stat-label">Cold</div></div>
@@ -6272,7 +9030,7 @@ if (skillsPageNewBtn) {
 }
 
 async function loadGlobalSkills() {
-  skillsGrid.innerHTML = '<div class="connector-loading"><span class="spinner"></span> Skillek betoltese...</div>'
+  skillsGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('skills.loading')}</div>`
   skillsStats.innerHTML = ''
   try {
     const res = await fetch('/api/skills')
@@ -6280,7 +9038,7 @@ async function loadGlobalSkills() {
     renderGlobalSkills()
   } catch (err) {
     console.error('Skills betoltes hiba:', err)
-    skillsGrid.innerHTML = '<div class="connector-loading">Hiba a betoltes soran</div>'
+    skillsGrid.innerHTML = `<div class="connector-loading">${t('skills.error')}</div>`
   }
 }
 
@@ -6304,10 +9062,10 @@ function renderGlobalSkills() {
   const pluginCount = globalSkills.filter(s => s.source === 'plugin').length
 
   skillsStats.innerHTML = `
-    <div class="stat-card"><div class="stat-value">${globalSkills.length}</div><div class="stat-label">Összes</div></div>
-    <div class="stat-card"><div class="stat-value" style="color:var(--info)">${userCount}</div><div class="stat-label">User (saját)</div></div>
-    ${pluginCount ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${pluginCount}</div><div class="stat-label">Plugin</div></div>` : ''}
-    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${withSkillMd.length}</div><div class="stat-label">Dokumentált</div></div>
+    <div class="stat-card"><div class="stat-value">${globalSkills.length}</div><div class="stat-label">${t('skills.stat.total')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--info)">${userCount}</div><div class="stat-label">${t('skills.stat.user')}</div></div>
+    ${pluginCount ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${pluginCount}</div><div class="stat-label">${t('skills.stat.plugin')}</div></div>` : ''}
+    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${withSkillMd.length}</div><div class="stat-label">${t('skills.stat.documented')}</div></div>
   `
 
   if (globalSkills.length === 0) {
@@ -6332,7 +9090,7 @@ function renderGlobalSkills() {
         <div class="skills-card-icon">${icon}</div>
         <div class="skills-card-info">
           <div class="skills-card-name">${escapeHtml(displayName)} ${sourceBadge}</div>
-          <div class="skills-card-desc">${escapeHtml(skill.description || 'Nincs leírás')}</div>
+          <div class="skills-card-desc">${escapeHtml(skill.description || t('skills.no_description'))}</div>
         </div>
       </div>
     `
@@ -6351,7 +9109,7 @@ async function openSkillDetail(skillName, displayLabel) {
 
     // Description
     const descEl = document.getElementById('skillDetailDesc')
-    descEl.textContent = detail.description || 'Nincs leírás'
+    descEl.textContent = detail.description || t('skills.no_description')
 
     // Meta line: source + path. Replaces the old per-agent assignment
     // UI -- sub-agents share the caller's HOME, so the skill is already
@@ -6361,21 +9119,21 @@ async function openSkillDetail(skillName, displayLabel) {
       const sourceLabel = detail.source === 'plugin'
         ? `plugin${detail.pluginPackage ? ' (' + escapeHtml(detail.pluginPackage) + ')' : ''}`
         : detail.source === 'user'
-        ? 'user (saját fájl)'
-        : 'ismeretlen'
+        ? t('skills.source.user')
+        : t('skills.source.unknown')
       metaEl.innerHTML = `
-        <div class="skill-detail-source">Forrás: <strong>${sourceLabel}</strong></div>
-        <div class="skill-detail-note">Automatikusan elérhető minden sub-agent számára (közös HOME).</div>
+        <div class="skill-detail-source">${t('skills.detail.source_label')} <strong>${sourceLabel}</strong></div>
+        <div class="skill-detail-note">${t('skills.detail.auto_available')}</div>
       `
     }
 
     // Content
     const contentEl = document.getElementById('skillDetailContent')
-    contentEl.textContent = detail.content || '(SKILL.md nem található)'
+    contentEl.textContent = detail.content || t('skills.content_not_found')
 
   } catch (err) {
     console.error('Skill detail hiba:', err)
-    document.getElementById('skillDetailDesc').textContent = 'Hiba a betöltés során'
+    document.getElementById('skillDetailDesc').textContent = t('connectors.error_list')
     document.getElementById('skillDetailContent').textContent = ''
     const metaEl = document.getElementById('skillDetailMeta')
     if (metaEl) metaEl.innerHTML = ''
@@ -6388,14 +9146,14 @@ async function openSkillDetail(skillName, displayLabel) {
 async function loadTeamGraph() {
   const container = document.getElementById('teamGraph')
   if (!container) return
-  container.innerHTML = '<div class="team-empty">Betöltés...</div>'
+  container.innerHTML = '<div class="team-empty">' + t('team.loading') + '</div>'
   try {
     const res = await fetch('/api/team/graph')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     renderTeamGraph(container, data)
   } catch (err) {
-    container.innerHTML = `<div class="team-empty">Hiba: ${err.message || err}</div>`
+    container.innerHTML = `<div class="team-empty">${t('team.error', { msg: err.message || err })}</div>`
   }
 }
 
@@ -6413,8 +9171,8 @@ function renderTeamGraph(container, data) {
     div.className = 'team-node'
     if (node.role === 'main') div.classList.add('main')
     else if (node.role === 'leader') div.classList.add('leader')
-    const roleLabel = node.role === 'main' ? 'főügynök' : (node.role === 'leader' ? 'csapatvezető' : 'beosztott')
-    const running = node.running ? '● Fut' : '○ Leállva'
+    const roleLabel = node.role === 'main' ? t('team.role.main') : (node.role === 'leader' ? t('team.role.leader') : t('team.role.member'))
+    const running = node.running ? t('team.running') : t('team.stopped')
     const avatarUrl = node.id === mainAgentId
       ? `/api/marveen/avatar?t=${Date.now()}`
       : `/api/agents/${encodeURIComponent(node.id)}/avatar?t=${Date.now()}`
@@ -6429,48 +9187,432 @@ function renderTeamGraph(container, data) {
     }
     return div
   }
-  // BFS levels starting from main
-  const levels = [[mainAgentId]]
+  // Render as a nested tree so each report sits directly under its own
+  // manager. A flat BFS-by-row layout made a leader's reports look like they
+  // belonged to whichever node happened to be above them in the row.
   const seen = new Set([mainAgentId])
-  while (levels[levels.length - 1].length) {
-    const nextIds = []
-    for (const id of levels[levels.length - 1]) {
-      for (const child of childrenOf.get(id) || []) {
-        if (!seen.has(child)) { seen.add(child); nextIds.push(child) }
-      }
-    }
-    if (nextIds.length === 0) break
-    levels.push(nextIds)
-  }
-  // Orphans (nodes not reachable from main, shouldn't happen with the auto
-  // fallback on the backend but guard just in case) go to a trailing level.
-  const orphans = nodes.filter(n => !seen.has(n.id))
-  if (orphans.length) levels.push(orphans.map(n => n.id))
-  for (let i = 0; i < levels.length; i++) {
-    const level = document.createElement('div')
-    level.className = 'team-level'
-    for (const id of levels[i]) {
-      const node = byId.get(id)
-      if (!node) continue
-      level.appendChild(renderNode(node))
-    }
-    container.appendChild(level)
-    if (i < levels.length - 1) {
+  const renderSubtree = (id) => {
+    const node = byId.get(id)
+    if (!node) return null
+    const col = document.createElement('div')
+    col.className = 'team-subtree'
+    col.appendChild(renderNode(node))
+    const kids = (childrenOf.get(id) || []).filter(c => !seen.has(c) && byId.has(c))
+    for (const c of kids) seen.add(c)
+    if (kids.length) {
       const conn = document.createElement('div')
       conn.className = 'team-connector'
-      container.appendChild(conn)
+      col.appendChild(conn)
+      const row = document.createElement('div')
+      row.className = 'team-children'
+      for (const c of kids) {
+        const sub = renderSubtree(c)
+        if (sub) row.appendChild(sub)
+      }
+      col.appendChild(row)
     }
+    return col
+  }
+  // Main on top, then a row of its direct reports (each carrying its own
+  // subtree beneath it).
+  const mainNode = byId.get(mainAgentId)
+  if (mainNode) {
+    const mainRow = document.createElement('div')
+    mainRow.className = 'team-level'
+    mainRow.appendChild(renderNode(mainNode))
+    container.appendChild(mainRow)
+  }
+  const directs = (childrenOf.get(mainAgentId) || []).filter(c => !seen.has(c) && byId.has(c))
+  for (const c of directs) seen.add(c)
+  if (directs.length) {
+    const conn = document.createElement('div')
+    conn.className = 'team-connector'
+    container.appendChild(conn)
+    const row = document.createElement('div')
+    row.className = 'team-children team-roots'
+    for (const c of directs) {
+      const sub = renderSubtree(c)
+      if (sub) row.appendChild(sub)
+    }
+    container.appendChild(row)
+  }
+  // Orphans (nodes not reachable from main, shouldn't happen with the auto
+  // fallback on the backend but guard just in case) go to a trailing row.
+  const orphans = nodes.filter(n => !seen.has(n.id))
+  if (orphans.length) {
+    const row = document.createElement('div')
+    row.className = 'team-level'
+    for (const n of orphans) row.appendChild(renderNode(n))
+    container.appendChild(row)
   }
   if (nodes.length === 1) {
     const empty = document.createElement('div')
     empty.className = 'team-empty'
-    empty.textContent = 'Nincs sub-agent létrehozva.'
+    empty.textContent = t('team.empty')
     container.appendChild(empty)
   }
 }
 
 const refreshTeamBtn = document.getElementById('refreshTeamBtn')
 if (refreshTeamBtn) refreshTeamBtn.addEventListener('click', loadTeamGraph)
+
+// === Team: inter-agent message log + compose ===
+// View the /api/messages queue and let the operator send a message to an agent
+// from the dashboard. Targets come from /api/schedules/agents (the same allowed
+// agent list the scheduler uses) -- never a free-text target. The sender is the
+// owner (resolved by type from /api/kanban/assignees), so the receiving agent
+// sees a message from Gábor, not a spoofable string. /api/messages sits behind
+// the dashboard bearer token + Cloudflare Access.
+const MSG_STATUS_META = {
+  pending: { label: () => t('messages.status.pending'), cls: 'badge-warm' },
+  delivered: { label: () => t('messages.status.delivered'), cls: 'badge-active' },
+  done: { label: () => t('messages.status.done'), cls: 'badge-active' },
+  failed: { label: () => t('messages.status.failed'), cls: 'badge-paused' },
+}
+async function resolveOwnerName() {
+  try {
+    const res = await fetch('/api/kanban/assignees')
+    if (res.ok) {
+      const list = await res.json()
+      const owner = Array.isArray(list) ? list.find(a => a.type === 'owner') : null
+      if (owner && owner.name) return owner.name
+    }
+  } catch { /* fall through */ }
+  return 'owner'
+}
+
+// === Messages page ===
+// chatAgentHasAvatar: populated from /api/agents during loadChatAgentList
+const chatAgentHasAvatar = new Map() // name -> true|false
+let chatSelectedAgent = null
+
+function chatMonogramEl(agentName, size) {
+  const letter = agentName.charAt(0).toUpperCase()
+  const colors = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899']
+  const color = colors[agentName.split('').reduce((a,c)=>a+c.charCodeAt(0),0) % colors.length]
+  return `<div class="chat-avatar chat-avatar-mono" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.round(size*0.4)}px">${letter}</div>`
+}
+
+// Global onerror handler — avoids HTML-in-attribute escaping issues
+window.chatImgError = function(img) {
+  const name = img.getAttribute('data-agent-name') || img.alt || '?'
+  const size = parseInt(img.width) || 32
+  const letter = name.charAt(0).toUpperCase()
+  const colors = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899']
+  const color = colors[name.split('').reduce((a,c)=>a+c.charCodeAt(0),0) % colors.length]
+  const div = document.createElement('div')
+  div.className = 'chat-avatar chat-avatar-mono'
+  div.style.cssText = `width:${size}px;height:${size}px;background:${color};font-size:${Math.round(size*0.4)}px`
+  div.textContent = letter
+  img.replaceWith(div)
+}
+
+function chatAvatarHtml(agentName, size = 32) {
+  const lower = agentName.toLowerCase()
+  const hasAvatar = chatAgentHasAvatar.get(lower)
+  if (!hasAvatar) return chatMonogramEl(agentName, size)
+  const src = lower === mainAgentId().toLowerCase()
+    ? `/api/marveen/avatar?t=${Date.now()}`
+    : `/api/agents/${encodeURIComponent(lower)}/avatar?t=${Date.now()}`
+  return `<img class="chat-avatar" src="${src}" width="${size}" height="${size}" alt="${escapeHtml(agentName)}" data-agent-name="${escapeHtml(agentName)}" onerror="chatImgError(this)">`
+}
+
+async function loadMessagesPage() {
+  await loadChatAgentList()
+}
+
+const CHAT_SYSTEM_AGENTS = new Set(['heartbeat','telegram-coordinator','channel-coordinator'])
+// The owner's own message thread is pinned to the top and labelled "<name> (te)".
+// The owner display name comes from the backend (OWNER_NAME via /api/marveen ->
+// window._marveen.ownerName), not a hardcoded literal, so a renamed install
+// recognizes its real owner. Empty until _marveen resolves (no false match).
+function chatOwnerName() { return window._marveen?.ownerName || '' }
+
+function chatLastSeenKey(agentName) { return 'chat_last_seen_' + agentName }
+function chatGetLastSeen(agentName) { return parseInt(localStorage.getItem(chatLastSeenKey(agentName)) || '0', 10) }
+function chatMarkSeen(agentName, maxId) {
+  if (maxId > chatGetLastSeen(agentName)) localStorage.setItem(chatLastSeenKey(agentName), String(maxId))
+}
+function chatIsUnread(agentName, threadInfo) {
+  const owner = chatOwnerName()
+  if (!owner || agentName !== owner) return false
+  if (!threadInfo?.lastMsg) return false
+  return threadInfo.lastMsg.id > chatGetLastSeen(agentName)
+}
+
+async function loadChatAgentList() {
+  const sidebar = document.getElementById('chatAgentList')
+  if (!sidebar) return
+  try {
+    // Load fleet agents + threads in parallel
+    const [agentsRes, threadsRes] = await Promise.all([
+      fetch('/api/agents'),
+      fetch('/api/messages/threads'),
+    ])
+    const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
+    const threads = threadsRes.ok ? await threadsRes.json() : []
+
+    // Build fleet list: API agents + marveen, minus system agents
+    const fleetNames = [mainAgentId(), ...agentsRaw.map(a => a.name || a)]
+      .filter(n => !CHAT_SYSTEM_AGENTS.has(n))
+      .filter((n, i, arr) => arr.indexOf(n) === i)
+
+    // Populate avatar map from API data
+    chatAgentHasAvatar.clear()
+    chatAgentHasAvatar.set(mainAgentId(), true)
+    for (const a of agentsRaw) {
+      if (a.name) chatAgentHasAvatar.set(a.name, !!a.hasAvatar)
+    }
+
+    // Build index from /api/messages/threads (per-agent, no global-window bug)
+    const threadIndex = new Map() // agentName -> {lastMessage, count}
+    for (const t of threads) {
+      if (t.agent) threadIndex.set(t.agent, { lastMsg: t.lastMessage, count: t.count || 0 })
+    }
+    // Also include thread agents not in fleet (e.g. the owner's own direct msgs)
+    for (const t of threads) {
+      if (t.agent && !fleetNames.includes(t.agent) && !CHAT_SYSTEM_AGENTS.has(t.agent)) {
+        fleetNames.push(t.agent)
+      }
+    }
+
+    // Sort: owner pinned first, then agents with messages by recency, rest alphabetical
+    const owner = chatOwnerName()
+    const sorted = [...fleetNames].sort((a, b) => {
+      if (owner && a === owner) return -1
+      if (owner && b === owner) return 1
+      const aHas = threadIndex.has(a), bHas = threadIndex.has(b)
+      if (aHas && !bHas) return -1
+      if (!aHas && bHas) return 1
+      if (aHas && bHas) {
+        const aTime = threadIndex.get(a).lastMsg?.created_at || 0
+        const bTime = threadIndex.get(b).lastMsg?.created_at || 0
+        return bTime - aTime
+      }
+      return a.localeCompare(b)
+    })
+
+    sidebar.innerHTML = sorted.map(name => {
+      const info = threadIndex.get(name)
+      const lm = info?.lastMsg
+      const when = lm?.created_at ? new Date(lm.created_at * 1000).toLocaleTimeString('hu-HU', {hour:'2-digit',minute:'2-digit'}) : ''
+      const preview = lm ? (lm.content || '').replace(/\n/g,' ').slice(0, 60) : t('messages.empty')
+      const isSelected = name === chatSelectedAgent ? ' selected' : ''
+      const dimmed = info ? '' : ' style="opacity:0.5"'
+      const unread = chatIsUnread(name, info)
+      const displayName = owner && name === owner ? owner + ' (te)' : name
+      return `<div class="chat-agent-item${isSelected}${unread ? ' unread' : ''}" data-agent="${escapeHtml(name)}"${dimmed}>
+        <div class="chat-agent-avatar">${chatAvatarHtml(name, 40)}</div>
+        <div class="chat-agent-info">
+          <div class="chat-agent-name">${escapeHtml(displayName)}${unread ? '<span class="chat-unread-dot"></span>' : ''}</div>
+          <div class="chat-agent-preview ${unread ? 'unread-preview' : ''}">${escapeHtml(preview)}</div>
+        </div>
+        <div class="chat-agent-time">${when}</div>
+      </div>`
+    }).join('')
+
+    sidebar.querySelectorAll('.chat-agent-item').forEach(el => {
+      el.addEventListener('click', () => {
+        sidebar.querySelectorAll('.chat-agent-item').forEach(x => x.classList.remove('selected'))
+        el.classList.add('selected')
+        chatSelectedAgent = el.dataset.agent
+        loadChatThread(chatSelectedAgent)
+      })
+    })
+
+    if (!chatSelectedAgent) {
+      const first = sidebar.querySelector('.chat-agent-item')
+      if (first) first.click()
+    }
+  } catch (e) {
+    sidebar.innerHTML = `<div class="chat-sidebar-empty">${t('messages.sidebar_error', { msg: escapeHtml(String(e.message||e)) })}</div>`
+  }
+}
+
+// Pagination state for the open thread
+const chatThreadState = { agent: null, minLoadedId: null, hasMore: true, loading: false }
+const CHAT_PAGE_SIZE = 10
+const CHAT_LOAD_MORE = 20
+
+async function loadChatThread(agentName) {
+  const panel = document.getElementById('chatThreadPanel')
+  if (!panel) return
+
+  chatThreadState.agent = agentName
+  chatThreadState.minLoadedId = null
+  chatThreadState.hasMore = true
+  chatThreadState.loading = false
+
+  const owner = chatOwnerName()
+  const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : agentName
+
+  panel.innerHTML = `
+    <div class="chat-thread-header">
+      ${chatAvatarHtml(agentName, 32)}
+      <span class="chat-thread-title">${escapeHtml(threadDisplayName)}</span>
+      <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread('${escapeHtml(agentName)}')">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
+    </div>
+    <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">${t('messages.loading')}</div></div>
+    <div class="chat-compose">
+      <div class="chat-compose-row">
+        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(agentName) })}"></textarea>
+        <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">${t('messages.send_btn')}</button>
+      </div>
+    </div>
+  `
+
+  document.getElementById('chatSendBtn')?.addEventListener('click', () => sendChatMessage(agentName))
+  document.getElementById('chatComposeText')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChatMessage(agentName) }
+  })
+
+  // Initial load
+  await fetchChatPage(agentName, null, CHAT_PAGE_SIZE, 'replace')
+  // Mark thread as read (localStorage last-seen)
+  const threadData = (await fetch('/api/messages/threads').then(r => r.ok ? r.json() : []).catch(() => []))
+    .find(t => t.agent === agentName)
+  if (threadData?.lastMessage?.id) {
+    chatMarkSeen(agentName, threadData.lastMessage.id)
+    // Remove unread indicator from sidebar item
+    document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"]`)?.classList.remove('unread')
+    const dot = document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"] .chat-unread-dot`)
+    if (dot) dot.remove()
+    const preview = document.querySelector(`.chat-agent-item[data-agent="${CSS.escape(agentName)}"] .unread-preview`)
+    if (preview) preview.classList.remove('unread-preview')
+  }
+
+  // Scroll-up pagination handler
+  const bubbles = document.getElementById('chatBubbles')
+  if (bubbles) {
+    bubbles.addEventListener('scroll', () => {
+      if (bubbles.scrollTop < 80 && chatThreadState.hasMore && !chatThreadState.loading
+          && chatThreadState.agent === agentName) {
+        fetchChatPage(agentName, chatThreadState.minLoadedId, CHAT_LOAD_MORE, 'prepend')
+      }
+    })
+  }
+}
+
+function buildBubbleHtml(m) {
+  const isOutgoing = m.from_agent === mainAgentId()
+  const senderName = isOutgoing ? mainAgentId() : m.from_agent
+  const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
+  const statusMetaRaw = MSG_STATUS_META[m.status] || { label: m.status || '', cls: 'badge' }
+  const statusMeta = { ...statusMetaRaw, label: typeof statusMetaRaw.label === 'function' ? statusMetaRaw.label() : statusMetaRaw.label }
+  return `<div class="chat-bubble-row ${isOutgoing ? 'outgoing' : 'incoming'}" data-msg-id="${m.id}">
+    ${!isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(senderName, 28)}</div>` : ''}
+    <div class="chat-bubble ${isOutgoing ? 'bubble-out' : 'bubble-in'}">
+      <div class="bubble-meta">
+        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderName)}</span>` : ''}
+        <span class="bubble-id-chip">#${m.id}</span>
+        <span class="badge ${statusMeta.cls}" style="font-size:10px">${escapeHtml(statusMeta.label)}</span>
+      </div>
+      <div class="bubble-text">${escapeHtml(m.content || '')}</div>
+      <div class="bubble-time">${when}</div>
+    </div>
+    ${isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(mainAgentId(), 28)}</div>` : ''}
+  </div>`
+}
+
+async function fetchChatPage(agentName, beforeId, limit, mode) {
+  if (chatThreadState.loading) return
+  chatThreadState.loading = true
+  const container = document.getElementById('chatBubbles')
+  const loadingIndicator = document.getElementById('chatLoadingTop')
+  if (!container) { chatThreadState.loading = false; return }
+  if (loadingIndicator && mode === 'prepend') loadingIndicator.style.display = 'block'
+  try {
+    let url = `/api/messages?agent=${encodeURIComponent(agentName)}&limit=${limit}`
+    if (beforeId) url += `&before=${beforeId}`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const msgs = await res.json()
+    const sorted = Array.isArray(msgs) ? [...msgs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0)) : []
+
+    if (mode === 'replace') {
+      if (sorted.length === 0) {
+        container.innerHTML = '<p class="activity-empty">' + t('messages.empty_thread') + '</p>'
+      } else {
+        container.innerHTML = '<div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">' + t('messages.loading') + '</div>'
+        container.insertAdjacentHTML('beforeend', sorted.map(buildBubbleHtml).join(''))
+        container.scrollTop = container.scrollHeight
+      }
+      if (sorted.length < limit) chatThreadState.hasMore = false
+    } else { // prepend
+      if (loadingIndicator) loadingIndicator.style.display = 'none'
+      if (!sorted.length) { chatThreadState.hasMore = false; chatThreadState.loading = false; return }
+      if (sorted.length < limit) chatThreadState.hasMore = false
+      const prevHeight = container.scrollHeight
+      const indicator = document.getElementById('chatLoadingTop')
+      const html = sorted.map(buildBubbleHtml).join('')
+      if (indicator) {
+        indicator.insertAdjacentHTML('afterend', html)
+      } else {
+        container.insertAdjacentHTML('afterbegin', html)
+      }
+      // Restore scroll position so view doesn't jump
+      container.scrollTop = container.scrollHeight - prevHeight
+    }
+
+    if (sorted.length > 0) {
+      const minId = Math.min(...sorted.map(m => m.id))
+      if (chatThreadState.minLoadedId === null || minId < chatThreadState.minLoadedId) {
+        chatThreadState.minLoadedId = minId
+      }
+    }
+  } catch (e) {
+    if (loadingIndicator) loadingIndicator.style.display = 'none'
+    if (mode === 'replace') {
+      container.innerHTML = `<p class="activity-empty">Hiba: ${escapeHtml(String(e.message||e))}</p>`
+    }
+  } finally {
+    chatThreadState.loading = false
+  }
+}
+
+function renderChatBubbles(msgs, agentName) {
+  const container = document.getElementById('chatBubbles')
+  if (!container) return
+  if (!msgs || msgs.length === 0) {
+    container.innerHTML = '<p class="activity-empty">' + t('messages.empty_thread') + '</p>'
+    return
+  }
+  const sorted = [...msgs].sort((a,b) => (a.created_at||0) - (b.created_at||0))
+  container.innerHTML = sorted.map(buildBubbleHtml).join('')
+  container.scrollTop = container.scrollHeight
+}
+
+async function sendChatMessage(toAgent) {
+  const textarea = document.getElementById('chatComposeText')
+  const btn = document.getElementById('chatSendBtn')
+  const content = textarea?.value?.trim()
+  if (!content) { textarea?.focus(); return }
+  if (btn) btn.disabled = true
+  try {
+    const from = await resolveOwnerName()
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: toAgent, content }),
+    })
+    if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Hiba') }
+    if (textarea) textarea.value = ''
+    showToast(t('messages.sent'))
+    await loadChatThread(toAgent)
+    await loadChatAgentList()
+  } catch (e) {
+    showToast(t('messages.error_send', { msg: e.message || e }))
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+document.getElementById('chatRefreshBtn')?.addEventListener('click', () => {
+  loadChatAgentList()
+  if (chatSelectedAgent) loadChatThread(chatSelectedAgent)
+})
 
 function renderTeamEditor(agent, allAgents) {
   const team = agent.team || { role: 'member', reportsTo: null, delegatesTo: [], autoDelegation: false, trustFrom: [] }
@@ -6479,7 +9621,7 @@ function renderTeamEditor(agent, allAgents) {
   reportsSel.innerHTML = ''
   const emptyOpt = document.createElement('option')
   emptyOpt.value = ''
-  emptyOpt.textContent = '(főügynök)'
+  emptyOpt.textContent = t('team.reports_to_empty')
   reportsSel.appendChild(emptyOpt)
   for (const other of allAgents) {
     if (other.name === agent.name) continue
@@ -6530,7 +9672,7 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
   const autoDelegation = document.getElementById('editTeamAutoDelegation').checked
   const originalText = btn.textContent
   btn.disabled = true
-  btn.textContent = 'Mentés...'
+  btn.textContent = t('team.save_saving')
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/team`, {
       method: 'PUT',
@@ -6554,20 +9696,20 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
       if (w) {
         const parts = []
         if (Array.isArray(w.droppedSelf) && w.droppedSelf.length) {
-          parts.push(`önreferenciák: ${w.droppedSelf.join(', ')}`)
+          parts.push(`${t('team.dropped_self')}: ${w.droppedSelf.join(', ')}`)
         }
         if (Array.isArray(w.droppedUnknown) && w.droppedUnknown.length) {
-          parts.push(`ismeretlen nevek: ${w.droppedUnknown.join(', ')}`)
+          parts.push(`${t('team.dropped_unknown')}: ${w.droppedUnknown.join(', ')}`)
         }
         if (parts.length) warningMsg = parts.join(' · ')
       }
     } catch { /* body already consumed or not JSON -- OK, no warnings to show */ }
-    showToast(warningMsg ? `Csapat mentve (kivett: ${warningMsg})` : 'Csapat mentve')
-    btn.textContent = '✓ Mentve'
+    showToast(warningMsg ? t('team.save_warning', { detail: warningMsg }) : t('team.save_ok'))
+    btn.textContent = t('team.save_done')
     setTimeout(() => { btn.textContent = originalText; btn.disabled = false }, 1800)
     loadAgents()
   } catch {
-    showToast('Hiba a csapat mentésekor')
+    showToast(t('team.save_error'))
     btn.textContent = originalText
     btn.disabled = false
   }
@@ -6577,12 +9719,12 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
 function formatRelative(ts) {
   const diff = Math.max(0, Date.now() - ts)
   const min = Math.floor(diff / 60000)
-  if (min < 1) return 'most'
-  if (min < 60) return `${min}p`
+  if (min < 1) return t('common.time.now_abbr')
+  if (min < 60) return t('common.time.min_abbr', { n: min })
   const hr = Math.floor(min / 60)
-  if (hr < 24) return `${hr}ó`
+  if (hr < 24) return t('common.time.hour_abbr', { h: hr })
   const day = Math.floor(hr / 24)
-  return `${day}n`
+  return t('common.time.day_abbr', { n: day })
 }
 
 async function loadOverview() {
@@ -6592,14 +9734,14 @@ async function loadOverview() {
     const d = await res.json()
     // Stats
     document.getElementById('statAgents').textContent = d.agents.running
-    document.getElementById('statAgentsSub').textContent = `${d.agents.total} összesen`
+    document.getElementById('statAgentsSub').textContent = t('overview.stat.agents_sub', { n: d.agents.total })
     document.getElementById('statTasks').textContent = d.tasksToday
     const taskDiff = d.tasksToday - d.tasksYesterday
-    document.getElementById('statTasksSub').textContent = taskDiff === 0 ? 'ugyanaz mint tegnap' : (taskDiff > 0 ? `+${taskDiff} a tegnapihoz` : `${taskDiff} a tegnapihoz`)
+    document.getElementById('statTasksSub').textContent = taskDiff === 0 ? t('overview.stat.same_as_yesterday') : (taskDiff > 0 ? '+' + taskDiff + ' ' + t('overview.stat.change', { n: '' }).trim() : taskDiff + ' ' + t('overview.stat.change', { n: '' }).trim())
     document.getElementById('statMemories').textContent = d.memories.count.toLocaleString('hu-HU').replace(/,/g, ' ')
-    document.getElementById('statMemoriesSub').textContent = `bejegyzés · ${d.memories.categories} category`
+    document.getElementById('statMemoriesSub').textContent = `${t('overview.stat.sub.memories')} · ${d.memories.categories} category`
     document.getElementById('statSkills').textContent = d.skills.count
-    document.getElementById('statSkillsSub').textContent = d.skills.today > 0 ? `ebből ${d.skills.today} ma` : ''
+    document.getElementById('statSkillsSub').textContent = d.skills.today > 0 ? t('overview.stat.skills_today', { n: d.skills.today }) : ''
     // Team: reuse the hierarchy graph renderer so the overview card shows
     // exactly what the Csapat page does (avatars + reports-to tree).
     try {
@@ -6613,7 +9755,7 @@ async function loadOverview() {
     const act = document.getElementById('overviewActivity')
     act.innerHTML = ''
     if (!d.activity || d.activity.length === 0) {
-      act.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Nincs friss esemény.</div>'
+      act.innerHTML = '<div style="color:var(--text-muted);font-size:13px">' + t('overview.no_activity') + '</div>'
     } else {
       for (const a of d.activity) {
         const icon = a.icon === 'delegate'
@@ -6632,11 +9774,16 @@ async function loadOverview() {
       }
     }
   } catch (err) {
-    document.getElementById('overviewActivity').innerHTML = `<div style="color:var(--text-muted);font-size:13px">Hiba: ${err.message || err}</div>`
+    document.getElementById('overviewActivity').innerHTML = '<div style="color:var(--text-muted);font-size:13px">' + t('overview.error', { msg: escapeHtml(String(err.message || err)) }) + '</div>'
   }
 }
 
-// Brand mark: use main agent's avatar if available
+// Brand mark + product-brand chrome: pull the configured brand from
+// /api/marveen and apply it to the dashboard chrome (tab title, mobile topbar,
+// sidebar name, updates subtitle). brandName is the product/system name and is
+// distinct from the main agent's display name; the backend defaults brandName to
+// BOT_NAME, so a brand-unaware install keeps showing the agent name. If the
+// field is absent (legacy backend) the existing HTML default text is kept.
 async function initSidebarBrand() {
   try {
     const img = document.createElement('img')
@@ -6648,12 +9795,40 @@ async function initSidebarBrand() {
     const res = await fetch('/api/marveen')
     if (res.ok) {
       const m = await res.json()
-      const name = document.getElementById('sidebarBrandName')
-      if (name && m.name) name.textContent = m.name
+      const brand = m.brandName || m.name
+      // Publish the brand tokens so every t() call ({brand}/{bot}/{agentId})
+      // renders the configured names, then re-apply the static i18n so any
+      // label painted before this fetch resolved picks up the real brand.
+      window._brandTokens = {
+        brand: brand || 'Marveen',
+        bot: m.name || brand || 'Marveen',
+        agentId: m.agentId || 'marveen',
+      }
+      if (typeof renderStaticI18n === 'function') renderStaticI18n()
+      if (brand) {
+        document.title = brand
+        const appleTitle = document.querySelector('meta[name="apple-mobile-web-app-title"]')
+        if (appleTitle) appleTitle.setAttribute('content', brand)
+        const topbar = document.getElementById('mobileTopbarTitle')
+        if (topbar) topbar.textContent = brand
+        const name = document.getElementById('sidebarBrandName')
+        if (name) name.textContent = brand
+        const subtitle = document.getElementById('updatesSubtitle')
+        if (subtitle) subtitle.textContent = `${brand} ` + t('overview.updates_subtitle')
+      }
     }
   } catch {}
 }
 initSidebarBrand()
+
+// In an installed (standalone) PWA, lock the zoom: iOS otherwise auto-zooms when
+// a small-text input is focused and allows stray pinch-zoom, neither of which
+// suits an app-like control panel. Left untouched in a normal browser tab so
+// page zoom / accessibility still work there.
+if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
+  const vp = document.querySelector('meta[name="viewport"]')
+  if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover')
+}
 
 // === Updates page ===
 function escapeHtmlUpdates(s) {
@@ -6663,8 +9838,14 @@ function escapeHtmlUpdates(s) {
 function renderUpdatesBadge(status) {
   const badge = document.getElementById('updatesBadge')
   if (!badge) return
-  if (status && status.behind && status.behind > 0) {
-    badge.textContent = String(status.behind)
+  // Version-centric: show the number of NEW VERSIONS, not raw commits. Fall back
+  // to the behind count only in the rare pre-release state (unreleased commits
+  // but no new version tag yet).
+  const versionCount = status && Array.isArray(status.releases)
+    ? status.releases.filter((r) => r.version).length : 0
+  const count = versionCount > 0 ? versionCount : ((status && status.behind) || 0)
+  if (count > 0) {
+    badge.textContent = String(count)
     badge.hidden = false
   } else {
     badge.hidden = true
@@ -6683,7 +9864,7 @@ async function loadUpdates() {
   const summary = document.getElementById('updatesSummary')
   const list = document.getElementById('updatesCommitList')
   const applyBtn = document.getElementById('updatesApplyBtn')
-  summary.textContent = 'Ellenőrzés...'
+  summary.textContent = t('updates.checking')
   summary.className = 'updates-summary'
   list.innerHTML = ''
   try {
@@ -6695,34 +9876,106 @@ async function loadUpdates() {
     const lat = (data.latest || '').slice(0, 7) || '–'
     if (data.error) {
       summary.className = 'updates-summary error'
-      summary.innerHTML = `<strong>Nem sikerült ellenőrizni:</strong> ${escapeHtmlUpdates(data.error)}<br>Jelenlegi: <code>${cur}</code>`
+      summary.innerHTML = `<strong>${t('updates.check_failed')}:</strong> ${escapeHtmlUpdates(data.error)}<br>${t('updates.current_label')} <code>${cur}</code>`
       applyBtn.hidden = true
     } else if (data.behind === 0) {
       summary.className = 'updates-summary up-to-date'
-      summary.innerHTML = `<strong>A legfrissebb verzión vagy</strong> (<code>${cur}</code>). Nincs teendő.`
+      summary.innerHTML = `<strong>${t('updates.up_to_date_html')}</strong> (<code>${cur}</code>). ${t('updates.no_changes')}`
       applyBtn.hidden = true
     } else {
       summary.className = 'updates-summary behind'
-      summary.innerHTML = `<strong>${data.behind} új commit elérhető</strong> a <code>${escapeHtmlUpdates(data.remote)}</code> repón.<br>Jelenlegi: <code>${cur}</code> → Legfrissebb: <code>${lat}</code>`
+      const versions = (data.releases || []).filter((r) => r.version)
+      if (versions.length > 0) {
+        // Version-centric: "N uj verzio elerheto (v1.21.0)".
+        summary.innerHTML = `<strong>${t('updates.versions_available', { n: versions.length })}</strong> <code>${escapeHtmlUpdates(versions[0].version)}</code>`
+      } else {
+        // Pre-release: unreleased commits but no new version tag yet.
+        summary.innerHTML = `<strong>${t('updates.changes_available')}</strong> ${t('updates.available_on', { remote: `<code>${escapeHtmlUpdates(data.remote)}</code>` })}`
+      }
       applyBtn.hidden = false
     }
-    if (data.commits && data.commits.length) {
-      list.innerHTML = data.commits.map(c => `
+    const commitCard = (c) => `
         <div class="updates-commit">
           <div class="updates-commit-head">
             <span>${escapeHtmlUpdates(c.short)} · ${escapeHtmlUpdates(c.author)}</span>
             <span>${escapeHtmlUpdates((c.date || '').slice(0, 10))}</span>
           </div>
           <div class="updates-commit-msg">${escapeHtmlUpdates(c.message)}</div>
-        </div>
-      `).join('')
+        </div>`
+    if (data.releases && data.releases.length) {
+      // Version-centric: the human-language summary per version is the primary
+      // content; the raw commit list (SHAs, conventional-commit prefixes, author
+      // names) is tucked behind a collapsed "details" so it is never the first
+      // thing the operator sees.
+      list.innerHTML = data.releases.map((rel) => {
+        const isUpcoming = !rel.version
+        const label = isUpcoming ? t('updates.group.upcoming') : escapeHtmlUpdates(rel.version)
+        const human = rel.summary
+          ? escapeHtmlUpdates(rel.summary)
+          : (isUpcoming ? t('updates.upcoming_note') : '')
+        return `
+        <div class="updates-version">
+          <div class="updates-version-tag">${label}</div>
+          ${human ? `<div class="updates-version-summary">${human}</div>` : ''}
+          <details class="updates-version-details">
+            <summary>${t('updates.details', { n: rel.commits.length })}</summary>
+            <div class="updates-commit-list">${rel.commits.map(commitCard).join('')}</div>
+          </details>
+        </div>`
+      }).join('')
+    } else if (data.commits && data.commits.length) {
+      list.innerHTML = data.commits.map(commitCard).join('')
     } else if (data.behind === 0) {
-      list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">Nincs változás.</p>`
+      list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('updates.no_changes')}</p>`
     }
   } catch (err) {
     summary.className = 'updates-summary error'
     summary.textContent = 'Hiba: ' + (err.message || err)
     applyBtn.hidden = true
+  }
+  renderDiagnoseOffer()
+}
+
+// Post-rollback diagnosis offer (PR-D). Reads /api/updates/status: if the last
+// update failed/rolled-back and this host can run a Claude agent, offer the
+// opt-in fixer; if it cannot (AVX), show a manual-intervention note instead.
+async function renderDiagnoseOffer() {
+  const box = document.getElementById('updatesDiagnose')
+  if (!box) return
+  let data
+  try { data = await (await fetch('/api/updates/status')).json() } catch { box.hidden = true; return }
+  if (data.needsHuman) {
+    box.hidden = false
+    box.className = 'updates-diagnose needs-human'
+    box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong><p>${escapeHtmlUpdates(t('updates.diagnose.needs_human'))}</p>`
+    return
+  }
+  if (!data.canDiagnose) { box.hidden = true; box.innerHTML = ''; return }
+  box.hidden = false
+  box.className = 'updates-diagnose'
+  box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong>`
+    + `<p>${escapeHtmlUpdates(t('updates.diagnose.body'))}</p>`
+    + `<button class="btn-secondary btn-compact" id="updatesDiagnoseBtn">${escapeHtmlUpdates(t('updates.diagnose.btn'))}</button>`
+  document.getElementById('updatesDiagnoseBtn').addEventListener('click', runDiagnose)
+}
+
+async function runDiagnose() {
+  if (!confirm(t('updates.diagnose.consent'))) return
+  const btn = document.getElementById('updatesDiagnoseBtn')
+  if (btn) btn.disabled = true
+  try {
+    const res = await fetch('/api/updates/diagnose', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (btn) btn.disabled = false
+      showToast(t('updates.diagnose.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      return
+    }
+    showToast(data.already ? t('updates.diagnose.already') : t('updates.diagnose.started'))
+    if (btn) { btn.hidden = true }
+  } catch (err) {
+    if (btn) btn.disabled = false
+    showToast(t('updates.diagnose.failed', { msg: err.message || err }))
   }
 }
 
@@ -6758,24 +10011,69 @@ async function runUpdate(autoStash) {
       resetBtn()
       // dirty-tree without autoStash: offer the auto-stash retry inline.
       if (data.reason === 'dirty-tree' && !autoStash) {
-        if (confirm('A working tree-ben lokális változtatások vannak. Stash-eljem őket automatikusan, frissítsek, majd visszaállítsam?')) {
+        if (confirm(t('updates.confirm.stash'))) {
           await runUpdate(true)
         }
         return
       }
-      showToast('Frissítés nem indult: ' + (data.error || ('HTTP ' + res.status)))
+      showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }))
       return
     }
-    showToast('Frissítés elindult, a dashboard újratöltődik...')
-    setTimeout(() => window.location.reload(), 30000)
+    showToast(t('updates.toast.applying'))
+    // Poll the real outcome instead of a blind timed reload. update.sh (and its
+    // detached finalizer) write store/update.last-result on exit, so we surface
+    // success / rolled-back / failed rather than a false "done" that reloads
+    // into an unchanged (or dead) dashboard.
+    await pollUpdateOutcome(resetBtn)
   } catch (err) {
     resetBtn()
-    showToast('Hiba: ' + (err.message || err))
+    showToast(t('updates.toast.error', {msg: err.message || err}))
   }
 }
 
+// Poll /api/updates/status until the run finishes (pidfile gone AND a fresh
+// result is present), then show the true outcome. Reload only on success.
+async function pollUpdateOutcome(resetBtn) {
+  const startedAt = Date.now()
+  const deadline = startedAt + 5 * 60_000   // hard cap: 5 min
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3000))
+    let data
+    try {
+      const res = await fetch('/api/updates/status')
+      data = await res.json()
+    } catch {
+      // Dashboard is mid-restart (expected): keep polling.
+      continue
+    }
+    const result = data && data.result
+    const fresh = result && typeof result.ts === 'number' && result.ts * 1000 >= startedAt - 5000
+    if (data && !data.running && fresh) {
+      const st = result.status
+      if (st === 'success') {
+        showToast(t('updates.toast.success', { old: result.old || '', new: result.new || '' }))
+        setTimeout(() => window.location.reload(), 2000)
+        return
+      }
+      if (st === 'rolled-back') {
+        if (resetBtn) resetBtn()
+        showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }))
+        renderDiagnoseOffer()
+        return
+      }
+      // failed
+      if (resetBtn) resetBtn()
+      showToast(t('updates.toast.failed', { phase: result.phase || '?', msg: result.message || ('code ' + result.code) }))
+      renderDiagnoseOffer()
+      return
+    }
+  }
+  if (resetBtn) resetBtn()
+  showToast(t('updates.toast.status_timeout'))
+}
+
 document.getElementById('updatesApplyBtn').addEventListener('click', async () => {
-  if (!confirm('Frissítés most. A szolgáltatások újraindulnak, a dashboard ~30 másodpercig nem érhető el. Folytatod?')) return
+  if (!confirm(t('updates.confirm.apply'))) return
   await runUpdate(false)
 })
 
@@ -6784,18 +10082,161 @@ document.getElementById('updatesApplyBtn').addEventListener('click', async () =>
 pollUpdatesBadge()
 setInterval(pollUpdatesBadge, 5 * 60_000)
 
+// === First-run onboarding wizard ===
+// Full-screen overlay shown when /api/onboarding/status reports the install
+// still needs setup (pre-install-now / configure-later flow). Steps 2-3 reuse
+// the existing channel-setup + pairing backend endpoints.
+async function fetchOnboardingStatus() {
+  try { return await (await fetch('/api/onboarding/status')).json() } catch { return null }
+}
+function onboardingCurrentStep(s) {
+  if (!s.claudeAuthPresent || !s.agentsRunning) return 1
+  if (!s.telegramConfigured) return 2
+  if (!s.paired) return 3
+  return 0
+}
+async function initOnboarding() {
+  const s = await fetchOnboardingStatus()
+  if (!s || !s.needsOnboarding) return
+  renderOnboarding(s)
+}
+async function refreshOnboarding() {
+  const s = await fetchOnboardingStatus()
+  if (s) renderOnboarding(s)
+}
+function renderOnboarding(s) {
+  const overlay = document.getElementById('onboardingOverlay')
+  if (!overlay) return
+  const step = onboardingCurrentStep(s)
+  if (step === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
+  overlay.hidden = false
+  overlay.classList.add('active')
+  document.body.style.overflow = 'hidden'
+  document.querySelectorAll('#onboardingSteps .onboarding-step').forEach((el) => {
+    const n = Number(el.dataset.ostep)
+    el.classList.toggle('active', n === step)
+    el.classList.toggle('done', n < step)
+  })
+  const body = document.getElementById('onboardingBody')
+  if (step === 1) body.innerHTML = onbStep1Html(s)
+  else if (step === 2) body.innerHTML = onbStep2Html()
+  else body.innerHTML = onbStep3Html()
+  wireOnboarding(step)
+}
+function onbMsg(text, isErr) {
+  const el = document.getElementById('onbMsg')
+  if (el) { el.textContent = text; el.className = 'onb-msg' + (isErr ? ' err' : ' ok') }
+}
+function onbStep1Html(s) {
+  return `<p>${escapeHtml(t('onboarding.step1.desc'))}</p>`
+    + (s.claudeAuthPresent
+      ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step1.auth_done'))}</p>`
+      : `<label class="form-label-sm">${escapeHtml(t('onboarding.step1.token_label'))}</label>`
+        + `<input id="onbToken" type="password" class="onb-input" placeholder="sk-ant-oat01-..." autocomplete="off">`
+        + `<div class="onb-hint">${escapeHtml(t('onboarding.step1.token_hint'))}</div>`
+        + `<button class="btn-primary btn-compact" id="onbAuthBtn">${escapeHtml(t('onboarding.step1.save_btn'))}</button>`)
+    + (s.claudeAuthPresent && !s.agentsRunning
+      ? `<button class="btn-primary btn-compact" id="onbLaunchBtn">${escapeHtml(t('onboarding.step1.launch_btn'))}</button>`
+      : '')
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep2Html() {
+  return `<p>${escapeHtml(t('onboarding.step2.desc'))}</p>`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.step2.token_label'))}</label>`
+    + `<input id="onbBotToken" type="password" class="onb-input" placeholder="123456:ABC..." autocomplete="off">`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.step2.token_hint'))}</div>`
+    + `<button class="btn-primary btn-compact" id="onbBotBtn">${escapeHtml(t('onboarding.step2.save_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep3Html() {
+  return `<p>${escapeHtml(t('onboarding.step3.desc'))}</p>`
+    + `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`
+    + `<div id="onbPending" class="onb-pending"></div>`
+    + `<button class="btn-secondary btn-compact" id="onbRefreshBtn">${escapeHtml(t('onboarding.step3.refresh_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function wireOnboarding(step) {
+  if (step === 1) {
+    const authBtn = document.getElementById('onbAuthBtn')
+    if (authBtn) authBtn.addEventListener('click', async () => {
+      const token = (document.getElementById('onbToken').value || '').trim()
+      if (!token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
+      authBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { authBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
+        await refreshOnboarding()
+      } catch (e) { authBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+    const launchBtn = document.getElementById('onbLaunchBtn')
+    if (launchBtn) launchBtn.addEventListener('click', async () => {
+      launchBtn.disabled = true; onbMsg(t('onboarding.step1.launching'))
+      try {
+        const res = await fetch('/api/onboarding/launch', { method: 'POST' })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { launchBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(t('onboarding.step1.launched'))
+        setTimeout(refreshOnboarding, 2500)
+      } catch (e) { launchBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 2) {
+    const botBtn = document.getElementById('onbBotBtn')
+    if (botBtn) botBtn.addEventListener('click', async () => {
+      const botToken = (document.getElementById('onbBotToken').value || '').trim()
+      if (!botToken) { onbMsg(t('onboarding.step2.token_empty'), true); return }
+      botBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(t('onboarding.step2.saved'))
+        setTimeout(refreshOnboarding, 2000)
+      } catch (e) { botBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 3) {
+    const refreshBtn = document.getElementById('onbRefreshBtn')
+    const loadPending = async () => {
+      try {
+        const p = await (await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)).json()
+        const list = Array.isArray(p) ? p : (p.pending || [])
+        const box = document.getElementById('onbPending')
+        if (!box) return
+        if (!list.length) { box.innerHTML = `<span class="onb-hint">${escapeHtml(t('onboarding.step3.no_pending'))}</span>`; return }
+        box.innerHTML = list.map((x) => {
+          const id = escapeHtml(String(x.id || x.chatId || x.userId || ''))
+          const label = escapeHtml(String(x.name || x.username || id))
+          return `<div class="onb-pending-row"><span>${label}</span><button class="btn-primary btn-compact onb-approve" data-id="${id}">${escapeHtml(t('onboarding.step3.approve_btn'))}</button></div>`
+        }).join('')
+        box.querySelectorAll('.onb-approve').forEach((b) => b.addEventListener('click', async () => {
+          b.disabled = true
+          try {
+            await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: b.dataset.id }) })
+            onbMsg(t('onboarding.step3.approved'))
+            setTimeout(refreshOnboarding, 1500)
+          } catch (e) { b.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+        }))
+      } catch { /* ignore */ }
+    }
+    if (refreshBtn) refreshBtn.addEventListener('click', () => { refreshOnboarding() })
+    loadPending()
+  }
+}
+
 // === Init ===
 populateAvatarGrid()
 loadMemAgents()
 loadOverview()
 loadAvailableModels()
+initOnboarding()
 
 // "DeepSeek API kulcs hozzáadása" link az agent edit panel-en --
 // a Vault page-re visz, ahol a felhasználó egy DEEPSEEK_API_KEY
 // secret-et tud felvenni, és visszatérve frissítjük a model listát.
 document.getElementById('deepseekConfigLink')?.addEventListener('click', (e) => {
   e.preventDefault()
-  switchPage('vault')
+  location.hash = 'vault'
 })
 
 // === Sudo modal for managed-settings.json (Slack setup pre-flight) ===
@@ -6808,18 +10249,15 @@ function showSudoModal(sudoCommand) {
   const card = document.createElement('div')
   card.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:560px;width:90%'
   card.innerHTML = `
-    <h3 style="margin:0 0 12px">Rendszerszintű beállítás szükséges</h3>
-    <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px">
-      A Claude Code megköveteli, hogy a Slack channel plugin engedélyezve legyen a rendszerszintű managed-settings.json fájlban.
-      Futtasd az alábbi parancsot a Terminálban:
-    </p>
+    <h3 style="margin:0 0 12px">${t('channel.sudo_modal.title')}</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin:0 0 16px">${t('channel.sudo_modal.desc')}</p>
     <div style="position:relative">
       <pre id="sudoCmdPre" style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-all">${escapeHtml(sudoCommand)}</pre>
-      <button id="sudoCopyBtn" style="position:absolute;top:6px;right:6px;padding:4px 10px;font-size:11px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);cursor:pointer">Másolás</button>
+      <button id="sudoCopyBtn" style="position:absolute;top:6px;right:6px;padding:4px 10px;font-size:11px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);cursor:pointer">${t('common.copy')}</button>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-      <button id="sudoCancelBtn" class="btn btn-secondary" style="padding:6px 16px;font-size:13px">Mégse</button>
-      <button id="sudoDoneBtn" class="btn btn-primary" style="padding:6px 16px;font-size:13px">Kész, újrapróbálom</button>
+      <button id="sudoCancelBtn" class="btn btn-secondary" style="padding:6px 16px;font-size:13px">${t('channel.sudo_modal.cancel')}</button>
+      <button id="sudoDoneBtn" class="btn btn-primary" style="padding:6px 16px;font-size:13px">${t('channel.sudo_modal.retry')}</button>
     </div>
   `
   overlay.appendChild(card)
@@ -6827,8 +10265,8 @@ function showSudoModal(sudoCommand) {
 
   document.getElementById('sudoCopyBtn').addEventListener('click', () => {
     navigator.clipboard.writeText(sudoCommand).then(() => {
-      document.getElementById('sudoCopyBtn').textContent = 'Másolva!'
-      setTimeout(() => { document.getElementById('sudoCopyBtn').textContent = 'Másolás' }, 1500)
+      document.getElementById('sudoCopyBtn').textContent = t('common.copied')
+      setTimeout(() => { document.getElementById('sudoCopyBtn').textContent = t('common.copy') }, 1500)
     })
   })
   document.getElementById('sudoCancelBtn').addEventListener('click', () => overlay.remove())
@@ -6849,13 +10287,13 @@ function fallbackCopyToClipboard(text, btn) {
   try {
     const ok = document.execCommand('copy')
     if (ok) {
-      btn.textContent = 'Másolva!'
-      setTimeout(() => { btn.textContent = 'Másolás' }, 1500)
+      btn.textContent = t('common.copied')
+      setTimeout(() => { btn.textContent = t('common.copy') }, 1500)
     } else {
-      showToast('A vágólapra másolás nem sikerült')
+      showToast(t('common.toast.copy_failed'))
     }
   } catch {
-    showToast('A vágólapra másolás nem sikerült')
+    showToast(t('common.toast.copy_failed'))
   }
   document.body.removeChild(ta)
 }
@@ -6873,21 +10311,18 @@ function showSlackManifestModal(manifest, instructions) {
   const stepsHtml = instructions.map((s, i) => `<li style="margin-bottom:6px">${escapeHtml(s)}</li>`).join('')
 
   card.innerHTML = `
-    <h3 style="margin:0 0 16px">Slack App létrehozása</h3>
-    <p style="font-size:13px;color:var(--text-muted);margin:0 0 12px">
-      Illeszd be az alábbi YAML manifestet a Slack App létrehozásakor.
-      Ez automatikusan beállítja az összes szükséges scope-ot, eseményt és a Socket Mode-ot.
-    </p>
+    <h3 style="margin:0 0 16px">${t('channel.slack_manifest.title')}</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin:0 0 12px">${t('channel.slack_manifest.desc')}</p>
     <div style="position:relative;margin-bottom:16px">
       <pre id="slackManifestPre" style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow-y:auto">${escapeHtml(manifest)}</pre>
-      <button id="slackManifestCopyBtn" style="position:absolute;top:6px;right:6px;padding:4px 10px;font-size:11px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);cursor:pointer">Másolás</button>
+      <button id="slackManifestCopyBtn" style="position:absolute;top:6px;right:6px;padding:4px 10px;font-size:11px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);cursor:pointer">${t('common.copy')}</button>
     </div>
-    <h4 style="margin:0 0 8px;font-size:14px">Lépések</h4>
+    <h4 style="margin:0 0 8px;font-size:14px">${t('channel.slack_manifest.steps_title')}</h4>
     <ol style="font-size:13px;padding-left:20px;margin:0 0 16px">${stepsHtml}</ol>
     <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button id="slackManifestCloseBtn" class="btn btn-secondary" style="padding:6px 16px;font-size:13px">Bezárás</button>
+      <button id="slackManifestCloseBtn" class="btn btn-secondary" style="padding:6px 16px;font-size:13px">${t('common.btn.close')}</button>
       <a href="https://api.slack.com/apps" target="_blank" rel="noopener" class="btn btn-primary" style="padding:6px 16px;font-size:13px;text-decoration:none;display:inline-flex;align-items:center;gap:4px">
-        Megnyitás (api.slack.com)
+        ${t('channel.slack_manifest.open_btn')}
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
       </a>
     </div>
@@ -6899,8 +10334,8 @@ function showSlackManifestModal(manifest, instructions) {
     const copyBtn = document.getElementById('slackManifestCopyBtn')
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(manifest).then(() => {
-        copyBtn.textContent = 'Másolva!'
-        setTimeout(() => { copyBtn.textContent = 'Másolás' }, 1500)
+        copyBtn.textContent = t('common.copied')
+        setTimeout(() => { copyBtn.textContent = t('common.copy') }, 1500)
       }).catch(() => {
         fallbackCopyToClipboard(manifest, copyBtn)
       })
@@ -6922,7 +10357,7 @@ document.getElementById('chSlackManifestBtn').addEventListener('click', async ()
     const data = await res.json()
     showSlackManifestModal(data.manifest, data.instructions)
   } catch {
-    showToast('Nem sikerült betölteni a manifestet')
+    showToast(t('channel.toast.manifest_failed'))
   } finally {
     btn.disabled = false
   }
@@ -6933,6 +10368,7 @@ document.getElementById('chSlackManifestBtn').addEventListener('click', async ()
 // ============================================================
 
 let recallInitialized = false
+let recallSortDesc = true
 
 async function loadRecallPage() {
   if (!recallInitialized) {
@@ -6941,14 +10377,15 @@ async function loadRecallPage() {
     document.getElementById('recallDate').value = today
 
     try {
-      const res = await fetch('/api/agents')
+      // /api/schedules/agents includes the main agent (jarvis); /api/agents lists sub-agents only
+      const res = await fetch('/api/schedules/agents')
       if (res.ok) {
         const agents = await res.json()
         const sel = document.getElementById('recallAgent')
         agents.forEach(a => {
           const opt = document.createElement('option')
           opt.value = a.name
-          opt.textContent = a.name
+          opt.textContent = a.label || a.name
           sel.appendChild(opt)
         })
       }
@@ -6957,6 +10394,17 @@ async function loadRecallPage() {
     document.getElementById('recallBtn').addEventListener('click', doRecall)
     document.getElementById('recallExpr').addEventListener('keydown', e => { if (e.key === 'Enter') doRecall() })
     document.getElementById('recallSearch').addEventListener('keydown', e => { if (e.key === 'Enter') doRecall() })
+    // Re-fetch per-agent log dates when the agent filter changes; without this
+    // the date hint stayed stuck on the agent active at first page load.
+    document.getElementById('recallAgent').addEventListener('change', loadRecallDates)
+    // #53: sort order toggle
+    document.getElementById('recallSortToggle').addEventListener('click', () => {
+      recallSortDesc = !recallSortDesc
+      const btn = document.getElementById('recallSortToggle')
+      btn.textContent = recallSortDesc ? '↓' : '↑'
+      btn.title = recallSortDesc ? t('recall.sort.tooltip.desc') : t('recall.sort.tooltip.asc')
+      doRecall()
+    })
 
     loadRecallDates()
   }
@@ -6974,7 +10422,7 @@ async function loadRecallDates() {
     if (dates.length && !dateInput.value) {
       dateInput.value = dates[0]
     }
-    dateInput.setAttribute('title', `${dates.length} nap naplóval`)
+    dateInput.setAttribute('title', t('recall.date.n_days', { n: dates.length }))
   } catch {}
 }
 
@@ -6995,21 +10443,21 @@ async function doRecall() {
 
   const timeline = document.getElementById('recallTimeline')
   const summary = document.getElementById('recallSummary')
-  timeline.innerHTML = '<p class="recall-loading">Betöltés...</p>'
+  timeline.innerHTML = `<p class="recall-loading">${t('recall.loading')}</p>`
   summary.innerHTML = ''
 
   try {
     const res = await fetch('/api/recall?' + params.toString())
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      timeline.innerHTML = `<p class="recall-error">${esc(err.error || 'Hiba történt')}</p>`
+      timeline.innerHTML = `<p class="recall-error">${esc(err.error || t('recall.error'))}</p>`
       return
     }
     const data = await res.json()
     renderRecallSummary(summary, data)
     renderRecallTimeline(timeline, data)
   } catch (err) {
-    timeline.innerHTML = '<p style="color:var(--danger)">Nem sikerült betölteni</p>'
+    timeline.innerHTML = `<p style="color:var(--danger)">${t('recall.load_error')}</p>`
   }
 }
 
@@ -7021,23 +10469,24 @@ function renderRecallSummary(el, data) {
   } else if (dateRange.from && dateRange.to) {
     parts.push(`<strong>${esc(dateRange.from)}</strong> &ndash; <strong>${esc(dateRange.to)}</strong>`)
   }
-  parts.push(`${s.logCount} naplóbejegyzés`)
-  parts.push(`${s.memoryCount} emlék`)
-  if (s.agents.length) parts.push(`Ágensek: ${s.agents.map(esc).join(', ')}`)
+  parts.push(t('recall.summary.log_count', { n: s.logCount }))
+  parts.push(t('recall.summary.memory_count', { n: s.memoryCount }))
+  if (s.agents.length) parts.push(`${t('recall.summary.agents')}: ${s.agents.map(esc).join(', ')}`)
   el.innerHTML = `<div class="recall-summary-row">${parts.map(p => `<span>${p}</span>`).join('')}</div>`
 }
 
 function renderRecallTimeline(el, data) {
   const { logs, memories } = data
   if (!logs.length && !memories.length) {
-    el.innerHTML = '<p class="recall-empty">Nincs találat erre az időszakra.</p>'
+    el.innerHTML = `<p class="recall-empty">${t('recall.empty_period')}</p>`
     return
   }
 
   const items = []
   logs.forEach(l => items.push({ type: 'log', ts: l.created_at, agent: l.agent_id, date: l.date, content: l.content, label: l.created_label }))
   memories.forEach(m => items.push({ type: 'memory', ts: m.created_at, agent: m.agent_id, category: m.category, content: m.content, keywords: m.keywords, label: m.created_label }))
-  items.sort((a, b) => a.ts - b.ts)
+  // #52/#53: apply sort order (desc = newest first, default)
+  items.sort((a, b) => recallSortDesc ? b.ts - a.ts : a.ts - b.ts)
 
   let currentDate = ''
   let html = ''
@@ -7093,14 +10542,17 @@ async function loadBgTasksPage() {
   if (!bgInitialized) {
     bgInitialized = true
     try {
-      const res = await fetch('/api/agents')
+      // Use /api/schedules/agents (not /api/agents) so the main agent is a
+      // selectable background-task target too -- /api/agents lists sub-agents
+      // only, while the backend (spawnBackgroundTask) accepts any agent_id.
+      const res = await fetch('/api/schedules/agents')
       if (res.ok) {
         const agents = await res.json()
         const sel = document.getElementById('bgAgent')
         agents.forEach(a => {
           const opt = document.createElement('option')
           opt.value = a.name
-          opt.textContent = a.name
+          opt.textContent = a.label || a.name
           sel.appendChild(opt)
         })
         if (agents.length === 1) sel.value = agents[0].name
@@ -7119,8 +10571,8 @@ async function loadBgTasksPage() {
 async function startBgTask() {
   const agent = document.getElementById('bgAgent').value
   const prompt = document.getElementById('bgPrompt').value.trim()
-  if (!agent) { showToast('Válassz ágenst'); return }
-  if (!prompt) { showToast('Add meg a feladatot'); return }
+  if (!agent) { showToast(t('bgTasks.select_agent')); return }
+  if (!prompt) { showToast(t('bgTasks.enter_task')); return }
 
   const btn = document.getElementById('bgStartBtn')
   btn.disabled = true
@@ -7132,14 +10584,14 @@ async function startBgTask() {
     })
     const data = await res.json()
     if (!res.ok) {
-      showToast(data.error || 'Hiba történt')
+      showToast(data.error || t('common.error'))
       return
     }
     document.getElementById('bgPrompt').value = ''
-    showToast('Háttérfeladat elindítva')
+    showToast(t('bgTasks.toast.started'))
     loadBgTasks()
   } catch {
-    showToast('Nem sikerült elindítani')
+    showToast(t('bgTasks.toast.start_error'))
   } finally {
     btn.disabled = false
   }
@@ -7155,19 +10607,19 @@ async function loadBgTasks() {
     if (agentVal) params.set('agent', agentVal)
     if (showAll) params.set('all', 'true')
     const res = await fetch('/api/background-tasks?' + params.toString())
-    if (!res.ok) { list.innerHTML = '<p style="color:var(--danger)">Hiba a betöltésnél</p>'; return }
+    if (!res.ok) { list.innerHTML = `<p style="color:var(--danger)">${t('bgTasks.error')}</p>`; return }
     const tasks = await res.json()
 
     if (!tasks.length) {
-      list.innerHTML = '<p style="color:var(--text-muted)">Nincs háttérfeladat.</p>'
+      list.innerHTML = `<p style="color:var(--text-muted)">${t('bgTasks.empty')}</p>`
       return
     }
 
     list.innerHTML = tasks.map(t => {
       const statusColors = { running: '#f59e0b', done: '#22c55e', failed: '#ef4444', timeout: '#6b7280' }
-      const statusLabels = { running: 'Fut', done: 'Kész', failed: 'Hiba', timeout: 'Időtúllépés' }
+      const statusLabels = { running: () => t('bgTasks.status.running'), done: () => t('bgTasks.status.done'), failed: () => t('bgTasks.status.failed'), timeout: () => t('bgTasks.status.timeout') }
       const color = statusColors[t.status] || '#6b7280'
-      const label = statusLabels[t.status] || t.status
+      const labelRaw = statusLabels[t.status]; const label = labelRaw ? (typeof labelRaw === 'function' ? labelRaw() : labelRaw) : t.status
       const output = t.output ? `<pre style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px;font-size:12px;max-height:200px;overflow:auto;white-space:pre-wrap;">${esc(t.output.slice(-2000))}</pre>` : ''
       return `<div style="margin-bottom:12px;padding:12px 16px;border-radius:8px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${color};">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
@@ -7178,31 +10630,31 @@ async function loadBgTasks() {
           </div>
           <div style="display:flex;gap:8px;align-items:center;">
             <span style="font-size:12px;color:var(--text-muted)">${esc(t.started_label)}</span>
-            ${t.status === 'running' ? `<button class="btn btn-sm" onclick="viewBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;">Kimenet</button><button class="btn btn-sm" onclick="cancelBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;color:var(--danger)">Leállítás</button>` : ''}
+            ${t.status === 'running' ? `<button class="btn btn-sm" onclick="viewBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;">${t('bgTasks.output_btn')}</button><button class="btn btn-sm" onclick="cancelBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;color:var(--danger)">${t('bgTasks.stop_btn')}</button>` : ''}
           </div>
         </div>
         <div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">${esc(t.prompt)}</div>
-        ${t.finished_label ? `<div style="font-size:12px;color:var(--text-muted);">Befejezve: ${esc(t.finished_label)}</div>` : ''}
+        ${t.finished_label ? `<div style="font-size:12px;color:var(--text-muted);">${t('bgTasks.finished_label')} ${esc(t.finished_label)}</div>` : ''}
         ${output}
       </div>`
     }).join('')
   } catch {
-    list.innerHTML = '<p style="color:var(--danger)">Nem sikerült betölteni</p>'
+    list.innerHTML = `<p style="color:var(--danger)">${t('bgTasks.load_error')}</p>`
   }
 }
 
 async function viewBgTask(id) {
   try {
     const res = await fetch(`/api/background-tasks/${id}`)
-    if (!res.ok) { showToast('Nem sikerült betölteni'); return }
+    if (!res.ok) { showToast(t('bgTasks.load_error')); return }
     const task = await res.json()
-    const output = task.liveOutput || task.output || '(nincs kimenet)'
+    const output = task.liveOutput || task.output || t('bgTasks.no_output')
     const modal = document.createElement('div')
     modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center;'
     modal.innerHTML = `<div style="background:var(--surface);border-radius:12px;padding:20px;max-width:800px;width:90%;max-height:80vh;overflow:auto;">
       <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
-        <h3 style="margin:0;">Háttérfeladat ${esc(id)}</h3>
-        <button class="btn btn-sm" id="bgModalClose" style="font-size:13px;">Bezárás</button>
+        <h3 style="margin:0;">${t('bgTasks.modal.title', { id: esc(id) })}</h3>
+        <button class="btn btn-sm" id="bgModalClose" style="font-size:13px;">${t('bgTasks.modal.close_btn')}</button>
       </div>
       <pre style="white-space:pre-wrap;font-size:12px;line-height:1.4;">${esc(output)}</pre>
     </div>`
@@ -7215,14 +10667,14 @@ async function viewBgTask(id) {
 }
 
 async function cancelBgTask(id) {
-  if (!confirm('Biztosan leállítod?')) return
+  if (!confirm(t('bgTasks.cancel.confirm'))) return
   try {
     const res = await fetch(`/api/background-tasks/${id}`, { method: 'DELETE' })
     if (res.ok) {
-      showToast('Leállítva')
+      showToast(t('bgTasks.toast.stopped'))
       loadBgTasks()
     } else {
-      showToast('Nem sikerült leállítani')
+      showToast(t('bgTasks.toast.stop_error'))
     }
   } catch {
     showToast('Hiba')
@@ -7238,7 +10690,7 @@ document.getElementById('refreshAutonomyBtn').addEventListener('click', loadAuto
 async function loadAutonomy() {
   const grid = document.getElementById('autonomyGrid')
   const footer = document.getElementById('autonomyUpdatedAt')
-  grid.innerHTML = '<p style="color:var(--text-muted);font-size:13px">Betöltés...</p>'
+  grid.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
 
   try {
     const res = await fetch('/api/autonomy')
@@ -7275,12 +10727,12 @@ async function loadAutonomy() {
       if (cat.locked) {
         const lock = document.createElement('div')
         lock.className = 'autonomy-row-lock'
-        lock.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Biztonsági zár'
+        lock.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> ${t('autonomy.lock_label')}`
         row.appendChild(lock)
       } else if (isCapped) {
         const cap = document.createElement('div')
         cap.className = 'autonomy-row-cap'
-        cap.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> Max ' + cat.maxLevel + '. szint'
+        cap.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> ${t('autonomy.cap_label', { n: cat.maxLevel })}`
         row.appendChild(cap)
       }
       row.appendChild(levels)
@@ -7289,12 +10741,12 @@ async function loadAutonomy() {
 
     if (config.updated_at > 0) {
       const d = new Date(config.updated_at * 1000)
-      footer.textContent = 'Utolsó módosítás: ' + d.toLocaleString('hu-HU')
+      footer.textContent = t('autonomy.last_modified', { date: d.toLocaleString('hu-HU') })
     } else {
-      footer.textContent = 'Még nem módosított'
+      footer.textContent = t('autonomy.not_modified')
     }
   } catch (err) {
-    grid.innerHTML = '<p style="color:var(--danger)">Nem sikerült betölteni az autonómia konfigot.</p>'
+    grid.innerHTML = `<p style="color:var(--danger)">${t('autonomy.error')}</p>`
     footer.textContent = ''
   }
 }
@@ -7313,9 +10765,235 @@ async function setAutonomyLevel(key, level) {
     }
     loadAutonomy()
   } catch {
-    showToast('Hiba a mentésnél')
+    showToast(t('kanban.toast.save_error'))
   }
 }
+
+// ============================================================
+// === Settings (central config registry) ===
+// ============================================================
+
+document.getElementById('refreshSettingsBtn').addEventListener('click', loadSettings)
+window.addEventListener('beforeunload', (e) => {
+  if (settingsDirty.size > 0) { e.preventDefault(); e.returnValue = '' }
+})
+
+// Human label for a registry "module" -- falls back to a capitalised key for
+// any future module the UI doesn't know about yet, so adding a registry
+// entry never requires a frontend change just to render a sane heading.
+function settingsModuleLabel(mod) {
+  const key = `settings.module.${mod}`
+  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true }
+  return known[mod] ? t(key) : (mod.charAt(0).toUpperCase() + mod.slice(1))
+}
+
+// Track dirty state: key -> { input, originalValue, type, errorEl }
+const settingsDirty = new Map()
+
+function updateSettingsSaveBar() {
+  const bar = document.getElementById('settingsSaveBar')
+  const countEl = document.getElementById('settingsDirtyCount')
+  if (!bar) return
+  const n = settingsDirty.size
+  bar.style.display = n > 0 ? 'flex' : 'none'
+  if (countEl) countEl.textContent = t('settings.dirty_count', {n})
+}
+
+function markSettingDirty(key, input, originalValue, type, errorEl) {
+  const currentVal = type === 'color' ? input.value : input.value
+  if (currentVal === String(originalValue)) {
+    settingsDirty.delete(key)
+  } else {
+    settingsDirty.set(key, { input, originalValue, type, errorEl })
+  }
+  updateSettingsSaveBar()
+}
+
+async function loadSettings() {
+  const container = document.getElementById('settingsGroups')
+  container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.loading')}</p>`
+  settingsDirty.clear()
+  updateSettingsSaveBar()
+
+  try {
+    const res = await fetch('/api/settings')
+    if (!res.ok) throw new Error('fetch failed')
+    const { settings } = await res.json()
+
+    const byModule = new Map()
+    for (const s of settings) {
+      if (!byModule.has(s.module)) byModule.set(s.module, [])
+      byModule.get(s.module).push(s)
+    }
+
+    container.innerHTML = ''
+    if (byModule.size === 0) {
+      container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.empty')}</p>`
+      return
+    }
+
+    for (const [mod, defs] of byModule) {
+      const group = document.createElement('div')
+      group.className = 'settings-group'
+
+      const heading = document.createElement('h3')
+      heading.className = 'settings-group-title'
+      heading.textContent = settingsModuleLabel(mod)
+      group.appendChild(heading)
+
+      for (const def of defs) {
+        group.appendChild(buildSettingRow(def))
+      }
+      container.appendChild(group)
+    }
+  } catch (err) {
+    container.innerHTML = `<p style="color:var(--danger)">${t('settings.error')}</p>`
+  }
+}
+
+function buildSettingRow(def) {
+  const row = document.createElement('div')
+  row.className = 'settings-row'
+
+  const info = document.createElement('div')
+  info.className = 'settings-row-info'
+
+  const title = document.createElement('div')
+  title.className = 'settings-row-key'
+  title.textContent = def.key
+  if (def.requiresRestart) {
+    const badge = document.createElement('span')
+    badge.className = 'settings-restart-badge'
+    badge.textContent = t('settings.restart_badge')
+    title.appendChild(badge)
+  }
+  info.appendChild(title)
+
+  const desc = document.createElement('div')
+  desc.className = 'settings-row-desc'
+  desc.textContent = t('settings.desc.' + def.key) || def.description
+  info.appendChild(desc)
+
+  const meta = document.createElement('div')
+  meta.className = 'settings-row-meta'
+  const metaParts = []
+  if (Array.isArray(def.valueSet) && def.valueSet.length) metaParts.push(t('settings.meta.values') + ': ' + def.valueSet.join(', '))
+  if (def.type === 'int' && (def.min !== undefined || def.max !== undefined)) {
+    metaParts.push(t('settings.meta.range') + ': ' + (def.min ?? '–') + '–' + (def.max ?? '–'))
+  }
+  if (def.type === 'color') metaParts.push(t('settings.meta.format') + ': #rrggbb')
+  metaParts.push(t('settings.meta.default') + ': ' + def.default)
+  meta.textContent = metaParts.join(' · ')
+  info.appendChild(meta)
+
+  row.appendChild(info)
+
+  const editor = document.createElement('div')
+  editor.className = 'settings-row-editor'
+
+  const originalValue = String(def.value)
+  let valueInput
+  if (Array.isArray(def.valueSet) && def.valueSet.length) {
+    valueInput = document.createElement('select')
+    valueInput.className = 'input'
+    for (const opt of def.valueSet) {
+      const o = document.createElement('option')
+      o.value = opt
+      o.textContent = opt
+      valueInput.appendChild(o)
+    }
+    valueInput.value = originalValue
+  } else if (def.type === 'color') {
+    valueInput = document.createElement('input')
+    valueInput.type = 'color'
+    valueInput.className = 'settings-color-input'
+    valueInput.value = def.value
+  } else if (def.type === 'int') {
+    valueInput = document.createElement('input')
+    valueInput.type = 'number'
+    valueInput.className = 'input'
+    if (def.min !== undefined) valueInput.min = def.min
+    if (def.max !== undefined) valueInput.max = def.max
+    valueInput.value = def.value
+  } else {
+    valueInput = document.createElement('input')
+    valueInput.type = 'text'
+    valueInput.className = 'input'
+    valueInput.value = def.value
+  }
+  valueInput.dataset.settingKey = def.key
+  valueInput.dataset.settingType = def.type
+  valueInput.dataset.originalValue = originalValue
+  editor.appendChild(valueInput)
+
+  const errorEl = document.createElement('div')
+  errorEl.className = 'settings-row-error'
+  editor.appendChild(errorEl)
+
+  valueInput.addEventListener('input', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
+  valueInput.addEventListener('change', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
+
+  row.appendChild(editor)
+  return row
+}
+
+async function saveAllSettings() {
+  if (settingsDirty.size === 0) return
+  const btn = document.getElementById('settingsSaveAllBtn')
+  if (btn) { btn.disabled = true; btn.textContent = t('settings.save_btn.saving') }
+
+  const errors = []
+  let needsRestart = false
+
+  for (const [key, { input, type, errorEl }] of settingsDirty) {
+    errorEl.textContent = ''
+    const raw = type === 'int' ? Number(input.value) : input.value
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value: raw }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        errorEl.textContent = data.error || 'Hiba'
+        errors.push(`${key}: ${data.error || 'hiba'}`)
+      } else {
+        input.dataset.originalValue = String(raw)
+        if (data.requiresRestart) needsRestart = true
+      }
+    } catch {
+      errorEl.textContent = 'Kapcsolati hiba'
+      errors.push(`${key}: kapcsolati hiba`)
+    }
+  }
+
+  // Remove successfully saved keys from dirty map
+  for (const [key, { input }] of settingsDirty) {
+    if (String(input.value) === input.dataset.originalValue) settingsDirty.delete(key)
+  }
+  updateSettingsSaveBar()
+
+  if (btn) { btn.disabled = false; btn.textContent = t('settings.btn.save') }
+  if (errors.length) {
+    showToast(t('settings.toast.partial_error'), 'error')
+  } else {
+    showToast(needsRestart ? t('settings.toast.saved_restart') : t('settings.toast.saved'))
+  }
+}
+
+function resetAllSettings() {
+  for (const [key, { input, originalValue }] of settingsDirty) {
+    input.value = originalValue
+    const errorEl = document.querySelector(`[data-setting-key="${key}"]`)?.closest('.settings-row')?.querySelector('.settings-row-error')
+    if (errorEl) errorEl.textContent = ''
+  }
+  settingsDirty.clear()
+  updateSettingsSaveBar()
+}
+
+document.getElementById('settingsSaveAllBtn')?.addEventListener('click', saveAllSettings)
+document.getElementById('settingsResetBtn')?.addEventListener('click', resetAllSettings)
 
 // === connectors.hu install banner ===
 ;(function () {
@@ -7361,7 +11039,7 @@ async function setAutonomyLevel(key, level) {
         showState('Install')
       }
     } catch (e) {
-      showError(e.message || 'Hiba a státusz lekérésnél', checkStatus)
+      showError(e.message || t('status.error.fetch'), checkStatus)
     }
   }
 
@@ -7380,7 +11058,7 @@ async function setAutonomyLevel(key, level) {
       try {
         const res = await fetch('/api/connectors-hu/install', { method: 'POST' })
         const data = await res.json().catch(() => ({}))
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Telepítés sikertelen')
+        if (!res.ok || !data.ok) throw new Error(data.error || t('connectors.error.install'))
         showState('Token')
       } catch (e) {
         showError(e.message, () => { showState('Install') })
@@ -7405,7 +11083,7 @@ async function setAutonomyLevel(key, level) {
           body: JSON.stringify({ token: token.trim() }),
         })
         const data = await res.json().catch(() => ({}))
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Konfiguráció sikertelen')
+        if (!res.ok || !data.ok) throw new Error(data.error || t('connectors.error.configure'))
         showState('Done')
       } catch (e) {
         showError(e.message, () => { showState('Token') })
@@ -7505,7 +11183,7 @@ function renderTuSummary(summary) {
   const el = document.getElementById('tuSummaryCards')
   if (!el) return
   if (!summary.length) {
-    el.innerHTML = '<div class="overview-stat"><div class="overview-stat-label">Nincs adat</div><div class="overview-stat-value">0</div><div class="overview-stat-sub">Kattints a "Gyűjtés" gombra</div></div>'
+    el.innerHTML = `<div class="overview-stat"><div class="overview-stat-label">${t('tokenUsage.no_data')}</div><div class="overview-stat-value">0</div><div class="overview-stat-sub">${t('tokenUsage.collect_hint')}</div></div>`
     return
   }
   el.innerHTML = summary.map(s => {
@@ -7517,7 +11195,7 @@ function renderTuSummary(summary) {
         style="border-left:3px solid ${tuGetColor(s.agent)};cursor:pointer;${dimmed ? 'opacity:0.4;' : ''}transition:opacity 0.2s">
         <div class="overview-stat-label">${escapeHtml(s.agent)}</div>
         <div class="overview-stat-value">${tuFormatTokens(totalIn)}</div>
-        <div class="overview-stat-sub">${(s.totalCalls || 0).toLocaleString()} hívás, out: ${tuFormatTokens(s.totalOutput)}</div>
+        <div class="overview-stat-sub">${t('tokenUsage.calls_sub', { calls: (s.totalCalls || 0).toLocaleString(), out: tuFormatTokens(s.totalOutput) })}</div>
       </div>`
   }).join('')
 
@@ -7553,8 +11231,8 @@ function tuGetResetLines(bucketStart, bucketEnd) {
     const ts = Math.floor(d.getTime() / 1000)
     const isMonday = d.getDay() === 1
     const near5h = lines.find(l => l.type === '5h' && Math.abs(l.ts - ts) < 1800)
-    if (!near5h) lines.push({ ts, type: isMonday ? 'weekly' : 'daily', label: isMonday ? 'hét' : 'nap' })
-    else if (isMonday) { near5h.type = 'weekly'; near5h.label = 'hét' }
+    if (!near5h) lines.push({ ts, type: isMonday ? 'weekly' : 'daily', label: isMonday ? t('tokenUsage.chart.week') : t('tokenUsage.chart.day') })
+    else if (isMonday) { near5h.type = 'weekly'; near5h.label = t('tokenUsage.chart.week') }
     d.setDate(d.getDate() + 1)
   }
   return lines
@@ -7647,7 +11325,7 @@ function renderTuTimeline(data, filterAgent) {
     ctx.fillStyle = textSecondary
     ctx.font = '14px sans-serif'
     ctx.textAlign = 'center'
-    ctx.fillText('Nincs adat a kiválasztott időszakra', cssW / 2, 160)
+    ctx.fillText(t('tokenUsage.no_period_data'), cssW / 2, 160)
     tuChartState = null
     return
   }
@@ -7836,11 +11514,11 @@ function renderTuTimeline(data, filterAgent) {
 
   const legendHits = []
   const lineItems = [
-    { label: '5h ablak', color: '#06b6d4', lw: 2, dash: [], id: '5h', active: is5hActive },
-    { label: 'heti ablak', color: '#8b5cf6', lw: 1.5, dash: [], id: 'weekly', active: isWeeklyActive },
+    { label: t('tokenUsage.chart.window_5h'), color: '#06b6d4', lw: 2, dash: [], id: '5h', active: is5hActive },
+    { label: t('tokenUsage.chart.window_weekly'), color: '#8b5cf6', lw: 1.5, dash: [], id: 'weekly', active: isWeeklyActive },
     { label: '5h', color: '#3b82f680', lw: 1, dash: [3, 3] },
-    { label: 'nap', color: '#f59e0b60', lw: 1, dash: [4, 4] },
-    { label: 'hét', color: '#ef444480', lw: 1.5, dash: [6, 4] },
+    { label: t('tokenUsage.chart.day'), color: '#f59e0b60', lw: 1, dash: [4, 4] },
+    { label: t('tokenUsage.chart.week'), color: '#ef444480', lw: 1.5, dash: [6, 4] },
   ]
   for (const li of lineItems) {
     const tw = ctx.measureText(li.label).width + 34
@@ -7890,13 +11568,13 @@ function renderTuTimeline(data, filterAgent) {
 
     if (hit && my >= pad.top && my <= pad.top + h) {
       const isPeak = tuIsPeakHour(hit.bucket)
-      let html = `<div style="font-weight:600;margin-bottom:4px">${tuFormatLocalShort(hit.bucket)}${isPeak ? ' <span style="color:#ef4444;font-size:10px">CSÚCSIDŐ</span>' : ''}</div>`
+      let html = `<div style="font-weight:600;margin-bottom:4px">${tuFormatLocalShort(hit.bucket)}${isPeak ? ` <span style="color:#ef4444;font-size:10px">${t('tokenUsage.chart.peak')}</span>` : ''}</div>`
       let total = 0
       for (const seg of hit.segments) {
         html += `<div><span style="color:${tuGetColor(seg.agent)}">&#9632;</span> ${seg.agent}: ${tuFormatTokens(seg.val)}</div>`
         total += seg.val
       }
-      if (hit.segments.length > 1) html += `<div style="border-top:1px solid rgba(255,255,255,0.2);margin-top:4px;padding-top:4px;font-weight:600">Összesen: ${tuFormatTokens(total)}</div>`
+      if (hit.segments.length > 1) html += `<div style="border-top:1px solid rgba(255,255,255,0.2);margin-top:4px;padding-top:4px;font-weight:600">${t('tokenUsage.total')} ${tuFormatTokens(total)}</div>`
       if (tuChartState.win5h || tuChartState.winWeekly) {
         const idx = barRects.indexOf(hit)
         if (idx >= 0) {
@@ -7947,15 +11625,15 @@ function renderTuBudgetCards() {
   el.innerHTML = `
     <div class="overview-stat tu-budget-card${tuBudgetView === '5h' ? ' tu-active' : ''}" data-budget="5h"
       style="border-left:3px solid #06b6d4;cursor:pointer;${tuBudgetView === 'weekly' ? 'opacity:0.4;' : ''}transition:opacity 0.2s">
-      <div class="overview-stat-label">5 órás ablak</div>
+      <div class="overview-stat-label">${t('tokenUsage.window_5h_label')}</div>
       <div class="overview-stat-value" style="color:#06b6d4">${tuFormatTokens(cur5h)}</div>
-      <div class="overview-stat-sub">kumulatív az aktuális ablakban</div>
+      <div class="overview-stat-sub">${t('tokenUsage.cumulative_sub')}</div>
     </div>
     <div class="overview-stat tu-budget-card${tuBudgetView === 'weekly' ? ' tu-active' : ''}" data-budget="weekly"
       style="border-left:3px solid #8b5cf6;cursor:pointer;${tuBudgetView === '5h' ? 'opacity:0.4;' : ''}transition:opacity 0.2s">
-      <div class="overview-stat-label">Heti ablak</div>
+      <div class="overview-stat-label">${t('tokenUsage.window_weekly_label')}</div>
       <div class="overview-stat-value" style="color:#8b5cf6">${tuFormatTokens(curWeekly)}</div>
-      <div class="overview-stat-sub">kumulatív az aktuális ablakban</div>
+      <div class="overview-stat-sub">${t('tokenUsage.cumulative_sub')}</div>
     </div>`
 
   el.querySelectorAll('.tu-budget-card').forEach(card => {
@@ -8001,7 +11679,7 @@ function renderTuDetailsTable() {
   if (countEl) countEl.textContent = `${sorted.length} sor`
 
   if (!sorted.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-secondary);font-size:13px;text-align:center;padding:16px">Nincs ilyen hívás a szűrt időszakban</td></tr>'
+    tbody.innerHTML = `<tr><td colspan="5" style="color:var(--text-secondary);font-size:13px;text-align:center;padding:16px">${t('tokenUsage.no_calls')}</td></tr>`
     return
   }
 
@@ -8030,17 +11708,17 @@ function renderTuDetails(data) {
     const thStyle = 'cursor:pointer;user-select:none'
     const thStyleR = thStyle + ';text-align:right'
     el.innerHTML = `<div style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <input id="tuSearchInput" type="text" placeholder="Keresés (ágens, tool, tartalom)..."
+      <input id="tuSearchInput" type="text" placeholder="${t('tokenUsage.search_placeholder')}"
         style="padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-primary);color:var(--text-primary);width:260px;font-size:13px">
       <span id="tuDetailsCount" style="color:var(--text-secondary);font-size:12px"></span>
     </div>
     <div style="overflow-x:auto"><table class="mem-table" style="width:100%;min-width:600px">
       <thead><tr>
-        <th style="${thStyle}" data-sort="timestamp">Idő${arrow('timestamp')}</th>
-        <th style="${thStyle}" data-sort="agent">Ágens${arrow('agent')}</th>
+        <th style="${thStyle}" data-sort="timestamp">${t('tokenUsage.col.time')}${arrow('timestamp')}</th>
+        <th style="${thStyle}" data-sort="agent">${t('tokenUsage.col.agent')}${arrow('agent')}</th>
         <th style="${thStyleR}" data-sort="input">Input${arrow('input')}</th>
         <th style="${thStyleR}" data-sort="output">Output${arrow('output')}</th>
-        <th>Tartalom</th>
+        <th>${t('tokenUsage.col.content')}</th>
       </tr></thead>
       <tbody id="tuDetailsTbody"></tbody>
     </table></div>`
@@ -8056,7 +11734,7 @@ function renderTuDetails(data) {
         th.closest('thead').querySelectorAll('th[data-sort]').forEach(h => {
           const c = h.dataset.sort
           const arrow = tuDetailSort.col === c ? (tuDetailSort.dir === 'asc' ? ' ▲' : ' ▼') : ''
-          const labels = { timestamp: 'Idő', agent: 'Ágens', input: 'Input', output: 'Output' }
+          const labels = { timestamp: t('tokenUsage.col.time'), agent: t('tokenUsage.col.agent'), input: 'Input', output: 'Output' }
           h.textContent = (labels[c] || c) + arrow
         })
         renderTuDetailsTable()
@@ -8093,15 +11771,15 @@ async function tuFetchDetails() {
 document.getElementById('tuCollectBtn')?.addEventListener('click', async () => {
   const btn = document.getElementById('tuCollectBtn')
   btn.disabled = true
-  btn.textContent = 'Gyűjtés...'
+  btn.textContent = t('tokenUsage.collect_btn.collecting')
   try {
     const res = await fetch('/api/token-usage/collect', { method: 'POST' }).then(r => r.json())
-    btn.textContent = `Kész (${res.inserted || 0} új)`
-    setTimeout(() => { btn.textContent = 'Gyűjtés'; btn.disabled = false }, 2000)
+    btn.textContent = t('tokenUsage.collect_done', { n: res.inserted || 0 })
+    setTimeout(() => { btn.textContent = t('tokenUsage.collect_btn.collect'); btn.disabled = false }, 2000)
     loadTokenUsage()
   } catch {
-    btn.textContent = 'Hiba!'
-    setTimeout(() => { btn.textContent = 'Gyűjtés'; btn.disabled = false }, 2000)
+    btn.textContent = t('tokenUsage.collect_error')
+    setTimeout(() => { btn.textContent = t('tokenUsage.collect_btn.collect'); btn.disabled = false }, 2000)
   }
 })
 
@@ -8115,7 +11793,1547 @@ window.addEventListener('resize', () => {
   }
 })
 
+// ============================================================
+// Ideas (Ötletláda)
+// ============================================================
+let ideas = []
+let ideasPromoteId = null
+let ideaEditId = null
+let ideaDetailId = null
+const STATUS_COLORS = { new: 'var(--accent)', reviewed: '#f59e0b', kanban: '#22c55e', rejected: '#ef4444' }
+const STATUS_LABELS = { new: () => t('ideas.status.new'), reviewed: () => t('ideas.status.reviewed'), kanban: () => t('ideas.status.kanban'), rejected: () => t('ideas.status.rejected') }
+
+async function loadIdeasPage() {
+  const statusFilter = document.getElementById('ideaStatusFilter')?.value ?? 'active'
+  const categoryFilter = document.getElementById('ideaCategoryFilter')?.value || ''
+  const params = new URLSearchParams()
+  // 'active' = new+reviewed, fetched unfiltered then narrowed client-side
+  if (statusFilter && statusFilter !== 'active') params.set('status', statusFilter)
+  if (categoryFilter) params.set('category', categoryFilter)
+  const [ideasRes, catsRes] = await Promise.all([fetch('/api/ideas?' + params), fetch('/api/ideas/categories')])
+  ideas = await ideasRes.json()
+  if (statusFilter === 'active') ideas = ideas.filter(i => i.status === 'new' || i.status === 'reviewed')
+  const cats = await catsRes.json()
+  const catSel = document.getElementById('ideaCategoryFilter')
+  if (catSel) {
+    const prev = catSel.value
+    catSel.innerHTML = `<option value="">${t('ideas.filter.all_categories')}</option>` + cats.map(c => `<option value="${escapeHtml(c)}" ${c === prev ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')
+  }
+  renderIdeasStats()
+  renderIdeasList()
+}
+
+function renderIdeasStats() {
+  const counts = { new: 0, reviewed: 0, kanban: 0, rejected: 0 }
+  for (const i of ideas) counts[i.status] = (counts[i.status] || 0) + 1
+  const el = document.getElementById('ideasStats')
+  if (!el) return
+  el.innerHTML = Object.entries(counts).map(([s, n]) =>
+    `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 16px;min-width:90px">
+      <div style="font-size:22px;font-weight:700;color:${STATUS_COLORS[s]}">${n}</div>
+      <div style="font-size:12px;color:var(--text-muted)">${typeof STATUS_LABELS[s] === 'function' ? STATUS_LABELS[s]() : STATUS_LABELS[s]}</div>
+    </div>`
+  ).join('')
+}
+
+function renderIdeasList() {
+  const el = document.getElementById('ideasList')
+  if (!el) return
+  if (!ideas.length) { el.innerHTML = `<div style="color:var(--text-muted);padding:32px;text-align:center">${t('ideas.empty')}</div>`; return }
+  const byCategory = {}
+  for (const idea of ideas) {
+    if (!byCategory[idea.category]) byCategory[idea.category] = []
+    byCategory[idea.category].push(idea)
+  }
+  el.innerHTML = Object.entries(byCategory).map(([cat, items]) => `
+    <div style="margin-bottom:8px">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);padding:4px 0 6px">${escapeHtml(cat)}</div>
+      ${items.map(renderIdeaCard).join('')}
+    </div>`).join('')
+}
+
+function ideaScoreBadge(idea) {
+  if (!idea.impact || !idea.effort) return ''
+  const score = idea.impact - idea.effort
+  const color = score > 0 ? '#22c55e' : score < 0 ? '#ef4444' : 'var(--text-muted)'
+  return `<span style="font-size:11px;color:${color};border:1px solid ${color};border-radius:4px;padding:2px 5px" title="Impact ${idea.impact} - Effort ${idea.effort}">I${idea.impact}·E${idea.effort}</span>`
+}
+
+function renderIdeaCard(idea) {
+  const statusColor = STATUS_COLORS[idea.status] || 'var(--text-muted)'
+  const statusLabelRaw = STATUS_LABELS[idea.status]; const statusLabel = statusLabelRaw ? (typeof statusLabelRaw === 'function' ? statusLabelRaw() : statusLabelRaw) : idea.status
+  const desc = idea.description ? `<div style="font-size:12px;color:var(--text-muted);margin-top:4px">${escapeHtml(idea.description.slice(0, 120))}${idea.description.length > 120 ? '…' : ''}</div>` : ''
+  const staleBadge = idea.stale ? `<span style="font-size:11px;background:#92400e22;color:#d97706;border:1px solid #d97706;border-radius:4px;padding:2px 5px" title="${t('ideas.stale_tooltip')}">${t('ideas.stale_badge')}</span>` : ''
+  return `<div class="card" style="padding:12px 16px;margin-bottom:4px${idea.stale ? ';border-left:3px solid #d97706' : ''}">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="idea-title-link" style="font-weight:600;font-size:14px;cursor:pointer" onclick="openIdeaDetail('${idea.id}')">${escapeHtml(idea.title)}</span>
+          <span style="font-size:11px;color:${statusColor};padding:2px 6px;border:1px solid ${statusColor};border-radius:4px">${statusLabel}</span>
+          ${ideaScoreBadge(idea)}
+          ${staleBadge}
+        </div>
+        ${desc}
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
+        ${idea.status !== 'reviewed' && idea.status !== 'kanban' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','reviewed')" style="font-size:11px">${t('ideas.btn.reviewed')}</button>` : ''}
+        ${idea.status !== 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','rejected')" style="font-size:11px;color:#ef4444">${t('ideas.btn.rejected')}</button>` : ''}
+        ${idea.status === 'reviewed' || idea.status === 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','new')" style="font-size:11px">${t('ideas.btn.reopen')}</button>` : ''}
+        <button class="btn-secondary btn-compact" onclick="openIdeaEdit('${idea.id}')" style="font-size:11px">${t('ideas.btn.edit')}</button>
+        ${idea.status !== 'kanban' && idea.status !== 'rejected' ? `<button class="btn-primary btn-compact" onclick="openIdeaBreakdown('${idea.id}')" style="font-size:11px">${t('ideas.btn.kanban_ai')}</button>` : ''}
+        <button class="btn-secondary btn-compact" onclick="deleteIdeaItem('${idea.id}')" style="font-size:11px;color:#ef4444">${t('ideas.btn.delete')}</button>
+      </div>
+    </div>
+  </div>`
+}
+
+function applyIdeaModalI18n() {
+  const labels = document.querySelectorAll('#ideaModalOverlay .form-label')
+  const keys = ['ideas.modal.title_label', 'ideas.modal.desc_label', 'ideas.modal.category_label', 'ideas.modal.impact_label', 'ideas.modal.effort_label']
+  labels.forEach((el, i) => { if (keys[i]) el.textContent = t(keys[i]) })
+  const saveBtn = document.getElementById('ideaModalSave')
+  const cancelBtn = document.getElementById('ideaModalCancel')
+  if (saveBtn) saveBtn.textContent = t('ideas.modal.save_btn')
+  if (cancelBtn) cancelBtn.textContent = t('ideas.modal.cancel_btn')
+}
+
+function openIdeaNew() {
+  ideaEditId = null
+  document.getElementById('ideaModalTitle').textContent = t('ideas.modal.title_new')
+  document.getElementById('ideaTitleInput').value = ''
+  document.getElementById('ideaDescInput').value = ''
+  applyIdeaModalI18n()
+  openModal(document.getElementById('ideaModalOverlay'))
+}
+
+function openIdeaEdit(id) {
+  const idea = ideas.find(i => i.id === id)
+  if (!idea) return
+  ideaEditId = id
+  document.getElementById('ideaModalTitle').textContent = t('ideas.modal.title_edit')
+  document.getElementById('ideaTitleInput').value = idea.title
+  document.getElementById('ideaDescInput').value = idea.description || ''
+  document.getElementById('ideaCategoryInput').value = idea.category
+  document.getElementById('ideaImpactInput').value = idea.impact ?? ''
+  document.getElementById('ideaEffortInput').value = idea.effort ?? ''
+  openModal(document.getElementById('ideaModalOverlay'))
+}
+
+async function saveIdea() {
+  const title = document.getElementById('ideaTitleInput').value.trim()
+  if (!title) { showToast(t('common.title') + ' ' + t('common.error'), 'error'); return }
+  const impactRaw = document.getElementById('ideaImpactInput').value
+  const effortRaw = document.getElementById('ideaEffortInput').value
+  const body = {
+    title,
+    description: document.getElementById('ideaDescInput').value.trim() || undefined,
+    category: document.getElementById('ideaCategoryInput').value,
+    source: 'manual',
+    impact: impactRaw ? parseInt(impactRaw) : null,
+    effort: effortRaw ? parseInt(effortRaw) : null,
+  }
+  if (ideaEditId) {
+    await fetch(`/api/ideas/${ideaEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  } else {
+    await fetch('/api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
+  }
+  closeModal(document.getElementById('ideaModalOverlay'))
+  loadIdeasPage()
+}
+
+async function deleteIdeaItem(id) {
+  if (!confirm(t('kanban.confirm.delete'))) return
+  await fetch(`/api/ideas/${id}`, { method: 'DELETE' })
+  loadIdeasPage()
+}
+
+// --- Idea detail modal (comments + impact/effort view) ---
+
+async function openIdeaDetail(id) {
+  const idea = ideas.find(i => i.id === id)
+  if (!idea) return
+  ideaDetailId = id
+  const statusLabel = STATUS_LABELS[idea.status] || idea.status
+  document.getElementById('ideaDetailTitle').textContent = idea.title
+  document.getElementById('ideaDetailMeta').textContent = `${idea.category} · ${statusLabel}`
+  document.getElementById('ideaDetailDesc').textContent = idea.description || t('ideas.no_description')
+  document.getElementById('ideaDetailImpact').value = idea.impact ?? ''
+  document.getElementById('ideaDetailEffort').value = idea.effort ?? ''
+  updateDetailScoreChip()
+  document.getElementById('ideaCommentsList').innerHTML = ''
+  document.getElementById('ideaCommentContent').value = ''
+  openModal(document.getElementById('ideaDetailOverlay'))
+  await loadIdeaComments(id)
+}
+
+function updateDetailScoreChip() {
+  const chip = document.getElementById('ideaDetailScoreChip')
+  if (!chip) return
+  const impact = Number(document.getElementById('ideaDetailImpact').value) || 0
+  const effort = Number(document.getElementById('ideaDetailEffort').value) || 0
+  if (!impact && !effort) { chip.textContent = ''; return }
+  if (!impact || !effort) { chip.textContent = ''; return }
+  const score = impact - effort
+  const color = score > 0 ? '#22c55e' : score < 0 ? '#ef4444' : 'var(--text-muted)'
+  chip.innerHTML = `<span class="idea-score-chip" style="border-color:${color};color:${color}">Pont: <strong>${score >= 0 ? '+' : ''}${score}</strong></span>`
+}
+
+document.getElementById('ideaDetailImpact')?.addEventListener('change', updateDetailScoreChip)
+document.getElementById('ideaDetailEffort')?.addEventListener('change', updateDetailScoreChip)
+
+document.getElementById('ideaDetailScoreSave')?.addEventListener('click', async () => {
+  if (!ideaDetailId) return
+  const impact = document.getElementById('ideaDetailImpact').value
+  const effort = document.getElementById('ideaDetailEffort').value
+  try {
+    const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        impact: impact ? Number(impact) : null,
+        effort: effort ? Number(effort) : null,
+      }),
+    })
+    if (!res.ok) { showToast(t('ideas.toast.score_saved_error'), 'error'); return }
+    // update local cache so card chip refreshes on close
+    const idea = ideas.find(i => i.id === ideaDetailId)
+    if (idea) {
+      idea.impact = impact ? Number(impact) : null
+      idea.effort = effort ? Number(effort) : null
+    }
+    updateDetailScoreChip()
+    showToast(t('ideas.toast.score_saved'))
+    renderIdeasList()
+  } catch { showToast(t('ideas.toast.score_saved_error'), 'error') }
+})
+
+async function loadIdeaComments(id) {
+  const list = document.getElementById('ideaCommentsList')
+  try {
+    const res = await fetch(`/api/ideas/${encodeURIComponent(id)}/comments`)
+    const data = await res.json()
+    if (!data.comments || !data.comments.length) {
+      list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:6px 0">${t('ideas.comments.empty')}</div>`
+      return
+    }
+    list.innerHTML = ''
+    for (const c of data.comments) {
+      const date = new Date(c.created_at * 1000).toLocaleString('hu-HU', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      const div = document.createElement('div')
+      div.className = 'comment-item'
+      div.innerHTML = `<div style="display:flex;align-items:baseline;gap:6px;margin-bottom:4px"><span class="comment-author">${escapeHtml(c.author)}</span><span class="comment-date">${date}</span></div><div class="comment-body">${escapeHtml(c.content)}</div>`
+      list.appendChild(div)
+    }
+  } catch {
+    list.innerHTML = `<div style="color:var(--danger);font-size:12px">${t('ideas.comments.error')}</div>`
+  }
+}
+
+document.getElementById('ideaCommentSubmit')?.addEventListener('click', async () => {
+  if (!ideaDetailId) return
+  const content = document.getElementById('ideaCommentContent').value.trim()
+  if (!content) { document.getElementById('ideaCommentContent').focus(); return }
+  try {
+    const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    })
+    if (!res.ok) { showToast(t('ideas.toast.comment_error'), 'error'); return }
+    document.getElementById('ideaCommentContent').value = ''
+    await loadIdeaComments(ideaDetailId)
+  } catch { showToast(t('ideas.toast.comment_error'), 'error') }
+})
+
+document.getElementById('ideaDetailClose')?.addEventListener('click', () => closeModal(document.getElementById('ideaDetailOverlay')))
+document.getElementById('ideaDetailCloseBtn')?.addEventListener('click', () => closeModal(document.getElementById('ideaDetailOverlay')))
+document.getElementById('ideaDetailEditBtn')?.addEventListener('click', () => {
+  if (!ideaDetailId) return
+  closeModal(document.getElementById('ideaDetailOverlay'))
+  openIdeaEdit(ideaDetailId)
+})
+
+function openIdeaPromote(id) {
+  ideasPromoteId = id
+  openModal(document.getElementById('ideaPromoteOverlay'))
+}
+
+async function promoteIdea(phase) {
+  if (!ideasPromoteId) return
+  const res = await fetch(`/api/ideas/${ideasPromoteId}/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phase }) })
+  const data = await res.json()
+  ideasPromoteId = null
+  closeModal(document.getElementById('ideaPromoteOverlay'))
+  if (data.ok) showToast(t('kanban.toast.card_created') + ': ' + data.kanban_id)
+  loadIdeasPage()
+}
+
+async function setIdeaStatus(id, status) {
+  try {
+    const res = await fetch(`/api/ideas/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
+    if (!res.ok) { showToast(t('ideas.toast.status_error')); return }
+    loadIdeasPage()
+  } catch { showToast(t('ideas.toast.status_error')) }
+}
+
+// Promote an idea to the board via AI breakdown + per-subtask approval.
+// Reuses the shared breakdown modal (breakdownMode='idea').
+async function openIdeaBreakdown(id) {
+  const idea = ideas.find(i => i.id === id)
+  if (!idea) return
+  // The breakdown modal's assignee dropdown reads kanbanAssignees, which is only
+  // populated by loadKanban(). If the user lands here without visiting the board,
+  // fetch it so the AI-suggested assignees are selectable.
+  if (!kanbanAssignees.length) {
+    try { kanbanAssignees = await (await fetch('/api/kanban/assignees')).json() } catch { /* dropdown falls back to "nincs" */ }
+  }
+  showToast(t('ideas.toast.ai_elaborating'))
+  try {
+    const res = await fetch(`/api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+    const data = await res.json()
+    if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
+    if (!data.subtasks || !data.subtasks.length) { showToast('Az AI nem adott vissza alfeladatot'); return }
+    breakdownMode = 'idea'
+    breakdownIdeaId = id
+    breakdownSubtasks = data.subtasks
+    showBreakdownModal(data.subtasks, { title: idea.title })
+    // Show DoD field only in idea mode
+    const dodSection = document.getElementById('breakdownDoDSection')
+    if (dodSection) { dodSection.style.display = ''; document.getElementById('breakdownSuccessCriteria').value = '' }
+  } catch {
+    showToast('Breakdown hiba')
+  }
+}
+
+document.getElementById('ideaNewBtn')?.addEventListener('click', openIdeaNew)
+document.getElementById('ideaModalClose')?.addEventListener('click', () => { closeModal(document.getElementById('ideaModalOverlay')) })
+document.getElementById('ideaModalCancel')?.addEventListener('click', () => { closeModal(document.getElementById('ideaModalOverlay')) })
+document.getElementById('ideaModalSave')?.addEventListener('click', saveIdea)
+document.getElementById('ideaPromoteClose')?.addEventListener('click', () => { closeModal(document.getElementById('ideaPromoteOverlay')) })
+document.getElementById('ideaPromoteCancel')?.addEventListener('click', () => { closeModal(document.getElementById('ideaPromoteOverlay')) })
+document.getElementById('ideaPromoteDetail')?.addEventListener('click', () => promoteIdea('detail'))
+document.getElementById('ideaPromotePlan')?.addEventListener('click', () => promoteIdea('plan'))
+document.getElementById('ideaStatusFilter')?.addEventListener('change', loadIdeasPage)
+document.getElementById('ideaCategoryFilter')?.addEventListener('change', loadIdeasPage)
+
+
+// === Agent reauth login flow ===
+async function handleAgentLogin(agentName, btn) {
+  const phase = btn.dataset.phase || 'start'
+  btn.disabled = true
+  const origText = btn.textContent
+  btn.textContent = phase === 'start' ? t('agents.auth.btn_starting') : t('agents.auth.btn_confirming')
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phase }),
+    })
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || 'HTTP ' + res.status) }
+    if (phase === 'start') {
+      btn.dataset.phase = 'confirm'
+      btn.textContent = t('agents.auth.btn_confirm')
+      btn.disabled = false
+      showToast(t('agents.auth.toast_started'))
+    } else {
+      btn.textContent = t('agents.auth.btn_logged_in')
+      showToast(t('agents.auth.toast_success'))
+      setTimeout(() => loadAgents(), 1500)
+    }
+  } catch (e) {
+    showToast('Hiba: ' + (e.message || e))
+    btn.textContent = origText
+    btn.dataset.phase = 'start'
+    btn.disabled = false
+  }
+}
+
+// === Agent terminal modal (xterm.js) ===
+let terminalInstance = null
+let terminalSSE = null
+let terminalFit = null
+// Master input gate (mirrors the server-side terminal-input toggle). Keystrokes
+// are dropped locally when OFF so we never spam the audit log with 403s; the
+// server enforces the same gate independently (fail-closed). Owner flips it via
+// the checkbox in the modal header (POST /api/terminal-input).
+let terminalInputEnabled = false
+
+function syncTerminalInputToggleUI() {
+  const cb = document.getElementById('terminalInputToggle')
+  const label = document.getElementById('terminalInputToggleLabel')
+  if (cb) cb.checked = terminalInputEnabled
+  if (label) {
+    label.textContent = terminalInputEnabled ? 'Input on' : 'Input off'
+    label.style.color = terminalInputEnabled ? '#8fbf6f' : '#b8b2a6'
+  }
+}
+
+function openTerminalModal(agentName) {
+  const overlay = document.getElementById('terminalOverlay')
+  const container = document.getElementById('terminalContainer')
+  const title = document.getElementById('terminalModalTitle')
+  if (!overlay || !container) return
+
+  title.textContent = agentName + ' - Terminal'
+
+  // Read the current server-side gate so the modal reflects reality on open.
+  fetch('/api/terminal-input')
+    .then(r => r.ok ? r.json() : { enabled: false })
+    .then(d => { terminalInputEnabled = d.enabled === true; syncTerminalInputToggleUI() })
+    .catch(() => { terminalInputEnabled = false; syncTerminalInputToggleUI() })
+
+  // Cleanup previous
+  if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
+  if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+  container.innerHTML = ''
+
+  // Init xterm — fontSize 12 + wider modal fits ~140 chars of tmux output
+  const term = new window.Terminal({
+    theme: { background: '#1a1a1a', foreground: '#e8e4da' },
+    fontFamily: 'JetBrains Mono, Menlo, monospace',
+    fontSize: 12,
+    cursorBlink: false,
+    disableStdin: false,
+    scrollback: 4000,
+    convertEol: true,
+    allowProposedApi: true,
+  })
+  const fitAddon = new window.FitAddon.FitAddon()
+  term.loadAddon(fitAddon)
+  term.open(container)
+  fitAddon.fit()
+  terminalInstance = term
+  terminalFit = fitAddon
+
+  openModal(overlay)
+  setTimeout(() => term.focus(), 50)
+
+  // SSE pane stream.
+  // The pane snapshot now includes scrollback history (server uses
+  // `capture-pane -S -2000`), so the user can scroll back. To keep scrolling
+  // stable we (a) only repaint when the snapshot actually changed, and (b) only
+  // repaint while the viewport is at the bottom — if the user has scrolled up we
+  // freeze their view and resume painting when they return to the bottom (the
+  // onScroll handler below). The repaint clears the scrollback (CSI 3 J) before
+  // rewriting the full snapshot so frames don't accumulate duplicate history.
+  let latestPane = null
+  let paintedPane = null
+  const isAtBottom = () => {
+    const buf = term.buffer.active
+    return buf.viewportY >= buf.baseY
+  }
+  const repaint = () => {
+    if (latestPane === null || latestPane === paintedPane) return
+    if (!isAtBottom()) return // user scrolled up — keep their view put
+    paintedPane = latestPane
+    term.write('\x1b[3J\x1b[2J\x1b[H' + latestPane)
+  }
+  const token = localStorage.getItem('marveen-dashboard-token') || ''
+  const sse = new EventSource(`/api/agents/${encodeURIComponent(agentName)}/pane/stream?token=${encodeURIComponent(token)}`)
+  sse.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data)
+      if (msg.pane !== undefined) {
+        latestPane = msg.pane.replace(/\x1b]8;[^\x1b]*\x1b\\/g, '')
+        repaint()
+      }
+    } catch {}
+  }
+  sse.onerror = () => term.write(`\r\n${t('terminal.stream_error')}\r\n`)
+  terminalSSE = sse
+  // When the user scrolls back down to the bottom, resume live repainting.
+  term.onScroll(() => { if (isAtBottom()) repaint() })
+
+  // Single onData handler — maps escape sequences to {special}, plain chars to {keys}
+  // Using onData only (no onKey) avoids double-firing on arrow/Enter keys.
+  // PageUp/PageDown are intentionally NOT forwarded: they scroll the xterm
+  // scrollback locally (history viewing) instead of going to the agent.
+  const ESC_TO_SPECIAL = {
+    '\r': 'Enter', '\x1b': 'Escape',
+    '\x1b[A': 'Up', '\x1b[B': 'Down', '\x1b[C': 'Right', '\x1b[D': 'Left',
+    '\x7f': 'BSpace', '\t': 'Tab', '\x1b[Z': 'S-Tab',
+    '\x03': 'C-c', '\x04': 'C-d', '\x15': 'C-u', '\x0c': 'C-l',
+  }
+  term.onData(data => {
+    if (data === '\x1b[5~') { term.scrollPages(-1); return } // PageUp -> scroll history up
+    if (data === '\x1b[6~') { term.scrollPages(1); return }  // PageDown -> scroll history down
+    if (!terminalInputEnabled) {
+      // Read-only mode: input gate is OFF. Drop the keystroke locally (server
+      // would 403 it anyway) and nudge the user to the toggle.
+      showToast('Terminal input is off. Enable it with the header toggle first.')
+      return
+    }
+    const special = ESC_TO_SPECIAL[data]
+    const body = special ? { special } : { keys: data }
+    fetch(`/api/agents/${encodeURIComponent(agentName)}/keys`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {})
+  })
+
+  // Resize fit on modal resize — observe the modal wrapper (not the xterm container
+  // itself) to avoid a ResizeObserver->fit->resize->ResizeObserver infinite loop
+  let fitTimer = null
+  const ro = new ResizeObserver(() => {
+    clearTimeout(fitTimer)
+    fitTimer = setTimeout(() => { try { fitAddon.fit() } catch {} }, 50)
+  })
+  const modalEl = container.closest('.terminal-modal') || container.parentElement
+  if (modalEl) ro.observe(modalEl)
+}
+
+document.getElementById('terminalClose')?.addEventListener('click', () => {
+  const overlay = document.getElementById('terminalOverlay')
+  if (overlay) closeModal(overlay)
+  if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
+  if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+})
+
+// Owner flips the master terminal-input gate. Optimistically reflect the desired
+// state, POST it, then reconcile with the server's authoritative response.
+document.getElementById('terminalInputToggle')?.addEventListener('change', (e) => {
+  const desired = e.target.checked === true
+  fetch('/api/terminal-input', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: desired }),
+  })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => {
+      terminalInputEnabled = d.enabled === true
+      syncTerminalInputToggleUI()
+      showToast(terminalInputEnabled ? 'Terminal input enabled (audit-logged)' : 'Terminal input disabled')
+    })
+    .catch(() => {
+      terminalInputEnabled = false
+      syncTerminalInputToggleUI()
+      showToast('Could not change terminal input state')
+    })
+})
+
+// === Agent conversation (readable transcript) modal ===
+// Renders the agent's Claude Code transcript as a chat-style timeline: inbound
+// Telegram messages, the agent's replies, and (optionally) its notes/actions.
+// Solves what the raw terminal can't: a readable, searchable review of what
+// actually happened -- also the support view for customer-hosted Marveens.
+const CONVERSATION_PAGE_SIZE = 400
+let conversationEntries = []
+let conversationAgentName = null
+let conversationHasOlder = false
+let conversationLoadingOlder = false
+
+async function openConversationModal(agentName, displayName) {
+  const overlay = document.getElementById('conversationOverlay')
+  const container = document.getElementById('conversationContainer')
+  const title = document.getElementById('conversationModalTitle')
+  if (!overlay || !container) return
+  conversationAgentName = agentName
+  title.textContent = t('conversation.title', { name: displayName || agentName })
+  container.innerHTML = `<div class="conversation-empty">${t('conversation.loading')}</div>`
+  openModal(overlay)
+  await loadConversation()
+}
+
+// Latest page (offset=0); resets the loaded window.
+async function loadConversation() {
+  const container = document.getElementById('conversationContainer')
+  const token = localStorage.getItem('marveen-dashboard-token') || ''
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=0`, {
+      headers: { 'Authorization': 'Bearer ' + token },
+    })
+    const d = await r.json()
+    conversationEntries = Array.isArray(d.entries) ? d.entries : []
+    conversationHasOlder = !!d.hasOlder
+    renderConversation()
+  } catch {
+    if (container) container.innerHTML = `<div class="conversation-empty">${t('conversation.error')}</div>`
+  }
+}
+
+// Page further back: fetch the window of entries immediately before the oldest
+// loaded one and PREPEND it, keeping the scroll position so the view does not
+// jump. Lets the operator read history beyond the on-screen window (and beyond
+// the old fixed cap).
+async function loadOlderConversation() {
+  if (conversationLoadingOlder || !conversationHasOlder) return
+  conversationLoadingOlder = true
+  const btn = document.getElementById('conversationLoadOlder')
+  if (btn) { btn.disabled = true; btn.textContent = t('conversation.loading') }
+  const token = localStorage.getItem('marveen-dashboard-token') || ''
+  try {
+    const offset = conversationEntries.length
+    const r = await fetch(`/api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=${offset}`, {
+      headers: { 'Authorization': 'Bearer ' + token },
+    })
+    const d = await r.json()
+    const older = Array.isArray(d.entries) ? d.entries : []
+    conversationHasOlder = !!d.hasOlder
+    if (older.length) {
+      conversationEntries = older.concat(conversationEntries)
+      renderConversation({ preserveScroll: true })
+    } else {
+      renderConversation()
+    }
+  } catch {
+    if (btn) { btn.disabled = false; btn.textContent = t('conversation.load_more') }
+  } finally {
+    conversationLoadingOlder = false
+  }
+}
+
+function fmtConvTs(ts) {
+  if (!ts) return ''
+  try {
+    return new Date(ts).toLocaleString('hu-HU', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  } catch { return '' }
+}
+
+function renderConversation(opts = {}) {
+  const container = document.getElementById('conversationContainer')
+  if (!container) return
+  const prevH = container.scrollHeight
+  const prevTop = container.scrollTop
+  const q = (document.getElementById('conversationSearch')?.value || '').toLowerCase().trim()
+  const showActions = document.getElementById('conversationShowActions')?.checked
+  let list = conversationEntries
+  if (!showActions) list = list.filter(e => e.kind === 'in' || e.kind === 'out')
+  if (q) list = list.filter(e => (e.text || '').toLowerCase().includes(q))
+  // "Korábbiak betöltése" sits at the top so the operator can page further back;
+  // shown whenever the server still has older entries beyond the loaded window.
+  const olderBtn = conversationHasOlder
+    ? `<button id="conversationLoadOlder" class="conv-load-older">${t('conversation.load_more')}</button>`
+    : ''
+  if (!list.length) {
+    container.innerHTML = olderBtn || `<div class="conversation-empty">${t('conversation.empty')}</div>`
+  } else {
+    container.innerHTML = olderBtn + list.map(renderConvEntry).join('')
+  }
+  document.getElementById('conversationLoadOlder')?.addEventListener('click', loadOlderConversation)
+  if (opts.preserveScroll) {
+    // After prepending older messages, keep the previously-visible ones in place.
+    container.scrollTop = prevTop + (container.scrollHeight - prevH)
+  } else {
+    container.scrollTop = container.scrollHeight
+  }
+}
+
+function renderConvEntry(e) {
+  const ts = fmtConvTs(e.ts)
+  const txt = escapeHtml(e.text || '').replace(/\n/g, '<br>')
+  if (e.kind === 'in') {
+    return `<div class="conv-row conv-in"><div class="conv-bubble"><div class="conv-meta">Telegram be · ${ts}</div><div class="conv-text">${txt}</div></div></div>`
+  }
+  if (e.kind === 'out') {
+    const lbl = escapeHtml(e.label || t('messages.conv.reply_label'))
+    return `<div class="conv-row conv-out"><div class="conv-bubble"><div class="conv-meta">${lbl} · ${ts}</div><div class="conv-text">${txt}</div></div></div>`
+  }
+  if (e.kind === 'note') {
+    return `<div class="conv-row conv-note"><div class="conv-note-text">📝 ${txt}</div></div>`
+  }
+  return `<div class="conv-row conv-action"><div class="conv-action-text">⚙ ${txt}<span class="conv-action-ts">${ts}</span></div></div>`
+}
+
+document.getElementById('conversationClose')?.addEventListener('click', () => {
+  const overlay = document.getElementById('conversationOverlay')
+  if (overlay) closeModal(overlay)
+})
+document.getElementById('conversationSearch')?.addEventListener('input', () => renderConversation())
+document.getElementById('conversationShowActions')?.addEventListener('change', () => renderConversation())
+document.getElementById('conversationRefresh')?.addEventListener('click', () => loadConversation())
 ;(() => {
-  const p = new URLSearchParams(window.location.search).get('page')
-  if (p) switchPage(p)
+  function routeFromHash() {
+    let pageId = decodeURIComponent((location.hash || '').replace(/^#/, ''))
+    if (!pageId) pageId = new URLSearchParams(window.location.search).get('page') || ''
+    if (pageId && document.getElementById(pageId + 'Page')) switchPage(pageId)
+  }
+  window.addEventListener('hashchange', routeFromHash)
+  routeFromHash()
+})()
+
+// ============================================================
+// === Docs (read-only viewer for the project's docs/ folder) ===
+// ============================================================
+
+function escapeAttr(s) {
+  return escapeHtml(String(s)).replace(/"/g, '&quot;')
+}
+
+// Minimal, dependency-free Markdown -> HTML renderer. Inputs come from the
+// repo's own docs/ folder (trusted), but we HTML-escape everything anyway and
+// only emit a fixed set of tags. Covers the constructs our docs use: fenced
+// code, headings, hr, tables, ordered/unordered lists, blockquotes, paragraphs,
+// and inline code/bold/italic/links.
+function mdInline(text) {
+  let s = escapeHtml(text)
+  s = s.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>')
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) =>
+    '<a href="' + escapeAttr(url) + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>')
+  return s
+}
+
+function renderMarkdown(md) {
+  const lines = String(md).replace(/\r\n/g, '\n').split('\n')
+  const out = []
+  let i = 0
+  const isBlockStart = (l) =>
+    /^```/.test(l) || /^(#{1,6})\s/.test(l) || /^\s*[-*]\s+/.test(l) ||
+    /^\s*\d+\.\s+/.test(l) || /^\s*\|.*\|\s*$/.test(l) || /^\s*>\s?/.test(l) ||
+    /^\s*([-*_])\1{2,}\s*$/.test(l) || /^\s*$/.test(l)
+  while (i < lines.length) {
+    const line = lines[i]
+    const fence = line.match(/^```(\w*)\s*$/)
+    if (fence) {
+      const code = []
+      i++
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i++ }
+      i++
+      out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>')
+      continue
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/)
+    if (h) { const lvl = h[1].length; out.push('<h' + lvl + '>' + mdInline(h[2].trim()) + '</h' + lvl + '>'); i++; continue }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { out.push('<hr>'); i++; continue }
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length &&
+        /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes('-')) {
+      const parseRow = (r) => r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim())
+      const headers = parseRow(line)
+      i += 2
+      const rows = []
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { rows.push(parseRow(lines[i])); i++ }
+      let t = '<table><thead><tr>' + headers.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead><tbody>'
+      for (const r of rows) t += '<tr>' + r.map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>'
+      t += '</tbody></table>'
+      out.push(t)
+      continue
+    }
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = []
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*[-*]\s+/, '')); i++ }
+      out.push('<ul>' + items.map(it => '<li>' + mdInline(it) + '</li>').join('') + '</ul>')
+      continue
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = []
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*\d+\.\s+/, '')); i++ }
+      out.push('<ol>' + items.map(it => '<li>' + mdInline(it) + '</li>').join('') + '</ol>')
+      continue
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const q = []
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++ }
+      out.push('<blockquote>' + q.map(mdInline).join('<br>') + '</blockquote>')
+      continue
+    }
+    if (/^\s*$/.test(line)) { i++; continue }
+    const para = []
+    while (i < lines.length && !isBlockStart(lines[i])) { para.push(lines[i]); i++ }
+    if (para.length) out.push('<p>' + para.map(mdInline).join('<br>') + '</p>')
+  }
+  return out.join('\n')
+}
+
+async function loadDocs() {
+  const listEl = document.getElementById('docsList')
+  const contentEl = document.getElementById('docsContent')
+  if (!listEl) return
+  listEl.innerHTML = '<p class="muted">' + t('docs.loading') + '</p>'
+  let docs = []
+  try {
+    const res = await fetch('/api/docs')
+    docs = await res.json()
+    if (!Array.isArray(docs)) docs = []
+  } catch (e) {
+    listEl.innerHTML = '<p class="muted">' + t('docs.list_load_error') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
+    return
+  }
+  if (!docs.length) {
+    listEl.innerHTML = '<p class="muted">' + t('docs.empty_list') + '</p>'
+    if (contentEl) contentEl.innerHTML = '<p class="muted">' + t('docs.empty_content') + '</p>'
+    return
+  }
+  listEl.innerHTML = docs.map(d =>
+    '<a href="#" class="docs-list-item" data-doc="' + escapeAttr(d.name) + '">' +
+      '<span class="docs-list-title">' + escapeHtml(d.title || d.name) + '</span>' +
+      (d.created ? '<span class="docs-list-date">' + escapeHtml(d.created) + '</span>' : '') +
+    '</a>'
+  ).join('')
+  listEl.querySelectorAll('.docs-list-item').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      listEl.querySelectorAll('.docs-list-item').forEach(x => x.classList.remove('active'))
+      a.classList.add('active')
+      openDoc(a.dataset.doc)
+    })
+  })
+  const first = listEl.querySelector('.docs-list-item')
+  if (first) { first.classList.add('active'); openDoc(first.dataset.doc) }
+}
+
+async function openDoc(name) {
+  const contentEl = document.getElementById('docsContent')
+  if (!contentEl) return
+  contentEl.innerHTML = '<p class="muted">' + t('docs.loading') + '</p>'
+  try {
+    const res = await fetch('/api/docs/' + encodeURIComponent(name))
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const doc = await res.json()
+    const content = doc.content || ''
+    // Toolbar with a raw-.md download, then the rendered markdown.
+    contentEl.innerHTML =
+      '<div class="docs-content-toolbar">' +
+        '<button class="btn-secondary btn-compact" id="docsDownloadBtn">' + t('docs.download_btn') + '</button>' +
+      '</div>' +
+      '<div class="docs-rendered markdown-body">' + renderMarkdown(content) + '</div>'
+    const dl = document.getElementById('docsDownloadBtn')
+    if (dl) dl.addEventListener('click', () => downloadMarkdown(name, content))
+  } catch (e) {
+    contentEl.innerHTML = '<p class="muted">' + t('docs.open_error') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
+  }
+}
+
+// Download a doc's raw markdown as a .md file (client-side Blob, no server).
+function downloadMarkdown(name, content) {
+  try {
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = /\.md$/.test(name) ? name : (name + '.md')
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (e) {
+    showToast(t('common.toast.download_failed', { msg: String(e && e.message || e) }))
+  }
+}
+
+// === Mobile login (QR of the ?token= bootstrap URL) ===
+// The desktop is already authenticated, so the token lives in localStorage.
+// We render it as a QR purely client-side and show it in a modal; the phone
+// scans it and stores the token locally. The token never travels through chat.
+(function setupMobileLogin() {
+  const btn = document.getElementById('mobileLoginBtn')
+  const overlay = document.getElementById('mobileLoginOverlay')
+  if (!btn || !overlay) return
+  const qrBox = document.getElementById('mobileLoginQr')
+  const closeBtn = document.getElementById('mobileLoginClose')
+
+  async function render() {
+    const token = localStorage.getItem('marveen-dashboard-token')
+    if (!token) {
+      qrBox.innerHTML = `<p class="muted">${t('mobile_login.no_token')}</p>`
+      return
+    }
+    if (typeof qrcode !== 'function') {
+      qrBox.innerHTML = `<p class="muted">${t('mobile_login.cdn_error')}</p>`
+      return
+    }
+    // The QR must encode a URL the phone can reach. If the desktop opened the
+    // dashboard on localhost/127.0.0.1, window.location.origin would put
+    // "localhost" in the QR and the phone would hit its OWN localhost. In that
+    // case ask the server for its LAN IP and build the QR from that. If the
+    // dashboard is already open on a LAN IP or a tunnel host, the origin works
+    // as-is.
+    let base = window.location.origin
+    const host = window.location.hostname
+    if (host === 'localhost' || host === '127.0.0.1') {
+      qrBox.innerHTML = `<p class="muted">${t('mobile_login.generating')}</p>`
+      try {
+        const r = await fetch('/api/network-info', { headers: { 'Authorization': 'Bearer ' + token } })
+        const info = r.ok ? await r.json() : {}
+        if (info.lan_ip) {
+          base = 'http://' + info.lan_ip + ':' + (info.port || window.location.port || '3420')
+        } else {
+          qrBox.innerHTML = `<p class="mobile-login-warn">${t('mobile_login.localhost_warn')}</p>`
+          return
+        }
+      } catch (e) {
+        qrBox.innerHTML = `<p class="mobile-login-warn">${t('mobile_login.lan_error')}</p>`
+        return
+      }
+    }
+    const url = base + '/?token=' + token
+    try {
+      const qr = qrcode(0, 'M') // typeNumber 0 = auto-fit, ECC level M
+      qr.addData(url)
+      qr.make()
+      qrBox.innerHTML = qr.createSvgTag({ cellSize: 6, margin: 4, scalable: true })
+    } catch (e) {
+      qrBox.innerHTML = `<p class="muted">${t('mobile_login.qr_error', { msg: escapeHtml(String(e && e.message || e)) })}</p>`
+    }
+  }
+
+  btn.addEventListener('click', () => { render(); openModal(overlay) })
+  if (closeBtn) closeBtn.addEventListener('click', () => closeModal(overlay))
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(overlay) })
+})()
+
+// === Archivalt kartyak ===
+;(() => {
+  let archivedInit = false
+
+  const STATUS_LABELS = {
+    planned:     () => t('kanban.status.planned'),
+    in_progress: () => t('kanban.status.in_progress'),
+    waiting:     () => t('kanban.status.waiting'),
+    done:        () => t('kanban.status.done')
+  }
+  const STATUS_COLORS = { planned: '#6b7280', in_progress: '#3b82f6', waiting: '#f59e0b', done: '#10b981' }
+  const PRIORITY_LABELS = {
+    low:    () => t('kanban.priority.low'),
+    normal: () => t('kanban.priority.normal'),
+    high:   () => t('kanban.priority.high'),
+    urgent: () => t('kanban.priority.urgent')
+  }
+  const PRIORITY_COLORS = { low: '#9ca3af', normal: '#6b7280', high: '#f59e0b', urgent: '#ef4444' }
+
+  function fmtDate(unix) {
+    if (!unix) return ''
+    return new Date(unix * 1000).toLocaleString('hu-HU', { dateStyle: 'short', timeStyle: 'short' })
+  }
+
+  // Render an archived card with the same visual language as the live board:
+  // project pill + #seq title + colored rounded priority/label chips, wrapped in
+  // the .kanban-card frame. The whole card opens a read-only detail modal on
+  // click; the restore button stops propagation so it doesn't also open it.
+  function renderArchivedCard(card) {
+    const prioColor = PRIORITY_COLORS[card.priority] || '#6b7280'
+    const prioLabel = PRIORITY_LABELS[card.priority]?.() ?? card.priority
+    const seqHtml = card.seq != null
+      ? `<span class="kanban-card-seq" style="font-family:monospace;font-size:11px;color:var(--text-muted);margin-right:5px">#${card.seq}</span>`
+      : ''
+    const projectHtml = card.project
+      ? `<span class="kanban-card-project">${esc(card.project)}</span>`
+      : ''
+    let labelsHtml = ''
+    if (Array.isArray(card.labels) && card.labels.length > 0) {
+      const pills = card.labels
+        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${esc(l.color)}">#${esc(l.name)}</span>`)
+        .join('')
+      labelsHtml = `<div class="kanban-card-labels">${pills}</div>`
+    }
+    const prioPill = `<span class="archived-prio-pill" style="--prio-color:${prioColor}">${prioLabel}</span>`
+    return `<div class="kanban-card archived-card" data-id="${esc(card.id)}" data-priority="${esc(card.priority)}">
+      ${projectHtml}
+      <div class="kanban-card-title">${seqHtml}${esc(card.title)}</div>
+      <div class="kanban-card-footer">${prioPill}</div>
+      ${labelsHtml}
+      <div class="archived-card-foot">
+        <span class="archived-date">${t('archived.label.archived_at', {date: fmtDate(card.archived_at)})}</span>
+        <button class="btn-secondary btn-compact archived-restore-btn" data-id="${esc(card.id)}" title="${t('archived.btn.restore_to_board')}" style="white-space:nowrap;flex-shrink:0;">${t('archived.btn.restore')}</button>
+      </div>
+    </div>`
+  }
+
+  // Read-only detail modal for an archived card: meta grid, labels, description,
+  // comments -- no editing affordances. Restore button mirrors the card button.
+  async function showArchivedDetail(card) {
+    const seqPrefix = card.seq != null ? `#${card.seq} ` : ''
+    document.getElementById('archivedDetailTitle').textContent = `${seqPrefix}${card.title}`
+    const meta = document.getElementById('archivedDetailMeta')
+    const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
+    meta.innerHTML = `
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.id')}</span><span class="meta-value" style="font-family:monospace">${esc(idLabel)}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.status')}</span><span class="meta-value">${STATUS_LABELS[card.status]?.() ?? card.status}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.assignee')}</span><span class="meta-value">${card.assignee ? esc(card.assignee) : t('kanban.meta.none')}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.priority')}</span><span class="meta-value">${PRIORITY_LABELS[card.priority]?.() ?? card.priority}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.project')}</span><span class="meta-value">${card.project ? esc(card.project) : t('kanban.meta.none')}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('archived.meta.archived_at')}</span><span class="meta-value">${fmtDate(card.archived_at)}</span></div>
+    `
+    const labelsWrap = document.getElementById('archivedDetailLabelsWrap')
+    const labelsBox = document.getElementById('archivedDetailLabels')
+    if (Array.isArray(card.labels) && card.labels.length > 0) {
+      labelsBox.innerHTML = card.labels
+        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${esc(l.color)}">#${esc(l.name)}</span>`)
+        .join('')
+      labelsWrap.style.display = ''
+    } else {
+      labelsWrap.style.display = 'none'
+    }
+    document.getElementById('archivedDetailDesc').textContent = card.description || ''
+
+    const commentsWrap = document.getElementById('archivedDetailCommentsWrap')
+    const commentsBox = document.getElementById('archivedDetailComments')
+    commentsBox.innerHTML = ''
+    try {
+      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`)
+      const comments = res.ok ? await res.json() : []
+      if (Array.isArray(comments) && comments.length > 0) {
+        for (const c of comments) {
+          const date = new Date(c.created_at * 1000).toLocaleString('hu-HU')
+          const div = document.createElement('div')
+          div.className = 'comment-item'
+          div.innerHTML = `<div><span class="comment-author">${esc(c.author)}</span><span class="comment-date">${date}</span></div><div class="comment-body">${esc(c.content)}</div>`
+          commentsBox.appendChild(div)
+        }
+        commentsWrap.style.display = ''
+      } else {
+        commentsWrap.style.display = 'none'
+      }
+    } catch { commentsWrap.style.display = 'none' }
+
+    const restoreBtn = document.getElementById('archivedDetailRestoreBtn')
+    restoreBtn.disabled = false
+    restoreBtn.textContent = t('archived.btn.restore_to_board')
+    restoreBtn.onclick = async () => {
+      restoreBtn.disabled = true
+      restoreBtn.textContent = t('archived.btn.restoring')
+      try {
+        const resp = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/unarchive`, { method: 'POST' })
+        if (resp.ok) {
+          closeModal(document.getElementById('archivedDetailOverlay'))
+          doArchivedSearch()
+        } else {
+          restoreBtn.disabled = false
+          restoreBtn.textContent = t('archived.btn.restore_to_board')
+          showToast(t('archived.restore_error'))
+        }
+      } catch {
+        restoreBtn.disabled = false
+        restoreBtn.textContent = t('archived.btn.restore_to_board')
+      }
+    }
+    openModal(document.getElementById('archivedDetailOverlay'))
+  }
+
+  async function populateArchivedProjects() {
+    try {
+      const r = await fetch('/api/kanban-projects')
+      if (!r.ok) return
+      const projects = await r.json()
+      const sel = document.getElementById('archivedProject')
+      const cur = sel.value
+      sel.innerHTML = '<option value="">' + t('archived.filter.all_projects') + '</option>'
+      for (const p of projects) {
+        const opt = document.createElement('option')
+        opt.value = p
+        opt.textContent = p
+        if (p === cur) opt.selected = true
+        sel.appendChild(opt)
+      }
+    } catch { /* best-effort */ }
+  }
+
+  async function doArchivedSearch() {
+    const list = document.getElementById('archivedList')
+    const summary = document.getElementById('archivedSummary')
+    list.className = ''
+    list.innerHTML = '<p class="naplo-empty">' + t('common.loading') + '</p>'
+    summary.textContent = ''
+
+    const params = new URLSearchParams()
+    const q = document.getElementById('archivedQ').value.trim()
+    const project = document.getElementById('archivedProject').value
+    const from = document.getElementById('archivedFrom').value
+    const to = document.getElementById('archivedTo').value
+    if (q) params.set('q', q)
+    if (project) params.set('project', project)
+    if (from) params.set('from', Math.floor(new Date(from).getTime() / 1000))
+    if (to) params.set('to', Math.floor(new Date(to + 'T23:59:59').getTime() / 1000))
+
+    try {
+      const r = await fetch('/api/kanban/archived?' + params.toString())
+      if (!r.ok) { list.innerHTML = '<p class="naplo-empty error">' + t('archived.error.http', {status: r.status}) + '</p>'; return }
+      const data = await r.json()
+      const cards = data.cards || []
+      summary.textContent = t('archived.summary', {count: cards.length, limit: data.limit})
+      if (cards.length === 0) { list.innerHTML = '<p class="naplo-empty">' + t('archived.empty') + '</p>'; return }
+      list.className = 'archived-grid'
+      list.innerHTML = cards.map(renderArchivedCard).join('')
+      const byId = new Map(cards.map(c => [c.id, c]))
+      // Whole card opens the read-only detail; restore button acts on its own.
+      list.querySelectorAll('.archived-card').forEach(el => {
+        el.addEventListener('click', () => {
+          const card = byId.get(el.dataset.id)
+          if (card) showArchivedDetail(card)
+        })
+      })
+      list.querySelectorAll('.archived-restore-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          e.stopPropagation()
+          const id = btn.dataset.id
+          btn.disabled = true
+          btn.textContent = '...'
+          try {
+            const resp = await fetch(`/api/kanban/${id}/unarchive`, { method: 'POST' })
+            if (resp.ok) {
+              const cardEl = btn.closest('.archived-card')
+              if (cardEl) cardEl.style.opacity = '0.4'
+              btn.textContent = t('archived.btn.restored')
+            } else {
+              btn.disabled = false
+              btn.textContent = t('archived.btn.restore')
+              showToast(t('archived.restore_error'))
+            }
+          } catch {
+            btn.disabled = false
+            btn.textContent = t('archived.btn.restore')
+          }
+        })
+      })
+    } catch (err) {
+      list.innerHTML = '<p class="naplo-empty error">' + t('common.error_network', {msg: err.message}) + '</p>'
+    }
+  }
+
+  function loadArchivedPage() {
+    if (!archivedInit) {
+      archivedInit = true
+      document.getElementById('archivedSearchBtn').addEventListener('click', doArchivedSearch)
+      document.getElementById('archivedRefreshBtn').addEventListener('click', doArchivedSearch)
+      document.getElementById('archivedQ').addEventListener('keydown', e => { if (e.key === 'Enter') doArchivedSearch() })
+      const adOverlay = document.getElementById('archivedDetailOverlay')
+      document.getElementById('archivedDetailClose').addEventListener('click', () => closeModal(adOverlay))
+      adOverlay.addEventListener('click', e => { if (e.target === adOverlay) closeModal(adOverlay) })
+    }
+    populateArchivedProjects()
+    doArchivedSearch()
+  }
+
+  window.loadArchivedPage = loadArchivedPage
+})()
+
+// === Naplo (Audit Timeline) ===
+;(() => {
+  let naploInitialized = false
+  let naploActiveSource = ''
+
+  const SOURCE_LABELS = { config: () => t('naplo.source.config'), idea: () => t('naplo.source.idea'), store: () => t('naplo.source.store'), diary: () => t('naplo.source.diary') }
+  const SOURCE_COLORS = { config: '#3b82f6', idea: '#10b981', store: '#f59e0b', diary: '#8b5cf6' }
+  const DIARY_ENTRY_LABELS = { log: () => t('naplo.diary.log_badge'), memory: () => t('naplo.diary.memory_badge') }
+  const DIARY_ENTRY_COLORS = { log: '#6b7280', memory: '#a78bfa' }
+
+  function fmtTs(unix) {
+    return new Date(unix * 1000).toLocaleString('hu-HU', { dateStyle: 'short', timeStyle: 'short' })
+  }
+
+  function renderEntry(e) {
+    const sourceColor = SOURCE_COLORS[e.source] || '#6b7280'
+    const sourceLabelRaw = SOURCE_LABELS[e.source]; const sourceLabel = sourceLabelRaw ? (typeof sourceLabelRaw === 'function' ? sourceLabelRaw() : sourceLabelRaw) : e.source
+    const badge = `<span class="naplo-badge" style="background:${sourceColor}">${sourceLabel}</span>`
+    const ts = `<span class="naplo-ts">${fmtTs(e.created_at)}</span>`
+    let detail = ''
+    if (e.source === 'config') {
+      const oldV = e.old_value != null ? `<code>${esc(e.old_value)}</code>` : '<em>nincs</em>'
+      const newV = e.new_value != null ? `<code>${esc(e.new_value)}</code>` : '<em>nincs</em>'
+      detail = `<strong>${esc(e.key)}</strong> ${oldV} &rarr; ${newV} <span class="naplo-actor">${esc(e.actor || '')}</span>`
+    } else if (e.source === 'idea') {
+      const from = e.from_status ? `<code>${esc(e.from_status)}</code> &rarr; ` : ''
+      detail = `<strong>${esc(e.idea_id)}</strong> ${from}<code>${esc(e.to_status)}</code>`
+      if (e.note) detail += ` <span class="naplo-note">${esc(e.note)}</span>`
+      if (e.actor) detail += ` <span class="naplo-actor">${esc(e.actor)}</span>`
+    } else if (e.source === 'store') {
+      const sizeStr = e.file_size != null ? ` (${(e.file_size / 1024).toFixed(1)} KB)` : ''
+      const agentStr = e.agent ? ` <span class="naplo-actor">${esc(e.agent)}</span>` : ''
+      const sens = e.is_sensitive ? ` <span class="naplo-sensitive">${t('naplo.entry.sensitive')}</span>` : ''
+      detail = `<code>${esc(e.rel_path)}</code> <span class="naplo-event-type">${esc(e.event_type)}</span>${sizeStr}${agentStr}${sens}`
+    } else if (e.source === 'diary') {
+      const entryColor = DIARY_ENTRY_COLORS[e.entry_type] || '#6b7280'
+      const entryLabelRaw = DIARY_ENTRY_LABELS[e.entry_type]; const entryLabel = entryLabelRaw ? (typeof entryLabelRaw === 'function' ? entryLabelRaw() : entryLabelRaw) : e.entry_type
+      const entryBadge = `<span class="naplo-badge" style="background:${entryColor};font-size:10px">${entryLabel}</span>`
+      const agentStr = e.agent_id ? ` <span class="naplo-actor">${esc(e.agent_id)}</span>` : ''
+      let contentSnippet = esc(e.content || '').replace(/\n/g, ' ').slice(0, 200)
+      if ((e.content || '').length > 200) contentSnippet += '…'
+      const keywordsStr = e.keywords ? `<div class="naplo-note" style="margin-top:2px">Kulcsszavak: ${esc(e.keywords)}</div>` : ''
+      const catStr = e.category ? ` <span class="naplo-event-type">${esc(e.category)}</span>` : ''
+      detail = `${entryBadge}${catStr}${agentStr}<div class="naplo-diary-content">${contentSnippet}</div>${keywordsStr}`
+    }
+    return `<div class="naplo-entry"><div class="naplo-entry-meta">${ts}${badge}</div><div class="naplo-entry-detail">${detail}</div></div>`
+  }
+
+  async function doNaplo() {
+    const timeline = document.getElementById('naplo-timeline')
+    const summary = document.getElementById('naplo-summary')
+    timeline.innerHTML = `<p class="naplo-empty">${t('naplo.loading')}</p>`
+    summary.textContent = ''
+
+    const params = new URLSearchParams()
+    if (naploActiveSource) params.set('source', naploActiveSource)
+    const from = document.getElementById('naplo-from').value
+    const to = document.getElementById('naplo-to').value
+    const q = document.getElementById('naplo-q').value.trim()
+    const agentEl = document.getElementById('naplo-agent')
+    const agentVal = agentEl ? agentEl.value.trim() : ''
+    if (from) params.set('from', Math.floor(new Date(from).getTime() / 1000))
+    if (to)   params.set('to', Math.floor(new Date(to + 'T23:59:59').getTime() / 1000))
+    if (q)    params.set('q', q)
+    if (agentVal) params.set('agent', agentVal)
+    params.set('limit', '200')
+
+    try {
+      const res = await fetch('/api/audit-log?' + params.toString())
+      if (!res.ok) { timeline.innerHTML = `<p class="naplo-empty error">Hiba: ${res.status}</p>`; return }
+      const data = await res.json()
+      const entries = data.entries || []
+      summary.textContent = t('naplo.summary', { n: entries.length })
+      if (entries.length === 0) { timeline.innerHTML = `<p class="naplo-empty">${t('naplo.empty')}</p>`; return }
+      timeline.innerHTML = entries.map(renderEntry).join('')
+    } catch (err) {
+      timeline.innerHTML = `<p class="naplo-empty error">${t('naplo.error', { msg: err.message })}</p>`
+    }
+  }
+
+  function loadNaplo() {
+    if (!naploInitialized) {
+      naploInitialized = true
+      document.querySelectorAll('#naplo-source-tabs .naplo-tab').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('#naplo-source-tabs .naplo-tab').forEach((b) => b.classList.remove('active'))
+          btn.classList.add('active')
+          naploActiveSource = btn.dataset.source
+          const agentFilter = document.getElementById('naplo-agent-wrap')
+          if (agentFilter) agentFilter.style.display = naploActiveSource === 'diary' ? '' : 'none'
+          doNaplo()
+        })
+      })
+      document.getElementById('naplo-search-btn').addEventListener('click', doNaplo)
+      document.getElementById('naplo-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doNaplo() })
+      document.getElementById('naplo-refresh-btn').addEventListener('click', doNaplo)
+    }
+    doNaplo()
+  }
+
+  window.loadNaplo = loadNaplo
+})()
+
+// === Kanban Gantt / timeline view ===
+;(function () {
+  // --- State ---
+  let ganttPeriod = 'week'  // 'week' | 'month' | 'quarter'
+  let ganttPeriodOffset = 0  // periods stepped from the current one (0 = current, -1 = prev, +1 = next)
+  let ganttOverdueOnly = false
+  let _initialized = false
+
+  // --- Color map by status (vars from theme) ---
+  const STATUS_COLOR = {
+    planned:     { bg: 'var(--accent)',  border: 'var(--accent)' },
+    in_progress: { bg: '#4f8ef7',        border: '#3a7be0' },
+    waiting:     { bg: '#e8a838',        border: '#c88c20' },
+    done:        { bg: '#3dbf79',        border: '#28a560' },
+  }
+
+  // Period window: returns { rangeStart: Date, rangeEnd: Date } (midnight boundaries)
+  function periodWindow() {
+    const now = new Date()
+    const start = new Date(now)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(start)
+    if (ganttPeriod === 'week') {
+      // Mon..Sun of current week, shifted by ganttPeriodOffset weeks
+      const dow = (start.getDay() + 6) % 7  // Mon=0
+      start.setDate(start.getDate() - dow + ganttPeriodOffset * 7)
+      end.setTime(start.getTime())
+      end.setDate(start.getDate() + 7)
+    } else if (ganttPeriod === 'month') {
+      start.setDate(1)
+      start.setMonth(start.getMonth() + ganttPeriodOffset)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 1, 1)
+    } else {  // quarter
+      const qStart = Math.floor(start.getMonth() / 3) * 3 + ganttPeriodOffset * 3
+      start.setMonth(qStart, 1)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 3, 1)
+    }
+    return { rangeStart: start, rangeEnd: end }
+  }
+
+  // Format date as short label (e.g. "jún 15" / "Jun 15")
+  function fmtDateShort(d) {
+    return d.toLocaleDateString(typeof _lang !== 'undefined' && _lang === 'en' ? 'en-US' : 'hu-HU', { month: 'short', day: 'numeric' })
+  }
+
+  // Return header tick labels for the visible range
+  function buildHeaderTicks(rangeStart, rangeEnd) {
+    const ticks = []
+    const totalMs = rangeEnd - rangeStart
+    // Aim for ~5-8 ticks; snap to day boundaries
+    let stepDays = 1
+    if (ganttPeriod === 'month') stepDays = 7
+    else if (ganttPeriod === 'quarter') stepDays = 14
+    const cur = new Date(rangeStart)
+    while (cur < rangeEnd) {
+      ticks.push({
+        date: new Date(cur),
+        pct: (cur - rangeStart) / totalMs * 100,
+      })
+      cur.setDate(cur.getDate() + stepDays)
+    }
+    return ticks
+  }
+
+  // Group visible cards by project (or 'Nincs projekt' for null)
+  function groupCardsByProject(cards) {
+    const map = new Map()
+    for (const c of cards) {
+      const key = c.project || t('kanban.gantt.no_project')
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(c)
+    }
+    return map
+  }
+
+  // Build and inject the Gantt DOM into #kanbanGanttView
+  function renderGantt() {
+    const container = document.getElementById('kanbanGanttView')
+    if (!container) return
+    container.innerHTML = ''
+
+    const { rangeStart, rangeEnd } = periodWindow()
+    const totalMs = rangeEnd - rangeStart
+    const nowMs = Date.now()
+    const todayPct = Math.max(0, Math.min(100, (nowMs - rangeStart) / totalMs * 100))
+
+    // Filter: cards that have a due_date
+    let cards = (Array.isArray(kanbanCards) ? kanbanCards : []).filter(c => c.due_date)
+
+    if (ganttOverdueOnly) {
+      // Keep cards that are overdue OR due within 7 days
+      const cutoff = (nowMs + 7 * 86400000) / 1000
+      cards = cards.filter(c => c.due_date <= cutoff / 1 && c.status !== 'done')
+    }
+
+    // Exclude cards whose entire bar lies outside the window
+    cards = cards.filter(c => {
+      const barStart = c.created_at ? c.created_at * 1000 : rangeStart.getTime()
+      const barEnd   = c.due_date * 1000
+      return barEnd >= rangeStart && barStart <= rangeEnd
+    })
+
+    if (cards.length === 0) {
+      container.innerHTML = `<p style="color:var(--muted);padding:24px 0;text-align:center;">${t('kanban.gantt.no_cards')}</p>`
+      return
+    }
+
+    const grouped = groupCardsByProject(cards)
+
+    // --- Outer layout ---
+    const wrap = document.createElement('div')
+    wrap.className = 'gantt-wrap'
+    wrap.style.cssText = 'display:flex;flex-direction:column;overflow:hidden;'
+
+    // --- Header row: left label + tick strip ---
+    const headerRow = document.createElement('div')
+    headerRow.style.cssText = 'display:flex;border-bottom:1px solid var(--border);margin-bottom:4px;'
+
+    const headerLabel = document.createElement('div')
+    headerLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--muted);padding:4px 8px;border-right:1px solid var(--border);'
+    headerLabel.textContent = t('kanban.gantt.col_label')
+    headerRow.appendChild(headerLabel)
+
+    const headerTrack = document.createElement('div')
+    headerTrack.style.cssText = 'flex:1;position:relative;height:28px;overflow:hidden;'
+    const ticks = buildHeaderTicks(rangeStart, rangeEnd)
+    for (const tick of ticks) {
+      const el = document.createElement('div')
+      el.style.cssText = `position:absolute;left:${tick.pct.toFixed(2)}%;transform:translateX(-50%);font-size:11px;color:var(--muted);top:6px;white-space:nowrap;`
+      el.textContent = fmtDateShort(tick.date)
+      headerTrack.appendChild(el)
+    }
+    // Today marker in header
+    if (todayPct >= 0 && todayPct <= 100) {
+      const todayHead = document.createElement('div')
+      todayHead.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);opacity:0.6;`
+      headerTrack.appendChild(todayHead)
+    }
+    headerRow.appendChild(headerTrack)
+    wrap.appendChild(headerRow)
+
+    // --- Body rows ---
+    const body = document.createElement('div')
+    body.style.cssText = 'overflow-y:auto;max-height:70vh;'
+
+    for (const [project, projCards] of grouped) {
+      // Group header
+      const groupHeader = document.createElement('div')
+      groupHeader.style.cssText = 'display:flex;align-items:center;background:var(--bg2,var(--sidebar-bg));border-bottom:1px solid var(--border);'
+      const ghLabel = document.createElement('div')
+      ghLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;font-weight:600;color:var(--fg);padding:5px 8px;border-right:1px solid var(--border);'
+      ghLabel.textContent = `${project} (${projCards.length})`
+      groupHeader.appendChild(ghLabel)
+      const ghStripe = document.createElement('div')
+      ghStripe.style.cssText = 'flex:1;height:26px;background:var(--bg2,var(--sidebar-bg));'
+      groupHeader.appendChild(ghStripe)
+      body.appendChild(groupHeader)
+
+      // Card rows
+      for (const card of projCards) {
+        const barStartMs = card.created_at ? card.created_at * 1000 : rangeStart.getTime()
+        const barEndMs   = card.due_date * 1000
+        const isOverdue  = card.status !== 'done' && barEndMs < nowMs
+
+        // Clamp to window
+        const clampedStart = Math.max(barStartMs, rangeStart.getTime())
+        const clampedEnd   = Math.min(barEndMs,   rangeEnd.getTime())
+        const leftPct  = (clampedStart - rangeStart) / totalMs * 100
+        const widthPct = Math.max(0.5, (clampedEnd - clampedStart) / totalMs * 100)
+
+        const col = isOverdue ? { bg: 'var(--danger,#e05252)', border: '#b83030' }
+                              : (STATUS_COLOR[card.status] || STATUS_COLOR.planned)
+
+        const row = document.createElement('div')
+        row.style.cssText = 'display:flex;align-items:center;border-bottom:1px solid var(--border);min-height:32px;'
+
+        const rowLabel = document.createElement('div')
+        rowLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--fg);padding:4px 8px;border-right:1px solid var(--border);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer;'
+        rowLabel.title = card.title
+        // Show the running display number (#N, card.seq) like the board, not the hex id.
+        const seqLabel = card.seq != null ? `#${card.seq}` : `#${card.id}`
+        rowLabel.textContent = `${seqLabel} ${card.title}`
+        rowLabel.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+
+        const rowTrack = document.createElement('div')
+        rowTrack.style.cssText = 'flex:1;position:relative;height:32px;overflow:hidden;'
+
+        // Today line (in each row)
+        if (todayPct >= 0 && todayPct <= 100) {
+          const tl = document.createElement('div')
+          tl.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);z-index:1;pointer-events:none;`
+          rowTrack.appendChild(tl)
+        }
+
+        const bar = document.createElement('div')
+        bar.style.cssText = [
+          `position:absolute`,
+          `left:${leftPct.toFixed(2)}%`,
+          `width:${widthPct.toFixed(2)}%`,
+          `top:5px`,
+          `bottom:5px`,
+          `background:${col.bg}`,
+          `border:1px solid ${col.border}`,
+          `border-radius:4px`,
+          `overflow:hidden`,
+          `white-space:nowrap`,
+          `font-size:11px`,
+          `color:#fff`,
+          `display:flex`,
+          `align-items:center`,
+          `padding:0 6px`,
+          `box-sizing:border-box`,
+          `cursor:pointer`,
+          `z-index:2`,
+          isOverdue ? 'background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.12) 0px,rgba(0,0,0,.12) 4px,transparent 4px,transparent 8px)' : '',
+        ].filter(Boolean).join(';')
+        bar.title = `${seqLabel} ${card.title}\n${fmtDateShort(new Date(barStartMs))} - ${fmtDateShort(new Date(barEndMs))}`
+        bar.textContent = `${seqLabel} ${card.title}`
+        bar.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+        rowTrack.appendChild(bar)
+        row.appendChild(rowLabel)
+        row.appendChild(rowTrack)
+        body.appendChild(row)
+      }
+    }
+
+    wrap.appendChild(body)
+
+    // --- Legend ---
+    const legend = document.createElement('div')
+    legend.style.cssText = 'display:flex;align-items:center;gap:16px;margin-top:10px;font-size:12px;flex-wrap:wrap;'
+    const legendItems = [
+      { key: 'planned',     color: STATUS_COLOR.planned.bg },
+      { key: 'in_progress', color: STATUS_COLOR.in_progress.bg },
+      { key: 'waiting',     color: STATUS_COLOR.waiting.bg },
+      { key: 'done',        color: STATUS_COLOR.done.bg },
+      { key: 'overdue',     color: 'var(--danger,#e05252)' },
+    ]
+    for (const item of legendItems) {
+      const dot = document.createElement('span')
+      dot.innerHTML = `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${item.color};vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.' + item.key)}`
+      legend.appendChild(dot)
+    }
+    const todayLegend = document.createElement('span')
+    todayLegend.style.cssText = 'margin-left:auto;color:var(--muted);'
+    todayLegend.innerHTML = `<span style="display:inline-block;width:12px;height:2px;background:var(--danger,#e05252);vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.today')}`
+    legend.appendChild(todayLegend)
+    wrap.appendChild(legend)
+
+    container.appendChild(wrap)
+
+    // --- Period stepper (below the timeline): step back/forward by one period unit ---
+    const nav = document.createElement('div')
+    nav.style.cssText = 'display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;'
+    const prevBtn = document.createElement('button')
+    prevBtn.className = 'view-btn'
+    prevBtn.style.cssText = 'width:auto;padding:0 14px;'
+    prevBtn.textContent = '‹ ' + t('kanban.gantt.nav_prev')
+    prevBtn.addEventListener('click', () => { ganttPeriodOffset--; renderGantt() })
+    const rangeLbl = document.createElement('span')
+    rangeLbl.style.cssText = 'font-size:12px;color:var(--muted);min-width:130px;text-align:center;'
+    rangeLbl.textContent = `${fmtDateShort(rangeStart)} - ${fmtDateShort(new Date(rangeEnd.getTime() - 1))}`
+    const nextBtn = document.createElement('button')
+    nextBtn.className = 'view-btn'
+    nextBtn.style.cssText = 'width:auto;padding:0 14px;'
+    nextBtn.textContent = t('kanban.gantt.nav_next') + ' ›'
+    nextBtn.addEventListener('click', () => { ganttPeriodOffset++; renderGantt() })
+    nav.append(prevBtn, rangeLbl, nextBtn)
+    container.appendChild(nav)
+  }
+
+  // --- View switcher init (called once after DOM ready) ---
+  function initGanttViewSwitcher() {
+    if (_initialized) return
+    _initialized = true
+
+    const boardBtn  = document.getElementById('kanbanViewBoard')
+    const ganttBtn  = document.getElementById('kanbanViewGantt')
+    const boardFilters = document.getElementById('kanbanBoardFilters')
+    const ganttFilters = document.getElementById('kanbanGanttFilters')
+    const boardEls  = [document.getElementById('kanbanBoard'), document.getElementById('kanbanSwimlaneBoard')]
+    const ganttEl   = document.getElementById('kanbanGanttView')
+
+    function activateBoard() {
+      boardBtn.classList.add('active')
+      ganttBtn.classList.remove('active')
+      boardFilters.style.display = 'flex'
+      ganttFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.removeProperty('display') })
+      ganttEl.style.display = 'none'
+    }
+
+    function activateGantt() {
+      ganttBtn.classList.add('active')
+      boardBtn.classList.remove('active')
+      ganttFilters.style.display = 'flex'
+      boardFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.display = 'none' })
+      ganttEl.style.display = 'block'
+      renderGantt()
+    }
+
+    boardBtn.addEventListener('click', activateBoard)
+    ganttBtn.addEventListener('click', activateGantt)
+
+    // Period buttons
+    document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        ganttPeriod = btn.dataset.period
+        ganttPeriodOffset = 0  // recenter on the current period when switching granularity
+        document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(b => b.classList.remove('active'))
+        btn.classList.add('active')
+        renderGantt()
+      })
+    })
+
+    // Overdue toggle
+    const overdueChk = document.getElementById('ganttOverdueOnly')
+    if (overdueChk) {
+      overdueChk.addEventListener('change', () => {
+        ganttOverdueOnly = overdueChk.checked
+        renderGantt()
+      })
+    }
+
+    // Re-render on data refresh (hook into global loadKanban completion)
+    const _origRenderKanban = window.renderKanban
+    if (typeof _origRenderKanban === 'function') {
+      window.renderKanban = function () {
+        _origRenderKanban.apply(this, arguments)
+        if (ganttEl.style.display !== 'none') renderGantt()
+      }
+    }
+  }
+
+  window._initGanttViewSwitcher = initGanttViewSwitcher
+  window.renderGantt = renderGantt
 })()

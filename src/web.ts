@@ -2,28 +2,40 @@ import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
+import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
+import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
-import { startMcpListChecker } from './web/mcp-list.js'
 import { startScheduleRunner } from './web/schedule-runner.js'
 import { startChannelPluginMonitor } from './web/channel-monitor.js'
+import { startInboundProber } from './web/inbound-probe.js'
 import { startChannelHealthMonitor } from './web/channel-health-monitor.js'
+import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
+import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
+import { startReauthHealer } from './web/reauth-healer.js'
+import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { startModelFallbackRunner } from './web/model-fallback-runner.js'
+import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
+import { tryHandleAgentConversation } from './web/routes/agent-conversation.js'
+import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
+import { sweepOrphanTaskStates } from './web/agent-taskstate.js'
 import { tryHandleDailyLog } from './web/routes/daily-log.js'
 import { tryHandleMemories } from './web/routes/memories.js'
 import { tryHandleMigrate } from './web/routes/migrate.js'
 import { tryHandleKanban } from './web/routes/kanban.js'
-import { tryHandleTasks } from './web/routes/tasks.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
+import { tryHandleDocs } from './web/routes/docs.js'
 import { tryHandleConnectorsHu } from './web/routes/connectors-hu.js'
 import { tryHandleAgentsSkills } from './web/routes/agents-skills.js'
 import { tryHandleSkills } from './web/routes/skills.js'
@@ -33,10 +45,18 @@ import { tryHandleRecall } from './web/routes/recall.js'
 import { tryHandleBackgroundTasks, sweepOrphanedBackgroundTasks } from './web/routes/background-tasks.js'
 import { tryHandleOverview } from './web/routes/overview.js'
 import { tryHandleUpdates } from './web/routes/updates.js'
+import { tryHandleOnboarding } from './web/routes/onboarding.js'
 import { tryHandleStatus } from './web/routes/status.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
+import { tryHandleIdeas } from './web/routes/ideas.js'
+import { tryHandleToolLog } from './web/routes/tool-log.js'
+import { tryHandleSettings } from './web/routes/settings.js'
+import { tryHandleAuditLog } from './web/routes/audit-log.js'
 import { tryHandleStatic } from './web/routes/static.js'
+import { tryHandleVoice } from './web/routes/voice.js'
+import { tryHandleVaultSsh } from './web/routes/vault-ssh.js'
+import { tryHandleVaultSshKeys } from './web/routes/vault-ssh-keys.js'
 import type { RouteContext } from './web/routes/types.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
@@ -56,8 +76,9 @@ export function startWebServer(port = 3420): http.Server {
     `http://localhost:${port}`,
     `http://127.0.0.1:${port}`,
     ...( WEB_HOST !== 'localhost' && WEB_HOST !== '127.0.0.1' ? [`http://${WEB_HOST}:${port}`] : []),
+    ...(DASHBOARD_PUBLIC_URL ? [DASHBOARD_PUBLIC_URL.replace(/\/$/, '')] : []),
+    ...DASHBOARD_ALLOWED_ORIGINS.split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean),
   ])
-  const isSafeMethod = (m: string) => m === 'GET' || m === 'HEAD' || m === 'OPTIONS'
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://localhost:${port}`)
@@ -65,19 +86,28 @@ export function startWebServer(port = 3420): http.Server {
     const method = req.method || 'GET'
 
     const origin = req.headers.origin
-    if (origin && allowedOrigins.has(origin)) {
+    // Emit CORS headers for allowlisted origins AND for genuinely same-origin
+    // requests reached via a reverse proxy (e.g. Tailscale Serve's ts.net host,
+    // where the Origin host matches Host / X-Forwarded-Host). Without this, an
+    // iOS Safari preflight for an Authorization-bearing /api/ fetch over the
+    // proxy gets a 204 with no Access-Control-* headers and the browser blocks
+    // the request -- the page shell loads but no data does. Authorization must be
+    // in Allow-Headers or the preflight rejects the Bearer header.
+    if (origin && (allowedOrigins.has(origin) ||
+        originMatchesServedHost(origin, req.headers.host, req.headers['x-forwarded-host'] as string | undefined))) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
     }
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
     // Block state-changing requests from browsers running on foreign origins.
-    // Same-origin fetches from the dashboard don't set Origin on some browsers, so we
-    // accept requests where Origin is absent OR whitelisted. Requests carrying a foreign
-    // Origin are rejected outright (this is the primary CSRF defence).
-    if (!isSafeMethod(method) && origin && !allowedOrigins.has(origin)) {
+    // Same-origin fetches (Origin absent, allowlisted, or matching the host the
+    // server was actually reached on -- e.g. a Tailscale Serve / reverse-proxy
+    // hostname) are accepted; a foreign Origin is rejected (the CSRF defence).
+    if (isBlockedCrossOriginWrite(method, origin, req.headers.host, req.headers['x-forwarded-host'] as string | undefined, allowedOrigins)) {
+      logger.warn({ method, path, origin, host: req.headers.host, xForwardedHost: req.headers['x-forwarded-host'] }, 'CSRF: blocked write from foreign origin')
       res.writeHead(403, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Origin not allowed' }))
       return
@@ -97,12 +127,28 @@ export function startWebServer(port = 3420): http.Server {
       const ok = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
       return json(res, { authenticated: ok })
     }
+    // The live pane SSE stream is consumed via EventSource, which cannot set an
+    // Authorization header -- accept the token via ?token= for this one GET
+    // path, validated with the same constant-time check. Everything else stays
+    // header-only.
+    const isSseStream = method === 'GET' && /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path)
     if (path.startsWith('/api/') && !isPublicApi) {
-      if (!checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)) {
+      const headerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
+      const queryOk = isSseStream && checkBearerToken(`Bearer ${url.searchParams.get('token') ?? ''}`, DASHBOARD_TOKEN)
+      if (!headerOk && !queryOk) {
         res.writeHead(401, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Unauthorized' }))
         return
       }
+    }
+
+    // The mobile-login QR needs a URL the phone can actually reach. When the
+    // desktop opens the dashboard on localhost, window.location.origin is
+    // useless (the phone would hit its OWN localhost), so the client asks the
+    // server for its LAN IP and builds the QR from that. Auth is already
+    // enforced by the /api/* gate above.
+    if (path === '/api/network-info' && method === 'GET') {
+      return json(res, { lan_ip: detectLanIp(), port })
     }
 
     try {
@@ -114,21 +160,32 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
       if (await tryHandleKanban(routeCtx)) return
-      if (await tryHandleTasks(routeCtx)) return
       if (await tryHandleSchedules(routeCtx)) return
       if (await tryHandleConnectorsHu(routeCtx)) return
       if (await tryHandleConnectors(routeCtx)) return
+      if (await tryHandleDocs(routeCtx)) return
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
+      if (await tryHandleAgentTerminal(routeCtx)) return
+      if (await tryHandleAgentConversation(routeCtx)) return
+      if (await tryHandleAgentTaskState(routeCtx)) return
       if (await tryHandleAgents(routeCtx, WEB_DIR)) return
       if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
       if (await tryHandleBackgroundTasks(routeCtx)) return
       if (await tryHandleRecall(routeCtx)) return
       if (await tryHandleOverview(routeCtx)) return
       if (await tryHandleUpdates(routeCtx)) return
+      if (await tryHandleOnboarding(routeCtx)) return
       if (await tryHandleStatus(routeCtx)) return
       if (await tryHandleAutonomy(routeCtx)) return
       if (await tryHandleTokenUsage(routeCtx)) return
+      if (await tryHandleIdeas(routeCtx)) return
+      if (await tryHandleToolLog(routeCtx)) return
+      if (await tryHandleSettings(routeCtx)) return
+      if (await tryHandleVoice(routeCtx)) return
+      if (await tryHandleVaultSshKeys(routeCtx)) return
+      if (await tryHandleVaultSsh(routeCtx)) return
+      if (await tryHandleAuditLog(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)
@@ -180,7 +237,9 @@ export function startWebServer(port = 3420): http.Server {
                 try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
               } catch { /* gone */ }
             }
-            server.listen(port)
+            server.listen(port, WEB_HOST, () => {
+              logger.info({ port }, `Web dashboard: re-listen bound after port reclaim`)
+            })
           }, 1500)
         } else {
           logger.error({ port }, 'Port foglalt de nem talaltunk felszabadithato node processt -- kilepes')
@@ -206,27 +265,117 @@ export function startWebServer(port = 3420): http.Server {
     )
   })
 
-  const routerInterval = startMessageRouter()
-  logger.info('Agent message router started (5s poll)')
+  // Self-heal a SILENT listener failure. Under launchd, a `kickstart -k` can
+  // race the dying predecessor's lingering socket: the EADDRINUSE reclaim +
+  // re-listen path can leave this process ALIVE but not actually listening, with
+  // no error (observed 2026-06-27 -- the success log above fired yet nothing was
+  // bound, and the background loops started below kept running, so the dashboard
+  // was deaf until a manual restart, which bound cleanly). A clean restart binds
+  // reliably, so if the listener is not up we exit(1) and let launchd restart us
+  // fresh rather than linger un-servable. Runs regardless of WEB_ONLY -- it is
+  // about the HTTP listener, not the background services.
+  //
+  // The grace must comfortably exceed a SLOW-but-valid bind: restarting OVER a
+  // wedged predecessor, the EADDRINUSE reclaim retries every ~1500ms until the
+  // old socket finally releases -- observed up to ~5 MINUTES (2026-06-27). An
+  // 8s grace would exit MID-bind and loop, so wait STARTUP_GRACE first. After
+  // that, poll periodically so a mid-life listener drop is caught too, not just
+  // a startup failure.
+  const STARTUP_GRACE_MS = 7 * 60 * 1000
+  const RELISTEN_POLL_MS = 60 * 1000
+  setTimeout(() => {
+    setInterval(() => {
+      if (!server.listening) {
+        logger.error({ port }, 'Web server not listening -- exiting(1) for a clean launchd restart')
+        process.exit(1)
+      }
+    }, RELISTEN_POLL_MS).unref()
+  }, STARTUP_GRACE_MS).unref()
 
-  const scheduleInterval = startScheduleRunner()
-  logger.info('Schedule runner started (60s poll)')
+  // WEB_ONLY=true disables all background services (scheduler, pollers, monitors).
+  // Used for staging preview instances that must not conflict with the live fleet
+  // (duplicate schedule execution, Telegram 409, tmux manipulation, etc.).
+  const webOnly = process.env['WEB_ONLY'] === 'true'
+  if (webOnly) {
+    logger.info('[staging] WEB_ONLY mode: background services disabled')
+  }
 
-  const pluginMonitorInterval = startChannelPluginMonitor()
-  logger.info('Channel plugin health monitor started (60s poll)')
+  const routerInterval = webOnly ? undefined : startMessageRouter()
+  if (!webOnly) logger.info('Agent message router started (5s poll)')
 
-  const channelHealthInterval = startChannelHealthMonitor()
-  logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
+  const scheduleInterval = webOnly ? undefined : startScheduleRunner()
+  if (!webOnly) logger.info('Schedule runner started (60s poll)')
 
-  const updateCheckerInterval = startUpdateChecker()
-  logger.info('Update checker started (15min poll)')
+  // Pre-start the interactive agent worker (subscription backend) so the first
+  // heartbeat / scheduled generation after boot does not pay the cold-boot
+  // latency. runViaWorker still lazy-starts + restarts it on demand, so this is
+  // a warm-up, not a hard dependency. Skipped on the SDK rollback backend.
+  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
+    import('./web/agent-worker.js')
+      .then(m => { m.startWorkerSession(); logger.info('Interactive agent worker pre-started') })
+      .catch(err => logger.warn({ err }, 'Failed to pre-start agent worker (will lazy-start on first use)'))
+  }
 
-  // Warm the MCP list cache so the Connectors page reflects claude.ai OAuth
-  // connectors on first load. 30s delay lets the main-channels session settle
-  // first so the telegram plugin's single-poller token is claimed before
-  // `claude mcp list` spawns it for a health check.
-  startMcpListChecker()
-  logger.info('MCP list cache warmup scheduled (30s delay, manual refresh only)')
+  const pluginMonitorInterval = webOnly ? undefined : startChannelPluginMonitor()
+  if (!webOnly) logger.info('Channel plugin health monitor started (60s poll)')
+
+  // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
+  // the prober session file + allowlist are configured. Wrapped so a failure
+  // never crashes server startup.
+  if (!webOnly) {
+    try {
+      startInboundProber()
+    } catch (err) {
+      logger.warn({ err }, 'Inbound prober failed to start')
+    }
+  }
+
+  const channelHealthInterval = webOnly ? undefined : startChannelHealthMonitor()
+  if (!webOnly) logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
+
+  const stuckInputInterval = webOnly ? undefined : startStuckInputWatcher()
+  if (!webOnly) logger.info('Stuck-input watcher started (15s poll, 20s offset)')
+
+  const stuckToolCallInterval = webOnly ? undefined : startStuckToolCallWatcher()
+  if (!webOnly) logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
+
+  const reauthHealerInterval = webOnly ? undefined : startReauthHealer()
+  if (!webOnly && reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
+
+  const autoRestartInterval = webOnly ? undefined : startAutoRestartRunner()
+  if (!webOnly) logger.info('Auto-restart runner started (60s poll, 40s offset)')
+
+  const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
+  if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
+
+  const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
+  if (!webOnly) logger.info('Update checker started (15min poll)')
+
+  // Collect token usage from JSONL transcripts every hour so the run-history
+  // token estimates stay fresh without requiring a manual dashboard visit.
+  const tokenCollectInterval = webOnly ? undefined : setInterval(() => {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
+  }, 60 * 60 * 1000)
+  if (!webOnly) {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
+    logger.info('Token usage auto-collect started (1h poll + startup)')
+  }
+
+  // NOTE: startMcpListChecker() is intentionally NOT called here.
+  //
+  // Root cause: calling `claude mcp list` at boot time (30s delay) spawns the
+  // Telegram plugin for a health check. The plugin claims the bot-token poller
+  // slot, which 409-kills the live session-bridge process that already holds
+  // the same token. On every deploy this caused the Telegram channel to go
+  // offline within 33s of startup (3/3 observed deploys, 2026-06-04).
+  //
+  // The Connectors page already has a manual "Refresh" button that calls
+  // refreshMcpListCache() on demand. The cache starts empty; users see their
+  // connectors after the first manual refresh.
+  //
+  // Related: PR #269 fixed a DIFFERENT 409 source (runtime poller-flapping /
+  // channel-coordinator 409 cooldown hysteresis). That fix and this one are
+  // complementary -- both 409 vectors must be addressed.
 
   // Warm the Marveen bot username cache so /api/marveen returns @username on
   // the first dashboard load. Re-fetched lazily otherwise.
@@ -237,10 +386,15 @@ export function startWebServer(port = 3420): http.Server {
   // agent already has its own hooks block.
   try {
     const patched: string[] = []
-    for (const agentName of listAgentNames()) {
+    const stalePatched: string[] = []
+    // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
+    // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
+    for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
       if (ensureAgentHooks(agentName)) patched.push(agentName)
+      if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
     }
     if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
+    if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
   } catch (err) {
     logger.warn({ err }, 'Agent hook backfill skipped')
   }
@@ -258,13 +412,26 @@ export function startWebServer(port = 3420): http.Server {
     logger.warn({ err }, 'Background task sweep skipped')
   }
 
+  try {
+    const swept = sweepOrphanTaskStates(Date.now())
+    if (swept > 0) logger.info({ swept }, 'Orphan agent task-state records swept')
+  } catch (err) {
+    logger.warn({ err }, 'Task-state orphan sweep skipped')
+  }
+
   const origClose = server.close.bind(server)
   server.close = (cb?: (err?: Error) => void) => {
     clearInterval(routerInterval)
     clearInterval(scheduleInterval)
-    clearInterval(pluginMonitorInterval)
+    if (pluginMonitorInterval) clearInterval(pluginMonitorInterval)
     clearInterval(channelHealthInterval)
+    clearInterval(stuckInputInterval)
+    clearInterval(stuckToolCallInterval)
+    if (reauthHealerInterval) clearInterval(reauthHealerInterval)
+    clearInterval(autoRestartInterval)
+    clearInterval(modelFallbackInterval)
     clearInterval(updateCheckerInterval)
+    clearInterval(tokenCollectInterval)
     return origClose(cb)
   }
 

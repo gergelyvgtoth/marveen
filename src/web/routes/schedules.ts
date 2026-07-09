@@ -1,7 +1,7 @@
 import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  listPendingTaskRetries, deletePendingTaskRetryById,
+  listPendingTaskRetries, deletePendingTaskRetryById, listTaskRunHistory,
 } from '../../db.js'
 import { MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
 import { runAgent } from '../../agent.js'
@@ -17,6 +17,7 @@ import {
   SCHEDULED_TASKS_DIR, MAX_SCHEDULED_TASK_PROMPT_LEN,
   listScheduledTasks, writeScheduledTask,
 } from '../scheduled-tasks-io.js'
+import { runScheduledTaskNow } from '../schedule-runner.js'
 import type { RouteContext } from './types.js'
 
 export async function tryHandleSchedules(ctx: RouteContext): Promise<boolean> {
@@ -205,10 +206,32 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     return true
   }
 
+  const scheduleRunMatch = path.match(/^\/api\/schedules\/([^/]+)\/run$/)
+  if (scheduleRunMatch && method === 'POST') {
+    const name = decodeURIComponent(scheduleRunMatch[1])
+    const dir = join(SCHEDULED_TASKS_DIR, name)
+    if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const result = runScheduledTaskNow(name)
+    if (!result.ok) { json(res, { error: result.error }, 400); return true }
+    logger.info({ name, result: result.result }, 'Scheduled task run-now fired')
+    json(res, { ok: true, result: result.result })
+    return true
+  }
+
   if (path === '/api/schedules/pending' && method === 'GET') {
     const now = Date.now()
     const rows = listPendingTaskRetries().map(r => toPendingRetryView(r, now))
     json(res, rows)
+    return true
+  }
+
+  const scheduleRunsMatch = path.match(/^\/api\/schedules\/([^/]+)\/runs$/)
+  if (scheduleRunsMatch && method === 'GET') {
+    const name = decodeURIComponent(scheduleRunsMatch[1])
+    const dir = join(SCHEDULED_TASKS_DIR, name)
+    if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const runs = listTaskRunHistory(name, 10)
+    json(res, runs)
     return true
   }
 

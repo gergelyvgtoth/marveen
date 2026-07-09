@@ -3,6 +3,12 @@ name: memoria-heartbeat
 description: 30 percenként átnézi a beszélgetést, menti a fontosat, és skill-eket generál ha volt komplex munka
 ---
 
+## 0. ELŐSZÖR: Van-e várakozó Telegram üzenet?
+
+**Mielőtt bármit csinálnál**, nézd meg a session inputját: ha van `<channel source=` kezdetű blokk a kontextusban (azaz a felhasználó küldött valamit egy csatornán -- Telegram, Slack, stb.), **azonnal válaszolj rá** -- a heartbeat logika (A/B/C, csendben maradás) NEM vonatkozik a közvetlen felhasználói üzenetekre. Válasz után folytasd a heartbeat-et.
+
+---
+
 Nézd át az utolsó 30 perc beszélgetéseidet. Két dolgot csinálj:
 
 ## 1. Memória mentés
@@ -57,14 +63,18 @@ Lépések:
    - ...
    EOF
    ```
-4. Index regen: `bash ~/ClaudeClaw/scripts/skill-index.sh`
+4. Index regen: `bash {{INSTALL_DIR}}/scripts/skill-index.sh`
 
 **Ha kihagytad a skill akciót, pedig A/B/C valamelyike IGEN volt:** kötelezően írj `hot` tier memóriát "skip-skill: <konkrét ok>" tartalommal, hogy később lássuk miért. Ne csendben hagyd ki.
 
 ## 3. Csendben maradás
 
-Ha NINCS komplex feladat / hiba / korrekció (A=B=C=NEM), és nincs új információ a 30 percben:
+**KIVÉTEL: Ha a felhasználó üzenetet küldött egy csatornán (`<channel source=` kezdetű blokk a kontextusban), arra mindig válaszolj -- a csendes heartbeat szabály NEM vonatkozik rá.**
+
+Ha NINCS komplex feladat / hiba / korrekció (A=B=C=NEM), ÉS nincs várakozó Telegram üzenet, ÉS nincs új információ a 30 percben:
 - Ne ments memóriát feleslegesen
 - Ne generálj skill-t
 - Ne küldj üzenetet a csatornára
-- Maradj csendben (egy rövid "csendes heartbeat" sor a transzkriptbe elég)
+- Maradj csendben: egyszerűen FEJEZD BE a kört, akció nélkül.
+
+**KRITIKUS (felügyelet nélküli stabilitás):** SOHA ne gépelj semmit az input-boxba (a `❯` prompt-sorba) és ne hagyj ott parkolt, el-nem-küldött szöveget -- még a "csendes heartbeat" szót sem. Ha jelezni akarod a csendes kört, az KIZÁRÓLAG a normál válasz-szövegedben (transzkript) lehet, EGYETLEN rövid sorral, majd a köröd azonnal érjen véget. Parkolt input-szöveg blokkolja a következő üzenet kézbesítését (a router `busy`-nak látja a sessiont) -> a csatorna NÉMUL felügyelet nélkül.

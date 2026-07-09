@@ -10,10 +10,11 @@ import {
 // Helper: build a GitRunner from plain strings. Covers the common
 // "return this exact branch / status" fixtures without dragging in a
 // real git invocation.
-function makeGit(branch: string, porcelain = ''): GitRunner {
+function makeGit(branch: string, porcelain = '', ahead = 0): GitRunner {
   return {
     currentBranch: () => branch,
     porcelainStatus: () => porcelain,
+    aheadCount: () => ahead,
   }
 }
 
@@ -26,6 +27,29 @@ describe('checkUpdatePreflight --happy path', () => {
   it('ignores whitespace-only branch output', () => {
     const result = checkUpdatePreflight(makeGit('  main  ', '   '))
     expect(result.ok).toBe(true)
+  })
+})
+
+describe('checkUpdatePreflight --local commits (diverged history)', () => {
+  it('rejects when the local checkout has commits ahead of upstream', () => {
+    const result = checkUpdatePreflight(makeGit('main', '', 2))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('local-commits')
+    if (result.reason !== 'local-commits') return
+    expect(result.ahead).toBe(2)
+    expect(result.message).toMatch(/fast-forward/)
+  })
+
+  it('passes a clean tree with zero ahead', () => {
+    expect(checkUpdatePreflight(makeGit('main', '', 0)).ok).toBe(true)
+  })
+
+  it('dirty-tree takes precedence over ahead (stash is offered first)', () => {
+    const result = checkUpdatePreflight(makeGit('main', ' M src/x.ts', 3))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('dirty-tree')
   })
 })
 
@@ -55,34 +79,31 @@ describe('checkUpdatePreflight --detached HEAD', () => {
   })
 })
 
-describe('checkUpdatePreflight --feature branch', () => {
-  it('rejects any branch name other than main', () => {
-    const result = checkUpdatePreflight(makeGit('v3-05-ui-trustfrom-picker'))
-    expect(result.ok).toBe(false)
-    if (result.ok || result.reason !== 'not-on-main') {
-      throw new Error('expected not-on-main result')
-    }
-    expect(result.branch).toBe('v3-05-ui-trustfrom-picker')
-    expect(result.message).toContain("'v3-05-ui-trustfrom-picker'")
-    expect(result.message).toMatch(/git checkout main/)
+describe('checkUpdatePreflight --branch agnostic', () => {
+  it('accepts a non-main release branch on a clean tree', () => {
+    // The update is branch-agnostic: update.sh pulls origin/<this-branch>.
+    // An install that tracks "develop" must be allowed to self-update.
+    const result = checkUpdatePreflight(makeGit('develop', ''))
+    expect(result.ok).toBe(true)
   })
 
-  it('rejects "master" (a common misconfiguration)', () => {
-    const result = checkUpdatePreflight(makeGit('master'))
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.reason).toBe('not-on-main')
+  it('accepts an arbitrary feature branch on a clean tree', () => {
+    const result = checkUpdatePreflight(makeGit('v3-05-ui-trustfrom-picker', ''))
+    expect(result.ok).toBe(true)
   })
 
-  it('prioritises not-on-main over dirty-tree when both apply', () => {
-    // Switching to main first invalidates the dirty-tree check anyway
-    // (the modifications may or may not carry across branches), so the
-    // useful error message for the user is "switch branches", not
-    // "commit your changes on this branch".
-    const result = checkUpdatePreflight(makeGit('feature-x', ' M src/web.ts\n'))
+  it('accepts "master" on a clean tree', () => {
+    const result = checkUpdatePreflight(makeGit('master', ''))
+    expect(result.ok).toBe(true)
+  })
+
+  it('still blocks a dirty tree regardless of branch name', () => {
+    // The branch is fine, but uncommitted changes would break the
+    // fast-forward pull, so dirty-tree is the reported reason.
+    const result = checkUpdatePreflight(makeGit('develop', ' M src/web.ts\n'))
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.reason).toBe('not-on-main')
+    expect(result.reason).toBe('dirty-tree')
   })
 })
 
@@ -121,13 +142,12 @@ describe('checkUpdatePreflight --dirty working tree', () => {
 })
 
 describe('checkUpdatePreflight -- result shape', () => {
-  it('never emits a branch field on the ok path', () => {
-    const result = checkUpdatePreflight(makeGit('main'))
-    // TypeScript alone does not enforce this at runtime, so assert it.
-    expect(Object.hasOwn(result, 'branch')).toBe(false)
-  })
+  it('never emits a branch field on any path', () => {
+    // No result carries a branch field anymore; the update is
+    // branch-agnostic, so the branch name is never part of a rejection.
+    const ok = checkUpdatePreflight(makeGit('main'))
+    expect(Object.hasOwn(ok, 'branch')).toBe(false)
 
-  it('only emits a branch field on the not-on-main path', () => {
     const detached = checkUpdatePreflight(makeGit(''))
     expect(Object.hasOwn(detached, 'branch')).toBe(false)
 
@@ -135,7 +155,7 @@ describe('checkUpdatePreflight -- result shape', () => {
     expect(Object.hasOwn(dirty, 'branch')).toBe(false)
 
     const feature = checkUpdatePreflight(makeGit('feature-x'))
-    expect(Object.hasOwn(feature, 'branch')).toBe(true)
+    expect(Object.hasOwn(feature, 'branch')).toBe(false)
   })
 })
 

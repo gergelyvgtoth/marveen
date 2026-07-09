@@ -7,11 +7,11 @@ import { safeJoin } from './sanitize.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
-export const DEFAULT_MODEL = 'claude-sonnet-4-6'
+export const DEFAULT_MODEL = 'claude-opus-4-8[1m]'
 
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
-  'opus': 'claude-opus-4-6',
+  'opus': 'claude-opus-4-8[1m]',
   'sonnet': 'claude-sonnet-4-6',
   'haiku': 'claude-haiku-4-5-20251001',
   'inherit': DEFAULT_MODEL,
@@ -189,6 +189,101 @@ export function readAgentClaudeConfigDir(name: string): string | null {
   return resolveClaudeConfigDir(readFileOr(configPath, '{}'), homedir())
 }
 
+// --- Remote agent config (remoteHost + remoteWorkdir) ---
+//
+// When BOTH a valid host and a valid absolute workdir are present, the agent's
+// tmux session runs on a remote machine over ssh instead of locally. Validation
+// mirrors resolveClaudeConfigDir's whitelist-not-blacklist philosophy: the host
+// is passed as a raw ssh-destination argv element (never shell-interpolated), so
+// the charset is defense-in-depth, but the workdir IS inlined into the remote
+// launch command (shQuoted), so it is validated strictly too.
+
+// ssh alias or user@host. NO ':' -- `ssh host:port` is not valid syntax; the
+// port belongs in the ~/.ssh/config `Port` directive.
+const REMOTE_HOST_ALLOWED = /^[A-Za-z0-9_.@-]+$/
+// Absolute path only. Tilde is rejected: a `~/proj` workdir would encode to
+// `~-proj` for the --continue probe but Claude Code stores the tilde-EXPANDED
+// path as `-home-user-proj`, so the probe would never match and --continue would
+// be silently dropped. Requiring an absolute path makes the encoding
+// deterministic.
+const REMOTE_WORKDIR_ALLOWED = /^\/[A-Za-z0-9_./@+-]*$/
+
+export interface RemoteAgentConfig {
+  host: string | null
+  workdir: string | null
+}
+
+// Pure resolver: takes the raw agent-config.json text and returns the remote
+// {host, workdir}. An agent is "remote" only when BOTH validate; a
+// half-configured agent (host set but workdir invalid, or vice-versa) is
+// treated as local (both null) so it never launches into an undefined dir.
+export function resolveRemoteConfig(rawConfigJson: string): RemoteAgentConfig {
+  const NONE: RemoteAgentConfig = { host: null, workdir: null }
+  let config: unknown
+  try { config = JSON.parse(rawConfigJson) } catch { return NONE }
+  if (!config || typeof config !== 'object') return NONE
+  const rawHost = (config as Record<string, unknown>).remoteHost
+  const rawWorkdir = (config as Record<string, unknown>).remoteWorkdir
+  if (typeof rawHost !== 'string' || typeof rawWorkdir !== 'string') return NONE
+  const host = rawHost.trim()
+  const workdir = rawWorkdir.trim()
+  if (!host || !workdir) return NONE
+  if (!REMOTE_HOST_ALLOWED.test(host)) return NONE
+  if (!REMOTE_WORKDIR_ALLOWED.test(workdir)) return NONE
+  if (hasParentTraversal(workdir)) return NONE
+  return { host, workdir }
+}
+
+export function readAgentRemoteConfig(name: string): RemoteAgentConfig {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  return resolveRemoteConfig(readFileOr(configPath, '{}'))
+}
+
+// Convenience for the many callers that only need the host to decide whether a
+// session is remote. Returns null for local agents.
+export function readAgentRemoteHost(name: string): string | null {
+  return readAgentRemoteConfig(name).host
+}
+
+// Validate-and-persist the remote config. Empty strings clear the fields
+// (revert the agent to local). Returns the resolved config on success, or an
+// error string when a non-empty value fails validation.
+export function writeAgentRemoteConfig(
+  name: string,
+  host: string,
+  workdir: string,
+): { ok: true; remote: RemoteAgentConfig } | { ok: false; error: string } {
+  const h = host.trim()
+  const w = workdir.trim()
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+
+  // Clearing: both empty -> remove the fields, agent becomes local.
+  if (!h && !w) {
+    delete config.remoteHost
+    delete config.remoteWorkdir
+    atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+    return { ok: true, remote: { host: null, workdir: null } }
+  }
+
+  // Setting: both required and both must validate together.
+  if (!h || !w) {
+    return { ok: false, error: 'Both remoteHost and remoteWorkdir are required (or both empty to clear).' }
+  }
+  const probe = resolveRemoteConfig(JSON.stringify({ remoteHost: h, remoteWorkdir: w }))
+  if (!probe.host || !probe.workdir) {
+    return {
+      ok: false,
+      error: 'Invalid remoteHost (alias or user@host, no port/metachars) or remoteWorkdir (must be an absolute path without `..`).',
+    }
+  }
+  config.remoteHost = probe.host
+  config.remoteWorkdir = probe.workdir
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+  return { ok: true, remote: probe }
+}
+
 export function readAgentChannelProvider(name: string): string | null {
   const configPath = join(agentDir(name), 'agent-config.json')
   try {
@@ -223,6 +318,31 @@ export function readAgentAuthMode(name: string): AuthMode {
   return 'shared'
 }
 
+// Opt-in per-agent auto-memory isolation (default OFF). When true, the
+// launcher plants a stub git root in the agent dir so Claude Code's
+// file-based auto-memory resolves to the agent's own project key instead of
+// the shared install-root key. See src/web/memory-boundary.ts for the full
+// mechanism and trade-offs. Absent/false = current shared behavior, unchanged.
+export function readAgentMemoryIsolation(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.memoryIsolation === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Persist the opt-in memoryIsolation flag. `false` removes the key so the
+// config file stays minimal and the default-OFF semantics remain explicit.
+export function writeAgentMemoryIsolation(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  if (enabled) config.memoryIsolation = true
+  else delete config.memoryIsolation
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
 export function writeAgentAuthMode(name: string, mode: AuthMode): void {
   if (!VALID_AUTH_MODES.has(mode)) return
   const configPath = join(agentDir(name), 'agent-config.json')
@@ -240,12 +360,90 @@ export function writeAgentSecurityProfile(name: string, profileId: string): void
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
+// Sentinel filename. A subdirectory under agents/ that contains this empty
+// file is treated as a TECHNICAL worker, not a first-class agent: it stays
+// out of listAgentNames() (so it never appears on the dashboard, in the
+// schedule runner, in inter-agent message routing, etc.), but is still a
+// real directory on disk for whatever workflow needs it. Used today by
+// agents/heartbeat-worker/, the sentinel cwd for the SDK-spawned hourly
+// heartbeat sub-agent (Szabi 2026-06-02: "ez a technikai agent meg se
+// jelenjen a dashboardon").
+export const HIDDEN_AGENT_SENTINEL = '.hidden-from-dashboard'
+
 export function listAgentNames(): string[] {
   if (!existsSync(AGENTS_BASE_DIR)) return []
   return readdirSync(AGENTS_BASE_DIR).filter((f) => {
-    try { return statSync(join(AGENTS_BASE_DIR, f)).isDirectory() } catch { return false }
+    try {
+      if (!statSync(join(AGENTS_BASE_DIR, f)).isDirectory()) return false
+      // Hide technical workers explicitly opted out via the sentinel
+      // file. Cheap fs stat -- one extra existsSync per agent dir per
+      // tick; the agent list is small (~6 today).
+      if (existsSync(join(AGENTS_BASE_DIR, f, HIDDEN_AGENT_SENTINEL))) return false
+      return true
+    } catch { return false }
   })
 }
+
+// ---- per-agent voice config -----------------------------------------------
+
+export type VoiceResponseMode = 'text' | 'voice' | 'auto'
+
+export interface AgentVoiceConfig {
+  responseMode: VoiceResponseMode
+  voiceModel: string
+}
+
+// Canonical set of bundled voice model identifiers (basename without .onnx).
+// Extend here when new models are added to the installer.
+export const KNOWN_VOICE_MODELS = new Set<string>([
+  'hu_HU-imre-medium',
+  'hu_HU-anna-medium',
+])
+
+const VALID_RESPONSE_MODES = new Set<VoiceResponseMode>(['text', 'voice', 'auto'])
+
+export const DEFAULT_VOICE_CONFIG: AgentVoiceConfig = {
+  responseMode: 'text',
+  voiceModel: 'hu_HU-imre-medium',
+}
+
+export function readAgentVoiceConfig(name: string): AgentVoiceConfig {
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    const vc = (config.voice ?? {}) as Partial<AgentVoiceConfig>
+    return {
+      responseMode: VALID_RESPONSE_MODES.has(vc.responseMode as VoiceResponseMode)
+        ? (vc.responseMode as VoiceResponseMode)
+        : DEFAULT_VOICE_CONFIG.responseMode,
+      voiceModel: KNOWN_VOICE_MODELS.has(vc.voiceModel ?? '')
+        ? (vc.voiceModel as string)
+        : DEFAULT_VOICE_CONFIG.voiceModel,
+    }
+  } catch {
+    return { ...DEFAULT_VOICE_CONFIG }
+  }
+}
+
+export function writeAgentVoiceConfig(name: string, patch: Partial<AgentVoiceConfig>): void {
+  if (patch.responseMode !== undefined && !VALID_RESPONSE_MODES.has(patch.responseMode)) {
+    throw new Error(`Invalid responseMode: ${patch.responseMode}`)
+  }
+  if (patch.voiceModel !== undefined && !KNOWN_VOICE_MODELS.has(patch.voiceModel)) {
+    throw new Error(`Unknown voiceModel: ${patch.voiceModel}`)
+  }
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  const current = readAgentVoiceConfig(name)
+  config.voice = {
+    responseMode: patch.responseMode ?? current.responseMode,
+    voiceModel: patch.voiceModel ?? current.voiceModel,
+  }
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// ---- agent lookup ----------------------------------------------------------
 
 // Does this identifier refer to a registered agent? MAIN_AGENT_ID always
 // counts (it lives outside agents/ but is a first-class peer). Sub-agents

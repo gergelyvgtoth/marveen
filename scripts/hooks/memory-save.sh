@@ -4,12 +4,13 @@
 # Called by Claude Code PreCompact hook (agent type handles the AI extraction)
 
 INSTALL_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-API="http://localhost:3420/api"
 
-# Load config
+# Load config (so WEB_PORT from .env is available before API is built)
 if [ -f "$INSTALL_DIR/.env" ]; then
   export $(grep -v '^#' "$INSTALL_DIR/.env" | xargs)
 fi
+
+API="http://localhost:${WEB_PORT:-3420}/api"
 
 AGENT_ID="${1:-marveen}"
 CONTENT="$2"
