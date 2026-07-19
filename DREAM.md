@@ -1,33 +1,26 @@
-# 💭 Dream Engine -- 2026-07-16 02:08
+# 💭 Dream Engine -- 2026-07-19 02:07
 
 ## 💡 Skill-javaslatok
 
-- Nincs új javaslat -- az elmúlt 24 óra nagyrészt rutinos heartbeat-ekből állt. Az idea-generator (2x) és upstream-watch lefutott, mindkettő a meglévő skill-eket követte. Ismétlődő manuális minta nem azonosítható.
+- **`status-report` skill** (marveen) -- "Mi van?", "update?", "frissítés?" üzenetek rendszer-állapotot kérnek, de jelenleg git history-t kapnak. Tegnap ez a minta ismétlődött. Egy dedikált skill megírva egyszer megoldja végleg.
+- Nincs további új flotta-szintű javaslat -- a nap agent-health heartbeatekből és idea-generator futásból állt, mindkettő lefedett skillekkel.
 
 ## 🧹 Memória-egészség
 
-154 memória összesen, 137 vektorizált (17 hiányzó, 11% -- embedding-job rendezi).
-3 memória cold-tier-be áthelyezve:
-- id 152, 153, 155: skip-skill naplóbejegyzések (idea-generator + reggeli-napindito, lezárt esetek)
-
-Megmaradó hot (1 db): "Lead hőtérkép -- Gergely kérte az 1-es ötlet kifejtését" (id: 149) -- még releváns, bent marad.
+157 memória összesen, 139 vektorizált (18 embedding pending -- auto-kezeli a háttérjob). Antikvált hot-tier: 0 (query üres, nincs mit mozgatni). Duplikátum: 0 észlelt.
 
 ## 🎯 Top-3 holnapi javaslat
 
-1. marveen: Slack cutover unblock (d7b2d637) -- HIGH priority, régóta waiting; Gergelytől kell Slack app token + Socket-Mode döntés; reggeli ping indokolt.
-2. marveen: Upstream v1.22.1 merge (pending) -- Gergely engedélyére vár; DREAM.md staged miatt `git stash -u` kell előtte; 0 valódi konflikt.
-3. mutacsi-dev: Strukturált gép-adatbázis + PDF extractor (f31476a0) -- mutacsi core feature, teljesen el sem indult; a többi mutacsi kártya alapja.
+1. **Slack cutover** (d7b2d637) -- HIGH prioritás, 2+ hete waiting. Gergely labdája (Slack tokens + Socket-Mode döntés). Reggeli ping indokolt.
+2. **Gép-adatbázis + PDF extractor** (f31476a0) -- Műtacsi core feature, tervezett státuszban van. Állapot-szinkron kérése ajánlott, előreléphet-e manuális beavatkozás nélkül.
+3. **NotebookLM döntés** (f6149ce8) -- Cody nem tud előrelépni az official vs unofficial API döntés nélkül. 1 kérdés, 1 döntés, aztán mehet.
 
 ## 🌐 External opportunity
 
-Skip -- legutóbbi futás: 2026-07-11 (5 napja), heti limit még nem telt el (7 nap).
+Skip -- legutóbbi futás: 2026-07-11 (heti limit). Következő keresés: 2026-07-25-től.
 
 ## 🛠 Skill-flotta health
 
-- `ai-fleet-project-execution` antikvált (54 napja módosítva) -- multi-agent projektvezetési skill, ritkán triggerel; átnézés vagy archiválás javasolt.
-- `channel-plugin-duplicate-socket` antikvált (54 napja módosítva) -- Slack cutover aktiválásakor lesz releváns; addig figyelési listán.
-- `retrospective` antikvált (51 napja módosítva) -- manuálisan triggerelős, szezonális használat; nem sürgős.
-
----
+47 skill a flottában. Pinned-flag nélküli custom skillek: avatar-extraction, dream-engine, github-repo-watch, marveen-agent-start, pulse, marveen-dashboard-ui, workflow-management és más. Használati log nélkül stale-t nem lehet pontosan azonosítani -- nincs törlési javaslat. Minden aktívnak tűnik.
 
 *Marveen, 02:09 -- most már alszom én is.*
