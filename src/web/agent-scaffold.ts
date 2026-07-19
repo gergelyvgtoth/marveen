@@ -1,13 +1,25 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { agentDir, agentConfigRoot, listAgentNames, readAgentCapabilities } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
 import { sanitizeCapabilityTag, CAPABILITY_TAG_MAX_PER_AGENT } from '../prompt-safety.js'
+
+// Resolve the base URL agents should use to reach the dashboard API.
+// DASHBOARD_PUBLIC_URL wins when set (distributed / k3s deployment); falls
+// back to localhost for single-host installs. Exported so heartbeat-agent-
+// scaffold and tests can import the same logic without duplicating it.
+export function resolveDashboardOrigin(publicUrl: string, port: number | string): string {
+  return (publicUrl || `http://localhost:${port}`).replace(/\/$/, '')
+}
+
+// Resolved once at module load; DASHBOARD_PUBLIC_URL requires a restart
+// (see config-registry.ts `requiresRestart` flag), so a const is safe.
+const dashboardOrigin = resolveDashboardOrigin(DASHBOARD_PUBLIC_URL, WEB_PORT)
 
 // Identity values the template substitution injects. Pulled out so the
 // substitution is a pure, parameterizable function (the runtime binds these to
@@ -55,6 +67,81 @@ export function agentSettingsPath(name: string): string {
   return join(agentDir(name), '.claude', 'settings.json')
 }
 
+// Volatile tmpfs prefixes: a hook command referencing these directories is
+// transient and must NOT be written into the shared ~/.claude/settings.json.
+// When the /tmp directory disappears on the next reboot the referenced script
+// is gone, python3/node exits non-zero, and Claude Code blocks every prompt --
+// the 2026-07-14 silent fleet-freeze incident.
+const _TMP_PREFIXES = ['/tmp/', '/var/tmp/', '/private/tmp/', '/dev/shm/']
+
+// Shared hook-entry type used by ensureAgentHooks and upgradeLegacyHookCommands.
+type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
+
+/**
+ * Returns true when the command is unsafe to register in shared settings:
+ *   (a) it references a path under a volatile tmpfs directory, OR
+ *   (b) the script path it references does not currently exist on disk.
+ *
+ * Exported for unit tests. Used as a registration guard in all hook-injection
+ * functions so that a scratchpad / staging checkout can never pollute the
+ * fleet's shared ~/.claude/settings.json with stale paths.
+ */
+export function isUnsafeHookCommand(command: string): boolean {
+  if (_TMP_PREFIXES.some((p) => command.includes(p))) return true
+  const m = command.match(/\/[^\s'"]+\.(?:py|mjs|js|sh)\b/)
+  if (m && !existsSync(m[0])) return true
+  return false
+}
+
+/** Extracts the script file basename from a hook command string (e.g. "staleness-guard.py"). */
+function _hookScriptBasename(command: string): string | null {
+  const m = command.match(/\/([^/\s'"]+\.(?:py|mjs|js|sh))\b/)
+  return m ? m[1] : null
+}
+
+/**
+ * In-place upgrade: for each hook command in tplHooks, if an existing hook in
+ * existingHooks references the same script basename but in a different form
+ * (e.g. bare `python3 /path/staleness-guard.py` vs the fail-open wrapper), the
+ * existing command is replaced with the template form. No-op when the command
+ * already matches exactly (idempotent).
+ *
+ * This runs as the first pass inside ensureAgentHooks so that legacy bare
+ * commands are upgraded automatically on every startup without any manual steps
+ * -- satisfying the zero-touch migration requirement for upstream distribution.
+ *
+ * Exported for unit testing.
+ */
+export function upgradeLegacyHookCommands(
+  existingHooks: Record<string, unknown>,
+  tplHooks: Record<string, unknown>,
+): boolean {
+  let changed = false
+  for (const [event, tplEntries] of Object.entries(tplHooks)) {
+    const existEntries = existingHooks[event]
+    if (!Array.isArray(existEntries)) continue
+    for (const tplEntry of tplEntries as HookEntry[]) {
+      for (const tplHook of tplEntry.hooks ?? []) {
+        if (!tplHook.command || isUnsafeHookCommand(tplHook.command)) continue
+        const tplBn = _hookScriptBasename(tplHook.command)
+        if (!tplBn) continue
+        for (const existEntry of existEntries as HookEntry[]) {
+          for (const existHook of existEntry.hooks ?? []) {
+            if (!existHook.command) continue
+            const existBn = _hookScriptBasename(existHook.command)
+            if (existBn === tplBn && existHook.command !== tplHook.command) {
+              existHook.command = tplHook.command
+              if (tplHook.timeout != null) existHook.timeout = tplHook.timeout
+              changed = true
+            }
+          }
+        }
+      }
+    }
+  }
+  return changed
+}
+
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
 // were scaffolded before scaffoldAgentDir seeded the template, so their
@@ -78,15 +165,19 @@ export function ensureAgentHooks(name: string): boolean {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
-  type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
   if (existing.hooks) {
     // Merge strategy:
+    //   0. Upgrade pass: in-place replace any legacy bare hook commands with the
+    //      fail-open wrapper form (basename-matched). This runs before the add pass
+    //      so the exact-match dedup in step 2 sees the upgraded commands and skips
+    //      them -- avoiding the double-entry bug where the wrapper is added alongside
+    //      the old bare command.
     //   1. If a hook event is entirely missing: add it wholesale.
     //   2. If the event exists: add any template hook commands not yet present
     //      as a new hook group entry (preserves existing hooks like telegram_progress.py).
     //   3. Sync the timeout of any command hook whose command matches but timeout differs.
     const existingHooks = existing.hooks as Record<string, unknown>
-    let changed = false
+    let changed = upgradeLegacyHookCommands(existingHooks, tplHooks)
     for (const [event, handlers] of Object.entries(tplHooks)) {
       if (!existingHooks[event]) {
         existingHooks[event] = handlers
@@ -99,9 +190,9 @@ export function ensureAgentHooks(name: string): boolean {
           existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
         )
         for (const tplEntry of tplEntries) {
-          // Add hooks that are missing (as a new group entry, preserving sibling hooks).
+          // Add hooks that are missing AND safe to register (registration guard).
           const newHooks = (tplEntry.hooks ?? []).filter(
-            (h) => h.command && !existingCommands.has(h.command),
+            (h) => h.command && !existingCommands.has(h.command) && !isUnsafeHookCommand(h.command),
           )
           if (newHooks.length > 0) {
             existEntries.push({ ...tplEntry, hooks: newHooks })
@@ -124,7 +215,16 @@ export function ensureAgentHooks(name: string): boolean {
     }
     if (!changed) return false
   } else {
-    existing.hooks = tplHooks
+    // No hooks yet: seed from template, filtering unsafe commands before writing.
+    const safeHooks: Record<string, unknown> = {}
+    for (const [event, entries] of Object.entries(tplHooks)) {
+      const safeEntries = (entries as HookEntry[]).map((entry) => ({
+        ...entry,
+        hooks: (entry.hooks ?? []).filter((h) => !h.command || !isUnsafeHookCommand(h.command)),
+      })).filter((entry) => (entry.hooks?.length ?? 0) > 0)
+      if (safeEntries.length > 0) safeHooks[event] = safeEntries
+    }
+    existing.hooks = safeHooks
   }
   // For the main agent, ~/.claude already exists; sub-agents need the dir created.
   if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
@@ -140,7 +240,13 @@ export function ensureAgentHooks(name: string): boolean {
 // <channel ts="..."> message was delivered long after it was sent (a lagged /
 // re-delivered message that may be stale), so it re-confirms before irreversible
 // actions. Re-running is a no-op once the entry exists (matched by command path).
-const STALENESS_HOOK_CMD = `python3 ${join(PROJECT_ROOT, 'scripts', 'hooks', 'staleness-guard.py')}`
+// Fail-open wrapper: if the script file is missing (e.g. after a /tmp checkout is
+// cleaned up), the bash test exits 0 instead of letting python3 exit non-zero and
+// blocking the prompt. Intentional policy blocks (the script exists and returns
+// non-zero) are still propagated via exec. The script path appears twice so the
+// guard regex below can still match it.
+const _stalenessScript = join(PROJECT_ROOT, 'scripts', 'hooks', 'staleness-guard.py')
+const STALENESS_HOOK_CMD = `bash -c '[ -f ${_stalenessScript} ] && exec python3 ${_stalenessScript}; exit 0'`
 
 export function ensureAgentStalenessHook(name: string): boolean {
   // agentSettingsPath() maps MAIN_AGENT_ID to ~/.claude/settings.json; using
@@ -158,6 +264,8 @@ export function ensureAgentStalenessHook(name: string): boolean {
   // Idempotency: already wired if any command entry references the guard script.
   const already = JSON.stringify(ups).includes('staleness-guard.py')
   if (already) return false
+  // Registration guard: don't write a /tmp or non-existent path into shared settings.
+  if (isUnsafeHookCommand(STALENESS_HOOK_CMD)) return false
   ups.push({ hooks: [{ type: 'command', command: STALENESS_HOOK_CMD, timeout: 10 }] })
   hooks.UserPromptSubmit = ups
   settings.hooks = hooks
@@ -192,12 +300,17 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   // hooks. Re-applied on every spawn (this function regenerates settings.json),
   // so they survive respawns. (a) email-send block -- outbound email routes
   // through the main agent. (b) self-pace block -- no ScheduleWakeup/Cron*/Bash
-  // self-injection. The MAIN_AGENT_ID is exempt from both. Merge/deploy is NOT
-  // gated: the operator authorizes those autonomously (so test/deploy runs are
-  // never blocked); the actual incident vector -- an agent answering its OWN
-  // posed question -- is covered by the self-pace block + the #0 CLAUDE.md doctrine.
+  // self-injection. (c) egress gate -- WebFetch calls that are not on the known
+  // API allowlist are hard-blocked and logged; arbitrary web content must go
+  // through the quarantine-reader sub-agent. The MAIN_AGENT_ID is exempt from
+  // (a) and (b) but NOT from (c) -- every agent can be hijacked via an injected
+  // WebFetch call, including the main one. Merge/deploy is NOT gated: the operator
+  // authorizes those autonomously (so test/deploy runs are never blocked); the
+  // actual incident vector -- an agent answering its OWN posed question -- is
+  // covered by the self-pace block + the #0 CLAUDE.md doctrine.
   if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
   if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
+  injectEgressGate(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
 
@@ -220,6 +333,8 @@ export function injectEmailSendGate(existing: Record<string, unknown>): void {
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
   const command = `node ${join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs')}`
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
   const entry = {
     matcher: 'Bash|send_email',
     hooks: [{ type: 'command', command, timeout: 10 }],
@@ -253,6 +368,8 @@ export function injectSelfPaceGate(existing: Record<string, unknown>): void {
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
   const command = `node ${join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs')}`
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
   const entry = {
     // Write|Edit|NotebookEdit are included so the gate actually fires on the
     // native-file route to the self-schedule store (gateDecision blocks a Write
@@ -265,6 +382,79 @@ export function injectSelfPaceGate(existing: Record<string, unknown>): void {
     ...prev.filter((e) => !JSON.stringify(e).includes('self-pace-gate.mjs')),
     entry,
   ]
+}
+
+// Idempotently wire the egress-gate PreToolUse hook (hard-blocks WebFetch to
+// any URL not on the known API allowlist, logs blocked calls). Applied to ALL
+// agents including MAIN_AGENT_ID -- the hook defends against prompt-injection
+// that exfiltrates data via an outbound WebFetch, and the main agent faces the
+// same risk as sub-agents. Same dedupe shape as the other gate injectors.
+export function injectEgressGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: 'WebFetch',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('egress-gate.mjs')),
+    entry,
+  ]
+}
+
+// Idempotent migration: ensure every agent's settings.json carries the egress
+// gate hook. Called at server startup (alongside ensureAgentStalenessHook) so
+// the hook is applied to both existing and newly-created agents without a full
+// respawn. Returns true if the file was updated, false if already wired.
+export function ensureEgressGate(name: string): boolean {
+  const settingsPath = agentSettingsPath(name)
+  let settings: Record<string, unknown> = {}
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  }
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse as unknown[] : []
+  // Idempotency: already wired if any entry references the egress-gate script.
+  if (JSON.stringify(ptu).includes('egress-gate.mjs')) return false
+  if (isUnsafeHookCommand(command)) return false
+  injectEgressGate(settings)
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
+// Deploy the quarantine-reader sub-agent definition to an agent's
+// .claude/agents/ directory. The template lives in templates/agents/ (tracked
+// in git); sub-agent definitions under agents/ are gitignored at runtime.
+// Idempotent: only writes when the file is absent or the template is newer.
+// Returns true if the file was written, false if already up-to-date.
+export function ensureQuarantineReader(name: string): boolean {
+  const tplPath = join(PROJECT_ROOT, 'templates', 'sub-agents', 'quarantine-reader.md')
+  if (!existsSync(tplPath)) return false
+  let destDir: string
+  if (name === MAIN_AGENT_ID) {
+    destDir = join(homedir(), '.claude', 'agents')
+  } else {
+    destDir = join(agentDir(name), '.claude', 'agents')
+  }
+  mkdirSync(destDir, { recursive: true })
+  const destPath = join(destDir, 'quarantine-reader.md')
+  // Idempotency: already deployed when file exists and matches the template.
+  if (existsSync(destPath)) {
+    try {
+      if (readFileSync(destPath, 'utf-8') === readFileSync(tplPath, 'utf-8')) return false
+    } catch { /* fall through to re-write */ }
+  }
+  copyFileSync(tplPath, destPath)
+  return true
 }
 
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the
@@ -335,8 +525,14 @@ export function scaffoldAgentDir(name: string) {
   const dir = agentDir(name)
   mkdirSync(join(dir, '.claude', 'skills'), { recursive: true })
   mkdirSync(join(dir, '.claude', 'hooks'), { recursive: true })
+  mkdirSync(join(dir, '.claude', 'agents'), { recursive: true })
   mkdirSync(channelStateDir(CHANNEL_PROVIDER, dir), { recursive: true })
   mkdirSync(join(dir, 'memory'), { recursive: true })
+
+  // Deploy the quarantine-reader sub-agent definition from the template so every
+  // scaffolded agent can use it for safe web/RSS fetching without calling WebFetch
+  // directly in the main context (where untrusted content would run as instructions).
+  ensureQuarantineReader(name)
 
   // Initialize empty files if they don't exist
   const memoryMd = join(dir, 'memory', 'MEMORY.md')
@@ -379,6 +575,12 @@ const FLEET_ROSTER_END = '<!-- END GENERATED: fleet-roster -->'
 // END in the file, eating unrelated content in between.
 const FLEET_ROSTER_BLOCK_RE = new RegExp(
   `${FLEET_ROSTER_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${FLEET_ROSTER_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+const AUTONOMY_BEGIN = '<!-- BEGIN GENERATED: autonomy-wiring (auto-generated, do not edit by hand) -->'
+const AUTONOMY_END = '<!-- END GENERATED: autonomy-wiring -->'
+const AUTONOMY_BLOCK_RE = new RegExp(
+  `${AUTONOMY_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${AUTONOMY_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
 )
 
 // Builds the text body that goes between the BEGIN/END markers.
@@ -446,6 +648,68 @@ function buildFleetRosterBody(selfName: string): string {
     '',
     'Ha egy kérés egyértelműen más szakterületére esik, jelezd vagy delegáld inter-agent üzenettel a megfelelő ágensnek.',
   ].join('\n')
+}
+
+// Builds the autonomy-wiring section body. Static per agent name: the content
+// never changes based on runtime fleet state, but the curl examples embed the
+// resolved dashboard origin and the agent's own name so agents don't have to
+// guess.
+function buildAutonomyBody(name: string): string {
+  return [
+    '## Autonómia és jóváhagyás',
+    '',
+    'Az autonóm műveletek fokozatait a store/autonomy-config.json szabályozza (level: 1=csak jelez, 2=javasol+jóváhagyás, 3=autonóm+jelent). Mielőtt önállóan cselekszel, nézd meg az adott kategória szintjét.',
+    '',
+    '**Level 1 (csak jelez)**: küldj inter-agent értesítést a főágensnek, de NE végezd el a műveletet. Ezután ÁLLJ MEG.',
+    `curl -s -X POST ${dashboardOrigin}/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"${name}\\",\\"to\\":\\"${MAIN_AGENT_ID}\\",\\"content\\":\\"[FELHÍVÁS] CATEGORY_KEY: MIT akartam elvégezni, de level 1 miatt csak jelzek.\\"}"`,
+    '',
+    '**Level 2 (jóváhagyás szükséges)**: kérj jóváhagyást az API-n MIELŐTT cselekszel.',
+    '',
+    'Jóváhagyás kérése (POST):',
+    `curl -s -X POST ${dashboardOrigin}/api/approvals -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"${name}","category":"CATEGORY_KEY","action_description":"Mit tervezel elvégezni és miért","timeout_seconds":3600}'`,
+    'A válaszban kapott id-vel kérdezheted le a döntést.',
+    '',
+    'Döntés lekérdezése (GET, 60 mp-enként ismételve):',
+    `curl -s -H "Authorization: Bearer $(cat store/.dashboard-token)" "${dashboardOrigin}/api/approvals/<id>"`,
+    'status=approved -> végezd el a műveletet. status=rejected vagy status=timeout -> ne csináld, naplózd az okot.',
+    '',
+    '**Level 3 (autonóm)**: elvégzed a műveletet, majd utána jelented a főágensnek.',
+  ].join('\n')
+}
+
+// Idempotently ensures the autonomy-wiring block is present and current in the
+// agent's CLAUDE.md. Called on every startAgentProcess() alongside
+// ensureFleetRosterSection() so that existing agents receive the block
+// automatically on respawn without manual migration.
+//
+// Idempotency contract mirrors ensureFleetRosterSection (five rules apply).
+export function ensureAutonomySection(name: string): void {
+  // The main agent's CLAUDE.md lives at PROJECT_ROOT, not inside agents/<name>/.
+  // Sub-agents use agentDir(name)/CLAUDE.md as usual.
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const body = buildAutonomyBody(name)
+  const block = `${AUTONOMY_BEGIN}\n${body}\n${AUTONOMY_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  let updated: string
+  if (AUTONOMY_BLOCK_RE.test(existing)) {
+    updated = existing.replace(AUTONOMY_BLOCK_RE, block)
+  } else {
+    updated = existing.trimEnd() + '\n\n' + block + '\n'
+  }
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
 }
 
 // Idempotently ensures the fleet roster block is present and current in the
@@ -532,20 +796,20 @@ A memoria 3 retegbol all (hot/warm/cold) + napi naplo.
 Minden /api/* végpont Bearer tokenes: a token a store/.dashboard-token fájlban.
 
 Memória mentés:
-curl -s -X POST http://localhost:3420/api/memories -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"AGENT_NAME","content":"MIT","category":"CATEGORY","keywords":"kulcsszo1, kulcsszo2"}'
+curl -s -X POST ${dashboardOrigin}/api/memories -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"AGENT_NAME","content":"MIT","category":"CATEGORY","keywords":"kulcsszo1, kulcsszo2"}'
 
 Napi napló (append-only):
-curl -s -X POST http://localhost:3420/api/daily-log -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"AGENT_NAME","content":"## HH:MM -- Tema\nMi tortent, mi lett az eredmeny"}'
+curl -s -X POST ${dashboardOrigin}/api/daily-log -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"AGENT_NAME","content":"## HH:MM -- Tema\nMi tortent, mi lett az eredmeny"}'
 
 Keresés (mielőtt válaszolsz, nézd meg van-e releváns emlék):
-curl -s -H "Authorization: Bearer $(cat store/.dashboard-token)" "http://localhost:3420/api/memories?agent=AGENT_NAME&q=KULCSSZO&category=warm"
+curl -s -H "Authorization: Bearer $(cat store/.dashboard-token)" "${dashboardOrigin}/api/memories?agent=AGENT_NAME&q=KULCSSZO&category=warm"
 
 ## Ütemezett feladatok
 
 Az ütemezett feladatok a ~/.claude/scheduled-tasks/ mappában élnek, fájl-alapúak (SKILL.md + task-config.json). A schedule runner 60 másodpercenként ellenőrzi és a te tmux session-ödbe küldi a promptot.
 
 Feladat létrehozása API-n keresztül:
-curl -s -X POST http://localhost:3420/api/schedules -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"name": "feladat-nev", "description": "Rövid leírás", "prompt": "A részletes prompt", "schedule": "0 8 * * *", "agent": "AGENT_NAME", "type": "heartbeat"}'
+curl -s -X POST ${dashboardOrigin}/api/schedules -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"name": "feladat-nev", "description": "Rövid leírás", "prompt": "A részletes prompt", "schedule": "0 8 * * *", "agent": "AGENT_NAME", "type": "heartbeat"}'
 
 Típusok: task (mindig szól az eredménnyel) vagy heartbeat (csak fontosnál szól).
 Cron formátum: perc óra nap hónap hétnapja (pl. 0 8 * * * = minden nap 8:00).
@@ -585,13 +849,13 @@ Minden kontextus-tömörítés előtt (PreCompact hook) automatikusan vizsgáld 
 
 ## Időkezelés
 
-MINDIG a megfelelő lokális időt használd (Europe/Budapest CEST/CET).
+MINDIG az install időzónáját használd: **${APP_TZ}** (a teljes telepítés ebben az EGY zónában dolgozik: ütemezés ÉS megjelenítés).
 
-- **Jelenlegi idő**: \`date\` Bash első lépés időponti feladatoknál (heartbeat, naptár-művelet, scheduled-task analízis)
-- **Channel message \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni Europe/Budapest-re (CEST = UTC+2 nyáron, CET = UTC+1 télen)
-- **Google Calendar list_events \`dateTime\`**: már lokál ISO 8601 (\`+02:00\` offset Budapestnek), OK
+- **Jelenlegi idő**: \`date\` Bash első lépés időponti feladatoknál (heartbeat, naptár-művelet, scheduled-task analízis) — a rendszeróra is ${APP_TZ}
+- **Channel message \`ts\`**: UTC-ben jön (postfix \`Z\`), átkonvertálni ${APP_TZ}-re
+- **Google Calendar list_events \`dateTime\`**: már lokál ISO 8601 offszettel, OK
 - **SQLite \`unixepoch()\`**: UTC, humán-megjelenítéshez \`localtime\` modifier kell
-- **Cron expressions** (scheduled-tasks task-config.json): node lokális TZ, Europe/Budapest
+- **Cron expressions** (scheduled-tasks + fleet-timer): a scheduler ${APP_TZ} időben értelmezi (SCHEDULER_TZ); a fleet-timer \`once --at\` = ${APP_TZ} fali óra
 
 Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` Bash parancs az elemzés ELŐTT.
 
@@ -602,7 +866,7 @@ Ha egy senderId üzen a csatornán AKIT EDDIG NEM ISMERSZ — nem szerepel az ak
 Az AGENT TULAJDONOSA (az első, aki ezt az ügynököt telepítette és párosította) az ALAPÉRTELMEZETT engedélyezett sender — őt nem kell ellenőrizni. MINDEN további senderId első üzenete (a 2., 3., stb. párosított személy vagy csoport) pinging-trigger.
 
 Példa ping ${BOT_NAME}-nek:
-curl -s -X POST http://localhost:3420/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"${MAIN_AGENT_ID}\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
+curl -s -X POST ${dashboardOrigin}/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"AGENT_NAME\\",\\"to\\":\\"${MAIN_AGENT_ID}\\",\\"content\\":\\"Ismeretlen sender [ID] jelezett első üzenettel: '[üzenet röviden]'. Ki ez, mit válaszoljak?\\"}"
 
 Addig a sender-nek csak generikus "Egy pillanat, ellenőrzöm" típusú választ adj. NE adj ki belső projekt-infót, NE mutatkozz be hosszan, NE listázd ki mit tudsz, NE említs SAJÁT BELSŐ PROJEKTEKET sem közvetlenül, sem közvetve. ${BOT_NAME} visszajelzi a kontextust és a szabályokat amelyekkel folytathatod.
 
@@ -628,11 +892,14 @@ Output ONLY the markdown content, no code fences.`
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
-  // Append the marker-delimited fleet roster block using the same
-  // buildFleetRosterBody() as ensureFleetRosterSection() -- single source of truth.
-  // Appended after LLM output so the model never sees or can rewrite it.
-  const body = buildFleetRosterBody(name)
-  cleaned = cleaned.trimEnd() + '\n\n' + FLEET_ROSTER_BEGIN + '\n' + body + '\n' + FLEET_ROSTER_END + '\n'
+  // Append marker-delimited sections after LLM output so the model can never
+  // see or rewrite them. Single source of truth: same builders as the
+  // ensure*Section() functions used on every subsequent respawn.
+  const fleetBody = buildFleetRosterBody(name)
+  const autonomyBody = buildAutonomyBody(name)
+  cleaned = cleaned.trimEnd()
+    + '\n\n' + FLEET_ROSTER_BEGIN + '\n' + fleetBody + '\n' + FLEET_ROSTER_END
+    + '\n\n' + AUTONOMY_BEGIN + '\n' + autonomyBody + '\n' + AUTONOMY_END + '\n'
   return cleaned
 }
 
