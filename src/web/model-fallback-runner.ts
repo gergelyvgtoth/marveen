@@ -24,6 +24,7 @@ import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { paneLooksIdle } from '../pane-state.js'
 import { readModelFallbackConfig } from './model-fallback-store.js'
 import { detectsUsageLimit, decideModelAction } from '../model-fallback.js'
+import { whileNotFrozen } from './fleet-freeze.js'
 
 // Drives the model-fallback-on-limit feature (see src/model-fallback.ts for the
 // why and the pure decision logic). Mirrors the auto-restart runner: a 60s
@@ -155,7 +156,8 @@ async function restartFor(name: string): Promise<void> {
   } else {
     // 'continue' (fresh: false) re-spawns with --continue so the conversation
     // survives the model swap.
-    await restartAgentProcess(name, { fresh: false })
+    // RESTARTWAKE927: the demotion restarts a pane whose work stopped at the quota wall.
+    await restartAgentProcess(name, { fresh: false, wake: { reason: 'model-fallback' } })
   }
 }
 
@@ -233,5 +235,5 @@ export function startModelFallbackRunner(): NodeJS.Timeout {
     }
   }
   setTimeout(sweep, INITIAL_DELAY_MS)
-  return setInterval(sweep, INTERVAL_MS)
+  return setInterval(whileNotFrozen('model-fallback', sweep), INTERVAL_MS)
 }

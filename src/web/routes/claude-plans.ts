@@ -17,16 +17,20 @@ import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { readBody, json } from '../http-helpers.js'
 import { logger } from '../../logger.js'
-import { MAIN_AGENT_ID } from '../../config.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../../config.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
 import { readClaudePlans, writeClaudePlans, validatePlan, PLAN_ID_ALLOWED, tokenSecretIdFor } from '../claude-plans.js'
 import { setSecret, deleteSecret, getSecret } from '../vault.js'
 import { readClaudePlansState, writeClaudePlansState, applyRotation, recordPlanObservation } from '../claude-plans-state.js'
 import { probePlanUsage, observationFromProbe, usageFromProbe } from '../../claude-plan-usage-probe.js'
 import { agentDir, writeAgentClaudePlan } from '../agent-config.js'
-import { restartAgentProcess } from '../agent-process.js'
-import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import {
+  restartAgentProcess, resolveMainAgentConfigDir, resolveMainAgentRotatedConfigDir, resolveMainAgentRotatedTokenSecretId,
+  hasFleetOauthToken, mainAgentSharedConfigDir,
+} from '../agent-process.js'
+import { hardRestartMarveenChannels, restartMainForRotationContinue } from '../channel-monitor.js'
 import { rotationReadiness } from '../claude-rotation-heartbeat.js'
+import { mainRotationContinueVerdict, type ContinueRestartResult } from '../main-rotation-continue.js'
 import type { RouteContext } from './types.js'
 
 /** Minimum gap between two manual probes of the same plan (POST .../probe). */
@@ -135,6 +139,44 @@ export function deleteOwnTokenSecret(planId: string, secretId: string | null | u
   if (secretId && secretId === tokenSecretIdFor(planId)) deleteSecret(secretId)
 }
 
+// Create a new plan from a POST body: every rejection check first, the vault
+// write last. The dashboard's "add by logging in" flow (claude-plans-login.ts)
+// calls this too, with the caught token as `token`, so both ways in share one
+// write path.
+export function commitNewPlan(rawBody: Record<string, unknown>): { status: number; payload: unknown } {
+  if (hasAmbiguousTokenField(rawBody)) {
+    return { status: 400, payload: { error: 'Invalid plan: token cannot be combined with configDir or tokenSecretId' } }
+  }
+  const rawId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
+  const { candidate, pendingToken } = prepareTokenCandidate(rawBody, rawId)
+
+  const plan = validatePlan(candidate, homedir())
+  if (!plan) {
+    return {
+      status: 400,
+      payload: {
+        error: 'Invalid plan: id (letters/digits/_.- only), label, exactly one of configDir (safe absolute or ~-prefixed path, no traversal/spaces) or token (raw claude setup-token output), planType (personal|team) and channelsAllowed (boolean) are all required',
+      },
+    }
+  }
+
+  const current = readClaudePlans()
+  if (current.some((p) => p.id === plan.id)) {
+    return { status: 409, payload: { error: `Plan id already exists: ${plan.id}` } }
+  }
+  if (pendingToken) {
+    const otherId = findPlanWithSameToken(current, plan.id, pendingToken.value)
+    if (otherId) return { status: 409, payload: { error: DUPLICATE_TOKEN_ERROR(otherId) } }
+  }
+
+  // Vault write happens only now, after every rejection check has already
+  // passed -- see prepareTokenCandidate's header.
+  if (pendingToken) setSecret(pendingToken.secretId, pendingToken.label, pendingToken.value)
+  writeClaudePlans([...current, plan])
+  logger.info({ id: plan.id, mode: plan.tokenSecretId ? 'token' : 'configDir' }, 'Claude plan created')
+  return { status: 201, payload: plan }
+}
+
 export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -156,40 +198,8 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
     }
 
     const rawBody = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
-    if (hasAmbiguousTokenField(rawBody)) {
-      json(res, { error: 'Invalid plan: token cannot be combined with configDir or tokenSecretId' }, 400)
-      return true
-    }
-    const rawId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
-    const { candidate, pendingToken } = prepareTokenCandidate(rawBody, rawId)
-
-    const plan = validatePlan(candidate, homedir())
-    if (!plan) {
-      json(res, {
-        error: 'Invalid plan: id (letters/digits/_.- only), label, exactly one of configDir (safe absolute or ~-prefixed path, no traversal/spaces) or token (raw claude setup-token output), planType (personal|team) and channelsAllowed (boolean) are all required',
-      }, 400)
-      return true
-    }
-
-    const current = readClaudePlans()
-    if (current.some((p) => p.id === plan.id)) {
-      json(res, { error: `Plan id already exists: ${plan.id}` }, 409)
-      return true
-    }
-    if (pendingToken) {
-      const otherId = findPlanWithSameToken(current, plan.id, pendingToken.value)
-      if (otherId) {
-        json(res, { error: DUPLICATE_TOKEN_ERROR(otherId) }, 409)
-        return true
-      }
-    }
-
-    // Vault write happens only now, after every rejection check has already
-    // passed -- see prepareTokenCandidate's header.
-    if (pendingToken) setSecret(pendingToken.secretId, pendingToken.label, pendingToken.value)
-    writeClaudePlans([...current, plan])
-    logger.info({ id: plan.id, mode: plan.tokenSecretId ? 'token' : 'configDir' }, 'Claude plan created')
-    json(res, plan, 201)
+    const out = commitNewPlan(rawBody)
+    json(res, out.payload, out.status)
     return true
   }
 
@@ -238,6 +248,14 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
       json(res, { error: 'targetPlanId is required' }, 400)
       return true
     }
+    // 8c338dc4: "continue": true restarts the main agent with --continue (same conversation, new
+    // plan). Only a real JSON boolean counts: a "true" string would otherwise fall back to the fresh
+    // restart without telling the caller.
+    if (b.continue !== undefined && typeof b.continue !== 'boolean') {
+      json(res, { error: 'continue must be a JSON boolean' }, 400)
+      return true
+    }
+    const wantContinue = b.continue === true
 
     if (!isRotationEnabled()) {
       json(res, { error: 'Rotation is disabled (CLAUDE_ROTATION_ENABLED=0)' }, 409)
@@ -271,6 +289,24 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
         return true
       }
 
+      // 8c338dc4: decided BEFORE anything is written, so a refused continue leaves the plan and the
+      // session untouched and the caller can still ask for the plain (fresh) rotation.
+      if (wantContinue) {
+        const verdict = mainRotationContinueVerdict({
+          explicitDir: resolveMainAgentConfigDir(),
+          activeRotatedDir: resolveMainAgentRotatedConfigDir(),
+          activeIsTokenPlan: resolveMainAgentRotatedTokenSecretId() !== null,
+          fleetToken: hasFleetOauthToken(),
+          targetConfigDir: target.configDir ?? null,
+          sharedDir: mainAgentSharedConfigDir(),
+          projectRoot: PROJECT_ROOT,
+        })
+        if (!verdict.ok) {
+          json(res, { error: `continue is not possible: ${verdict.reason}` }, 409)
+          return true
+        }
+      }
+
       // Record the decision BEFORE restarting: the next launch resolves its
       // CLAUDE_CONFIG_DIR by reading this file back
       // (main-agent-isolated-config.mjs -> resolveMainAgentRotatedConfigDir),
@@ -278,12 +314,24 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
       // comes up.
       writeClaudePlansState(applyRotation(readClaudePlansState(), MAIN_AGENT_ID, targetPlanId))
 
-      const result = hardRestartMarveenChannels()
-      if (!result.ok) {
-        json(res, { error: result.error || 'Main agent restart failed' }, 500)
-        return true
+      // The default stays the fresh restart; only "continue": true takes the --continue path, and only
+      // that path adds "mode" to the response (continue, or fresh-fallback when the resume failed).
+      let mode: ContinueRestartResult['mode'] | null = null
+      if (wantContinue) {
+        const restarted = await restartMainForRotationContinue()
+        if (!restarted.ok) {
+          json(res, { error: restarted.error }, 500)
+          return true
+        }
+        mode = restarted.mode
+      } else {
+        const result = hardRestartMarveenChannels()
+        if (!result.ok) {
+          json(res, { error: result.error || 'Main agent restart failed' }, 500)
+          return true
+        }
       }
-      logger.info({ agentId, targetPlanId }, 'Claude plan rotation: main agent restarted')
+      logger.info({ agentId, targetPlanId, ...(mode ? { mode } : {}) }, 'Claude plan rotation: main agent restarted')
 
       // Fleet leg (opt-in, CLAUDE_ROTATION_FLEET): the shared fleet token and
       // the sub-agents on it follow the main agent. Deliberately NOT awaited:
@@ -300,7 +348,14 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
           .then(({ runFleetLeg }) => runFleetLeg(target))
           .catch((err) => logger.error({ err: err instanceof Error ? err.name : 'error' }, 'Claude plan rotation: fleet leg failed to load'))
       }
-      json(res, { ok: true, agentId, activePlanId: targetPlanId, fleet: fleetOn ? 'started' : 'off' })
+      json(res, { ok: true, agentId, activePlanId: targetPlanId, fleet: fleetOn ? 'started' : 'off', ...(mode ? { mode } : {}) })
+      return true
+    }
+
+    // 8c338dc4: a sub-agent's restart keeps its own --continue rule (restartAgentProcess); a
+    // "continue" asked for here could not be honoured as asked, so it is refused, not ignored.
+    if (wantContinue) {
+      json(res, { error: 'continue applies to the main agent only' }, 400)
       return true
     }
 
@@ -315,7 +370,8 @@ export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> 
     // rotation side-car must not already claim the switch happened.
     writeAgentClaudePlan(agentId, targetPlanId)
     writeClaudePlansState(applyRotation(readClaudePlansState(), agentId, targetPlanId))
-    const result = await restartAgentProcess(agentId)
+    // RESTARTWAKE927: the plan switch restarts a pane that may be mid-turn.
+    const result = await restartAgentProcess(agentId, { wake: { reason: 'plan-switch' } })
     if (!result.ok) {
       json(res, { error: result.error || `Restart failed for agent ${agentId}` }, 500)
       return true
