@@ -289,6 +289,36 @@ class TestCollectClaudeAuthoritative(unittest.TestCase):
         self.assertEqual(err_kind, "transient")
 
 
+class TestReadClaudeTokenUsageLogin(unittest.TestCase):
+    """_read_claude_token() prefers the dedicated usage-only login
+    (MARVEEN_USAGE_CONFIG_DIR): the fleet runs on a setup token, which the
+    oauth/usage endpoint rejects (403, user:profile), so the session token
+    lives in its own config dir instead of ~/.claude."""
+
+    def _write_creds(self, d, token):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".credentials.json"), "w", encoding="utf-8") as f:
+            json.dump({"claudeAiOauth": {"accessToken": token}}, f)
+
+    def test_usage_login_wins_over_home_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_dir = os.path.join(tmp, "usage")
+            home = os.path.join(tmp, "home")
+            self._write_creds(usage_dir, "usage-token")
+            self._write_creds(os.path.join(home, ".claude"), "home-token")
+            with patch.dict(os.environ, {"MARVEEN_USAGE_CONFIG_DIR": usage_dir, "HOME": home}):
+                self.assertEqual(uc._read_claude_token(), ("usage-token", "usage_login"))
+
+    def test_empty_usage_login_falls_back_to_home_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_dir = os.path.join(tmp, "usage")
+            home = os.path.join(tmp, "home")
+            self._write_creds(usage_dir, "")
+            self._write_creds(os.path.join(home, ".claude"), "home-token")
+            with patch.dict(os.environ, {"MARVEEN_USAGE_CONFIG_DIR": usage_dir, "HOME": home}):
+                self.assertEqual(uc._read_claude_token(), ("home-token", "credentials_file"))
+
+
 class TestReadCachedClaudeAuthoritative(unittest.TestCase):
     """_read_cached_claude_authoritative() -- reused by collect_claude() to
     avoid losing real numbers to a transient 429/5xx during the freshness

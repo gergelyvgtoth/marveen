@@ -428,16 +428,27 @@ def _read_claude_token():
     Source order matters: the long-lived `claude setup-token` value that
     typically lands in the .env file is NOT accepted by the oauth/usage
     endpoint (it answers 403), while the session token from the Keychain /
-    credentials file is. Cheapest authoritative source first, .env last."""
-    cred_path = os.path.expanduser("~/.claude/.credentials.json")
-    if os.path.exists(cred_path):
+    credentials file is. Cheapest authoritative source first, .env last.
+
+    A dedicated usage-only login comes first (MARVEEN_USAGE_CONFIG_DIR,
+    default ~/.marveen-usage): a fleet that runs on the setup token has no
+    session token in ~/.claude, and putting one there would override the
+    agents' env token. A separate CLAUDE_CONFIG_DIR used by nothing but this
+    monitor keeps the user:profile session token away from the fleet."""
+    usage_dir = os.environ.get("MARVEEN_USAGE_CONFIG_DIR") or os.path.expanduser("~/.marveen-usage")
+    for cred_path, source in (
+        (os.path.join(usage_dir, ".credentials.json"), "usage_login"),
+        (os.path.expanduser("~/.claude/.credentials.json"), "credentials_file"),
+    ):
+        if not os.path.exists(cred_path):
+            continue
         try:
             with open(cred_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             oauth = data.get("claudeAiOauth") or {}
             token = oauth.get("accessToken") or data.get("accessToken")
             if token:
-                return token, "credentials_file"
+                return token, source
         except Exception:
             pass
 
