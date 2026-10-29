@@ -7,7 +7,7 @@ on this install they had piled up since 2026-10-13). This deletes a session's
 mapping directory once nothing in it changed for PII_MAPPING_RETENTION_DAYS.
 
 PII_MAPPING_RETENTION_DAYS (process env first, then the project .env):
-  unset      -> 7 days
+  unset      -> 365 days (Gergely, 2026-10-29)
   N > 0      -> N days
   0 / off    -> keep everything (e.g. a sales user who needs the names later)
 
@@ -23,7 +23,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_DAYS = 7
+DEFAULT_DAYS = 365
 
 
 def retention_days():
