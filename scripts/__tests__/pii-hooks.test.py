@@ -100,6 +100,25 @@ with tempfile.TemporaryDirectory() as tmp:
     check(run({"session_id": "other", "tool_input": {"chat_id": "333", "text": "SZEMELY_K1"}}) == "",
           "a K marker resolved for a chat it does not belong to")
 
+# --- inbound hook: service down -> block AND keep the message (Szotasz review item 5) ---
+with tempfile.TemporaryDirectory() as tmp:
+    home, proj = os.path.join(tmp, "home"), os.path.join(tmp, "proj")
+    os.makedirs(home)
+    os.makedirs(proj)
+    with open(os.path.join(proj, ".env"), "w") as f:
+        f.write("PII_ANONYMIZE=true\n")
+    env = dict(os.environ, HOME=home, CLAUDE_PROJECT_DIR=proj, PII_SERVICE_URL="http://127.0.0.1:9")
+    prompt = '<channel source="plugin:telegram:telegram" chat_id="1" message_id="5">Hívd fel Teszt Elek-et</channel>'
+    p = subprocess.run([sys.executable, INBOUND], input=json.dumps({"session_id": "s-9", "prompt": prompt}),
+                       capture_output=True, text=True, env=env)
+    check(p.returncode == 2, f"service down must block: rc={p.returncode}")
+    check("NEM veszett el" in p.stderr, f"the block must say the message was kept: {p.stderr}")
+    held_dir = os.path.join(home, ".pii-mapper", "held")
+    held = os.listdir(held_dir)
+    check(len(held) == 1, f"one held file expected: {held}")
+    check(oct(os.stat(os.path.join(held_dir, held[0])).st_mode & 0o777) == "0o600", "held file must be 600")
+    check(json.load(open(os.path.join(held_dir, held[0]), encoding="utf-8"))["prompt"] == prompt, "held prompt differs")
+
 # --- the outbound matcher fires for the REAL reply tool names (Szotasz review item 4:
 #     mcp__plugin_slack_slack__reply never matched; the plugin is slack-channel) ---
 import re as _re
