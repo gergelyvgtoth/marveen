@@ -20,8 +20,8 @@ const H = 3_600_000
 const D = 24 * H
 const now = Date.UTC(2026, 9, 28, 22, 0)
 const stamp = now - 9 * D
-const always = { type: 'heartbeat', catchUpMaxAgeMinutes: -1 }
-const normal = { type: 'heartbeat' }
+const always = { type: 'heartbeat', catchUpMaxAgeMinutes: -1 } as const
+const normal = { type: 'heartbeat' } as const
 
 describe('taskScanFromMs: outage catch-up for always-catch-up tasks', () => {
   const fromMs = computeCatchUpStart(stamp, now)
@@ -29,7 +29,7 @@ describe('taskScanFromMs: outage catch-up for always-catch-up tasks', () => {
   it('the fleet-wide window stays capped at 24 h', () => {
     expect(fromMs).toBe(now - SCHEDULE_MAX_CATCHUP_MS)
     expect(taskScanFromMs(normal, fromMs, stamp, now)).toBe(fromMs)
-    expect(taskScanFromMs({ type: 'task', catchUpMaxAgeMinutes: 600 }, fromMs, stamp, now)).toBe(fromMs)
+    expect(taskScanFromMs({ type: 'task' as const, catchUpMaxAgeMinutes: 600 }, fromMs, stamp, now)).toBe(fromMs)
   })
 
   it('an always-catch-up task scans back to the liveness stamp', () => {
