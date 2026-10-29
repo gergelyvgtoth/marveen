@@ -48,6 +48,7 @@ vi.mock('../web/agent-process.js', () => ({
   isAgentRunning: () => true,
   capturePane: () => fixture.pane,
   startAgentProcess: async () => ({ ok: true }),
+  hasFleetOauthToken: () => false,
 }))
 vi.mock('../web/reauth-detect.js', () => ({ detectReauthNeeded: () => fixture.reauth }))
 vi.mock('../web/claude-credentials-guard.js', () => ({ quarantineFleetTokenIfDead: async () => 'no-token' }))
@@ -555,5 +556,45 @@ describe('checkSession: the call site', () => {
     writeConfig('zeta', JSON.stringify({}))
     await sweep('zeta')
     expect(notifications()[0]).toContain('Manuális browser /login')
+  })
+})
+
+// 2026-10-29: a sub-agent on the fleet setup token got it as an env var at
+// launch; the token file was replaced 15 minutes later and every turn after
+// that said "Login expired". An API restart healed it at once, while a /login
+// would have rotated the shared credential. With a fleet token present, a dead
+// sub-agent is restarted, never sent /login keys.
+describe('decideReauthAction: fleet-token sub-agent', () => {
+  const atThreshold = { consecutiveDead: 2, lastActionAtMs: null }
+
+  it('restarts a dead fleet-token sub-agent instead of sending /login, even on an interactive host', () => {
+    const d = decideReauthAction(base({ fleetTokenPresent: true, prev: atThreshold }), T)
+    expect(d.fireNow).toBe(true)
+    expect(d.restartAgent).toBe(true)
+    expect(d.sendKeys).toBe(false)
+    expect(d.escalate).toBe(true)
+  })
+
+  it('does not restart before the threshold', () => {
+    const d = decideReauthAction(base({ fleetTokenPresent: true }), T)
+    expect(d.restartAgent).toBe(false)
+  })
+
+  it('an agent with its own token file is not restarted for a dead token', () => {
+    const d = decideReauthAction(base({ fleetTokenPresent: true, usesOwnTokenFile: true, prev: atThreshold }), T)
+    expect(d.restartAgent).toBe(false)
+    expect(d.sendKeys).toBe(false)
+  })
+
+  it('without a fleet token the old /login path is unchanged', () => {
+    const d = decideReauthAction(base({ prev: atThreshold }), T)
+    expect(d.restartAgent).toBe(false)
+    expect(d.sendKeys).toBe(true)
+  })
+
+  it('the main agent keeps its own restartMain path', () => {
+    const d = decideReauthAction(base({ isMain: true, fleetTokenPresent: true, prev: atThreshold }), T)
+    expect(d.restartAgent).toBe(false)
+    expect(d.restartMain).toBe(true)
   })
 })

@@ -6,7 +6,7 @@ import { MAIN_AGENT_ID, PROJECT_ROOT, RESPAWN_ENABLED, APP_TZ } from '../config.
 import { resolveFromPath } from '../platform.js'
 import { agentConfigRoot, listAgentNames } from './agent-config.js'
 import { resolveOauthTokenFileSetting } from './agent-oauth-token-file.js'
-import { isAgentRunning, capturePane, startAgentProcess } from './agent-process.js'
+import { isAgentRunning, capturePane, startAgentProcess, hasFleetOauthToken } from './agent-process.js'
 import { isRestartInFlight } from './restart-lock.js'
 import { quarantineFleetTokenIfDead } from './claude-credentials-guard.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
@@ -81,6 +81,12 @@ export interface ReauthHealerInput {
    * process re-reads the (presumably still valid) file.
    */
   usesOwnTokenFile?: boolean
+  /**
+   * A fleet setup-token is present (store/.claude-oauth-token). Then a fresh
+   * sub-agent process re-reads it, so a restart heals a stale env token, while
+   * a /login would rotate the shared credential (the cascade).
+   */
+  fleetTokenPresent?: boolean
   prev: ReauthHealerState
   nowMs: number
 }
@@ -110,7 +116,7 @@ export const NO_REAUTH_STATE: ReauthHealerState = { consecutiveDead: 0, lastActi
  * into the session every tick) and never fires for the main agent.
  */
 export function decideReauthAction(input: ReauthHealerInput, t: ReauthHealerThresholds): ReauthHealerDecision {
-  const { isDeadToken, sessionAlive, isMain, canInteractiveLogin, isFirstRunGate, usesOwnTokenFile, prev, nowMs } = input
+  const { isDeadToken, sessionAlive, isMain, canInteractiveLogin, isFirstRunGate, usesOwnTokenFile, fleetTokenPresent, prev, nowMs } = input
 
   // Clean / not-applicable: end the spell, allow a fresh alert next time.
   if (!isDeadToken || !sessionAlive) {
@@ -130,10 +136,16 @@ export function decideReauthAction(input: ReauthHealerInput, t: ReauthHealerThre
     // browser OAuth flow on a valid credential. NEVER for an agent that
     // authenticates from its own setup-token file: /login would replace the
     // session's credential with a new interactive one, overriding the file.
-    sendKeys: fireNow && !isMain && canInteractiveLogin && isFirstRunGate !== true && usesOwnTokenFile !== true,
+    sendKeys: fireNow && !isMain && canInteractiveLogin && isFirstRunGate !== true && usesOwnTokenFile !== true && fleetTokenPresent !== true,
     // First-run gate on a sub-agent: a restart heals it (startAgentProcess runs
     // ensureSharedClaudeOnboarded first). Works headless -- no browser step.
-    restartAgent: fireNow && !isMain && isFirstRunGate === true,
+    // Dead token on a sub-agent of a fleet-token install: the agent got the
+    // token as an env var at launch, so a token file rotated after that leaves
+    // it on a dead credential while a fresh process would pick up the live one
+    // (2026-10-29: Cody, started 23:41, token file replaced 23:56, every later
+    // turn 'Login expired'; an API restart healed it at once). Same reasoning as
+    // restartMain below, and it replaces /login there (see sendKeys).
+    restartAgent: fireNow && !isMain && (isFirstRunGate === true || (fleetTokenPresent === true && usesOwnTokenFile !== true)),
     // Main agent, genuine dead-token (not first-run gate): once GAP 1 lands, the
     // main session authenticates from the long-lived fleet setup-token via an
     // isolated CLAUDE_CONFIG_DIR, so a fresh process either picks the still-good
@@ -389,6 +401,7 @@ export interface SessionEvalInput {
   sessionAlive: boolean
   canInteractiveLogin: boolean
   isFirstRunGate: boolean
+  fleetTokenPresent?: boolean
   prev: ReauthHealerState
   nowMs: number
 }
@@ -409,6 +422,7 @@ export function evaluateSession(input: SessionEvalInput, t: ReauthHealerThreshol
       canInteractiveLogin: input.canInteractiveLogin,
       isFirstRunGate: input.isFirstRunGate,
       usesOwnTokenFile: signals.usesOwnTokenFile,
+      fleetTokenPresent: input.fleetTokenPresent,
       prev: input.prev,
       nowMs: input.nowMs,
     },
@@ -446,7 +460,7 @@ export function checkSession(label: string, session: string, isMain: boolean, qu
   // an agent without the field is byte-identical to before.
   // The main agent is never /login-healed here (isMain gates every branch), so evaluateSession skips the disk read for it.
   const { decision, tokenFileState, usesOwnTokenFile, escalationHint } = evaluateSession(
-    { label, isMain, isDeadToken: reauth.needsReauth, sessionAlive, canInteractiveLogin: hostCanInteractiveLogin(), isFirstRunGate, prev, nowMs: Date.now() },
+    { label, isMain, isDeadToken: reauth.needsReauth, sessionAlive, canInteractiveLogin: hostCanInteractiveLogin(), isFirstRunGate, fleetTokenPresent: hasFleetOauthToken(), prev, nowMs: Date.now() },
     { threshold: DEAD_PROBE_THRESHOLD, cooldownMs: ESCALATION_COOLDOWN_MS },
   )
 
@@ -476,7 +490,9 @@ export function checkSession(label: string, session: string, isMain: boolean, qu
     }
   }
   if (decision.restartAgent) {
-    logger.warn({ label, session, reason: reauth.reason }, 'reauth-healer: first-run gate on live sub-agent -- restarting it (re-seeds hasCompletedOnboarding)')
+    logger.warn({ label, session, reason: reauth.reason }, isFirstRunGate
+      ? 'reauth-healer: first-run gate on live sub-agent -- restarting it (re-seeds hasCompletedOnboarding)'
+      : 'reauth-healer: dead token on live fleet-token sub-agent -- restarting it (a fresh process re-reads the fleet token)')
     void restartFirstRunGatedAgent(label, session)
   }
   if (decision.escalate) {
