@@ -36,8 +36,24 @@ def mapping_file(session_id: str) -> str:
     return os.path.join(MAPPER_BASE, safe, "mapping.json")
 
 
-def load_mapping(session_id: str) -> dict:
+def chat_mapping_file(chat_id) -> str:
+    # The channel coordinator's per-chat mapping (src/channel-coordinator.ts
+    # chatMappingFile). Its markers carry a K (SZEMELY_K1), so they never
+    # collide with this session's markers in one reply.
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(chat_id or "")) or "unknown"
+    return os.path.join(MAPPER_BASE, f"chat-{safe}", "mapping.json")
+
+
+def load_mapping(session_id: str, chat_id=None) -> dict:
     merged: dict = {}
+    # The chat this reply goes to: markers the coordinator gave messages of
+    # THIS chat only (scoped to the conversation, Szotasz review item 1).
+    if chat_id not in (None, ""):
+        try:
+            with open(chat_mapping_file(chat_id)) as f:
+                merged.update(json.load(f))
+        except Exception:
+            pass
     # Only the mapping of THIS session. The coordinator's install-wide mapping
     # (COORDINATOR_MAPPING_FILE) numbers markers per call, so SZEMELY_1 can mean
     # two people from two chats there, and resolving a reply from it could put
@@ -57,7 +73,7 @@ def deanonymize(text: str, mapping: dict) -> str:
     # Whole-marker match, so SZEMELY_1 never eats the prefix of SZEMELY_10,
     # while a glued Hungarian suffix (SZEMELY_1nek) still resolves.
     return re.sub(
-        r"(?<![A-Za-z0-9_])[A-Z]+_\d+(?!\d)",
+        r"(?<![A-Za-z0-9_])[A-Z]+_K?\d+(?!\d)",
         lambda m: mapping.get(m.group(0), m.group(0)),
         text,
     )
@@ -73,7 +89,8 @@ def main():
     if not is_enabled():
         return
 
-    mapping = load_mapping(data.get("session_id", ""))
+    tool_input_peek = data.get("tool_input", {}) or {}
+    mapping = load_mapping(data.get("session_id", ""), tool_input_peek.get("chat_id") or tool_input_peek.get("channel"))
     if not mapping:
         return
 

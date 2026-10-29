@@ -95,8 +95,6 @@ const NATIVE_409_COOLDOWN_MS = 90 * 1000
 // ---- PII anonymization ---------------------------------------------------
 
 const PII_MAPPER_BASE = join(homedir(), '.pii-mapper')
-const COORDINATOR_MAPPING_DIR = join(PII_MAPPER_BASE, 'coordinator')
-const COORDINATOR_MAPPING_FILE = join(COORDINATOR_MAPPING_DIR, 'mapping.json')
 const PII_SERVICE_URL = 'http://127.0.0.1:5200'
 
 function isPiiEnabled(): boolean {
@@ -112,7 +110,11 @@ function isPiiEnabled(): boolean {
   return false
 }
 
-async function anonymizeContent(content: string): Promise<{ anonymized: string; mapping: Record<string, string> }> {
+// ok:false = the service did not answer usably. The caller must NOT fall back to
+// the raw text: PII_ANONYMIZE promises "service unreachable: messages blocked"
+// (Szotasz review on #1934, item 2 -- the old code returned the original content
+// with an empty mapping, and the backfill stored and delivered it unmasked).
+async function anonymizeContent(content: string): Promise<{ ok: boolean; anonymized: string; mapping: Record<string, string> }> {
   try {
     const resp = await fetch(`${PII_SERVICE_URL}/anonymize`, {
       method: 'POST',
@@ -120,25 +122,69 @@ async function anonymizeContent(content: string): Promise<{ anonymized: string; 
       body: JSON.stringify({ text: content }),
       signal: AbortSignal.timeout(5000),
     })
-    if (!resp.ok) return { anonymized: content, mapping: {} }
-    const data = await resp.json() as { anonymized: string; mapping: Record<string, string> }
-    return { anonymized: data.anonymized ?? content, mapping: data.mapping ?? {} }
+    if (!resp.ok) return { ok: false, anonymized: content, mapping: {} }
+    const data = await resp.json() as { anonymized?: unknown; mapping?: unknown }
+    if (typeof data.anonymized !== 'string' || !data.mapping || typeof data.mapping !== 'object') {
+      return { ok: false, anonymized: content, mapping: {} }
+    }
+    return { ok: true, anonymized: data.anonymized, mapping: data.mapping as Record<string, string> }
   } catch {
-    return { anonymized: content, mapping: {} }
+    return { ok: false, anonymized: content, mapping: {} }
   }
 }
 
-function saveCoordinatorMapping(newMapping: Record<string, string>): void {
-  try {
-    if (!existsSync(COORDINATOR_MAPPING_DIR)) mkdirSync(COORDINATOR_MAPPING_DIR, { recursive: true, mode: 0o700 })
-    let existing: Record<string, string> = {}
-    try { existing = JSON.parse(readFileSync(COORDINATOR_MAPPING_FILE, 'utf-8')) as Record<string, string> } catch { /* no file yet */ }
-    const tmp = COORDINATOR_MAPPING_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify({ ...existing, ...newMapping }, null, 2), { mode: 0o600 })
-    renameSync(tmp, COORDINATOR_MAPPING_FILE)
-  } catch (err) {
-    logger.warn({ err }, 'channel-coordinator: failed to save PII mapping')
+/**
+ * Pure: merge a fresh service mapping into a chat's stored mapping and rewrite
+ * the text to the stored markers. The service numbers from _1 on every call, so
+ * two messages both say SZEMELY_1 for different people; a plain object spread
+ * overwrote the first (Szotasz review on #1934, item 1). Here an original value
+ * that is already stored keeps its marker, a new one gets the next free number,
+ * and coordinator markers carry a K (SZEMELY_K1) so they can never collide with
+ * the inbound hook's session markers (SZEMELY_1) in the same reply.
+ */
+export function rekeyChatMapping(
+  existing: Record<string, string>,
+  fresh: Record<string, string>,
+  text: string,
+): { text: string; mapping: Record<string, string> } {
+  const merged: Record<string, string> = { ...existing }
+  const byValue = new Map(Object.entries(existing).map(([k, v]) => [v, k]))
+  const rename: Record<string, string> = {}
+  for (const [marker, value] of Object.entries(fresh)) {
+    const known = byValue.get(value)
+    if (known) { rename[marker] = known; continue }
+    const type = marker.replace(/_\d+$/, '')
+    let n = 1
+    while (merged[`${type}_K${n}`] !== undefined) n++
+    const key = `${type}_K${n}`
+    merged[key] = value
+    byValue.set(value, key)
+    rename[marker] = key
   }
+  // Longest marker first so SZEMELY_1 never eats the prefix of SZEMELY_10.
+  const markers = Object.keys(rename).sort((a, b) => b.length - a.length)
+  const out = markers.length === 0
+    ? text
+    : text.replace(new RegExp(markers.map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + '(?![0-9])', 'g'), (m) => rename[m] ?? m)
+  return { text: out, mapping: merged }
+}
+
+export function chatMappingFile(chatId: string | number): string {
+  const safe = String(chatId).replace(/[^A-Za-z0-9_-]/g, '') || 'unknown'
+  return join(PII_MAPPER_BASE, `chat-${safe}`, 'mapping.json')
+}
+
+function readChatMapping(chatId: string | number): Record<string, string> {
+  try { return JSON.parse(readFileSync(chatMappingFile(chatId), 'utf-8')) as Record<string, string> } catch { return {} }
+}
+
+function writeChatMapping(chatId: string | number, mapping: Record<string, string>): void {
+  const file = chatMappingFile(chatId)
+  const dir = join(file, '..')
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const tmp = file + '.tmp'
+  writeFileSync(tmp, JSON.stringify(mapping, null, 2), { mode: 0o600 })
+  renameSync(tmp, file)
 }
 
 // The coordinator keeps its OWN state dir, separate from the plugin's
@@ -294,23 +340,40 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 // Process one getUpdates batch. For each update: normalize, dedup-insert, and
 // (if newly inserted) hand off to Marveen. Returns the highest update_id seen
 // so the caller can advance the offset AFTER the whole batch is durable.
-async function processBatch(updates: { update_id: number }[]): Promise<number | null> {
+async function processBatch(updates: { update_id: number }[]): Promise<{ maxUpdateId: number | null; piiBlocked: boolean }> {
   const piiEnabled = isPiiEnabled()
   let maxUpdateId: number | null = null
   for (const raw of updates) {
-    maxUpdateId = maxUpdateId == null ? raw.update_id : Math.max(maxUpdateId, raw.update_id)
     const ev = mapUpdate(raw as Parameters<typeof mapUpdate>[0])
-    if (!ev) continue // unhandled update kind: offset still advances past it
+    if (!ev) { // unhandled update kind: offset still advances past it
+      maxUpdateId = maxUpdateId == null ? raw.update_id : Math.max(maxUpdateId, raw.update_id)
+      continue
+    }
 
-    // PII anonymization: replace real names/addresses in content before DB insert
+    // PII anonymization BEFORE the DB insert. Fail closed: when the service
+    // does not answer, stop here -- do not insert, do not advance the offset
+    // past this update -- so the raw text is never stored or delivered and the
+    // update is fetched again on a later poll (Szotasz review on #1934, item 2).
     if (piiEnabled && ev.content) {
-      const { anonymized, mapping } = await anonymizeContent(ev.content)
-      if (Object.keys(mapping).length > 0) {
-        ev.content = anonymized
-        saveCoordinatorMapping(mapping)
-        logger.info({ update_id: ev.update_id, markers: Object.keys(mapping).length }, 'channel-coordinator: PII anonymized')
+      const res = await anonymizeContent(ev.content)
+      if (!res.ok) {
+        logger.error({ update_id: ev.update_id }, 'channel-coordinator: PII service unavailable -- update held back (fail closed), retried on a later poll')
+        return { maxUpdateId, piiBlocked: true }
+      }
+      if (Object.keys(res.mapping).length > 0) {
+        try {
+          const chatKey = ev.chat_id ?? 'unknown'
+          const { text, mapping } = rekeyChatMapping(readChatMapping(chatKey), res.mapping, res.anonymized)
+          writeChatMapping(chatKey, mapping)
+          ev.content = text
+        } catch (err) {
+          logger.error({ err, update_id: ev.update_id }, 'channel-coordinator: PII mapping write failed -- update held back (fail closed)')
+          return { maxUpdateId, piiBlocked: true }
+        }
+        logger.info({ update_id: ev.update_id, markers: Object.keys(res.mapping).length }, 'channel-coordinator: PII anonymized')
       }
     }
+    maxUpdateId = maxUpdateId == null ? raw.update_id : Math.max(maxUpdateId, raw.update_id)
 
     let ins: InsertResult
     try {
@@ -329,7 +392,7 @@ async function processBatch(updates: { update_id: number }[]): Promise<number | 
       logger.error({ err, eventId: ins.eventId }, 'channel-coordinator: handoff failed; event left pending for replay')
     }
   }
-  return maxUpdateId
+  return { maxUpdateId, piiBlocked: false }
 }
 
 // ---- reconcile (no-message-loss replay) ----------------------------------
@@ -491,9 +554,12 @@ async function runLoop(token: string): Promise<void> {
       continue
     }
 
-    const maxUpdateId = await processBatch(updates)
+    const { maxUpdateId, piiBlocked } = await processBatch(updates)
     // Persist offset ONLY after the batch is durable + handed off.
     if (maxUpdateId != null) setOffset(SOURCE, maxUpdateId)
+    // PII service down: the held-back updates come again on the next poll; do
+    // not spin on them.
+    if (piiBlocked) await sleep(30_000)
   }
 }
 

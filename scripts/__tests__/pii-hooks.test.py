@@ -88,4 +88,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check(json.loads(out)["hookSpecificOutput"]["updatedInput"]["text"] == "Kedves Név1",
           "the session mapping must win, the coordinator one must not be read")
 
+    # Per-chat coordinator mapping: K markers resolve only for the chat the
+    # reply goes to, never for another chat (Szotasz review item 1).
+    for cid, name in (("111", "Első Ügyfél"), ("222", "Második Ügyfél")):
+        os.makedirs(os.path.join(home, ".pii-mapper", f"chat-{cid}"))
+        with open(os.path.join(home, ".pii-mapper", f"chat-{cid}", "mapping.json"), "w") as f:
+            json.dump({"SZEMELY_K1": name}, f, ensure_ascii=False)
+    out = run({"session_id": "sess-1", "tool_input": {"chat_id": "222", "text": "Kedves SZEMELY_K1 és SZEMELY_1"}})
+    check(json.loads(out)["hookSpecificOutput"]["updatedInput"]["text"] == "Kedves Második Ügyfél és Név1",
+          f"chat-scoped K marker + session marker: {out}")
+    check(run({"session_id": "other", "tool_input": {"chat_id": "333", "text": "SZEMELY_K1"}}) == "",
+          "a K marker resolved for a chat it does not belong to")
+
 print("pii-hooks: all pass")
