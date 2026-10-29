@@ -1026,6 +1026,30 @@ export function computeCatchUpStart(
   return Math.max(persistedTickMs, now - maxCatchUpMs)
 }
 
+// A task configured to ALWAYS catch up (catchUpMaxAgeMinutes < 0) is exactly
+// the kind whose run is still worth having after a long outage -- a repo or PR
+// watcher, a weekly analysis. The 24 h ceiling above is right for the fleet as a
+// whole (no burst of stale crons on boot), but it silently drops such a task's
+// single missed occurrence when the host was off for longer than a day (a
+// 9-day gap on 2026-10-19..28 swallowed every weekly watcher; the owner had to
+// ask for a manual replay). So the FIRST tick after a start scans those tasks
+// back to the real liveness stamp, bounded by this outer ceiling. Each such
+// task still fires at most once: cronPrevOccurrence yields one occurrence.
+export const SCHEDULE_ALWAYS_CATCHUP_MAX_MS = 30 * 24 * 60 * 60_000
+
+/** Pure: the scan-window start for one task on the first tick after a start. */
+export function taskScanFromMs(
+  task: Pick<ScheduledTask, 'type' | 'catchUpMaxAgeMinutes'>,
+  fromMs: number,
+  outageFromMs: number | null,
+  now: number,
+  maxMs: number = SCHEDULE_ALWAYS_CATCHUP_MAX_MS,
+): number {
+  if (outageFromMs == null || !Number.isFinite(outageFromMs) || outageFromMs > now) return fromMs
+  if (catchUpMaxAgeMs(task) !== Infinity) return fromMs
+  return Math.min(fromMs, Math.max(outageFromMs, now - maxMs))
+}
+
 function loadLastTickMs(): number | null {
   try {
     const raw = JSON.parse(readFileSync(SCHEDULE_TICK_STATE_PATH, 'utf-8')) as { lastTickMs?: unknown }
@@ -3132,6 +3156,9 @@ export function startScheduleRunner(): NodeJS.Timeout {
   // downtime recovery. Zeroed after the first tick; later gaps (a dropped tick)
   // are reported against the tick interval instead.
   let pendingStartupGapMs = persistedTickMs != null ? startupGapMs : 0
+  // Only the first tick may reach past the 24 h ceiling, and only for tasks
+  // that always catch up (see taskScanFromMs). Zeroed with pendingStartupGapMs.
+  let pendingOutageFromMs: number | null = persistedTickMs
   let lastPersistedTickMs = 0
 
   let tickRunning = false
@@ -3503,14 +3530,15 @@ export function startScheduleRunner(): NodeJS.Timeout {
 
     for (const task of tasks) {
       if (!task.enabled) continue
-      const occurrenceMs = cronPrevOccurrence(task.schedule, fromMs, now)
+      const taskFromMs = taskScanFromMs(task, fromMs, pendingOutageFromMs, now)
+      const occurrenceMs = cronPrevOccurrence(task.schedule, taskFromMs, now)
       if (occurrenceMs == null) continue
 
       // Prevent double-firing across a restart: skip if the task already ran at
       // or after the start of this scan window (its occurrence is already
       // recorded, so re-scanning the catch-up window must not fire it again).
       const lastRun = scheduleLastRun.get(task.name) || 0
-      if (lastRun >= fromMs) continue
+      if (lastRun >= taskFromMs) continue
 
       // How late is this occurrence, and is it still worth running? An
       // occurrence the owning tick never scanned (process down, dropped tick)
@@ -3794,6 +3822,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
       }
     }
     pendingStartupGapMs = 0
+    pendingOutageFromMs = null
 
     // Advance the scan window so the next tick starts exactly where this one
     // ended. Unconditional (even on busy-skip/error, which the pending-retry
