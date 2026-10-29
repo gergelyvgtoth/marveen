@@ -100,4 +100,15 @@ with tempfile.TemporaryDirectory() as tmp:
     check(run({"session_id": "other", "tool_input": {"chat_id": "333", "text": "SZEMELY_K1"}}) == "",
           "a K marker resolved for a chat it does not belong to")
 
+# --- the outbound matcher fires for the REAL reply tool names (Szotasz review item 4:
+#     mcp__plugin_slack_slack__reply never matched; the plugin is slack-channel) ---
+import re as _re
+_settings = json.load(open(os.path.join(os.path.dirname(os.path.dirname(HERE)), ".claude", "settings.json"), encoding="utf-8"))
+_matchers = [e["matcher"] for e in _settings["hooks"]["PreToolUse"]
+             if any("pii-deanonymize-outbound.py" in h.get("command", "") for h in e.get("hooks", []))]
+check(len(_matchers) == 1, f"exactly one outbound PII matcher expected: {_matchers}")
+for _tool in ("mcp__plugin_telegram_telegram__reply", "mcp__plugin_telegram_telegram__edit_message",
+              "mcp__plugin_slack-channel_slack__reply"):
+    check(_re.fullmatch(_matchers[0], _tool) is not None, f"outbound PII matcher misses {_tool}")
+
 print("pii-hooks: all pass")
