@@ -1740,6 +1740,47 @@ def collect_channel_body(tool_input: dict, unescape_mdv2: bool) -> str:
     return MDV2_ESCAPE.sub(r"\1", joined) if unescape_mdv2 else joined
 
 
+# CHANLEAK1013: a channel reply must never carry the owner's Telegram id, a
+# file path or a shell command (2026-10-13: setup commands, a path and the
+# owner id went out in a Telegram reply; the memory rule alone did not hold).
+# Commands and paths belong in a local file the owner opens in the terminal.
+_LEAK_PATH_RX = re.compile(
+    r"(?:~/|/home/|/Users/|/tmp/|/etc/|/root/)\S+"
+    r"|\b(?:store|scripts|src|docs|agents|web)/[\w./-]+"
+    r"|\b[\w.-]+\.(?:py|ts|mjs|sh|jsonl?|md|db|env|log)\b")
+_LEAK_CMD_RX = re.compile(
+    r"(?m)^\s*[!$]\s+\S"
+    r"|\b(?:python3? -c|curl -[a-zA-Z]|chmod \d|mkdir -p|sudo |rm -[rf]|bash -c|read -s|tmux (?:new|send)|git (?:push|reset))")
+
+
+def _owner_ids() -> set:
+    ids = set()
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for p in (os.path.join(root, ".claude", "channels", "telegram", "access.json"),
+              os.path.expanduser("~/.claude/channels/telegram/access.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                ids.update(str(x) for x in json.load(f).get("allowFrom", []))
+        except Exception:
+            pass
+    return {i for i in ids if len(i) >= 6}
+
+
+def internal_leak_problems(raw: str) -> list:
+    out = []
+    for oid in _owner_ids():
+        if re.search(r"(?<!\d)" + re.escape(oid) + r"(?!\d)", raw):
+            out.append("a tulajdonos Telegram-azonositoja szerepel az uzenetben (belso azonosito nem mehet ki)")
+            break
+    m = _LEAK_PATH_RX.search(raw)
+    if m:
+        out.append(f"fajlutvonal/fajlnev az uzenetben ({m.group(0)[:40]!r}): tedd helyi fajlba, ne a csatornara")
+    m = _LEAK_CMD_RX.search(raw)
+    if m:
+        out.append(f"shell-parancs az uzenetben ({m.group(0)[:40]!r}): a parancs helyi fajlba megy, a terminalban nyitja meg")
+    return out
+
+
 def channel_gate(tool_input: dict, label: str, unescape_mdv2: bool) -> None:
     """Audit a channel reply (Telegram or Discord). FAIL-OPEN on any internal
     error (exit 0 + loud log): email is deferrable, but these are the owner's
@@ -1782,7 +1823,7 @@ def channel_gate(tool_input: dict, label: str, unescape_mdv2: bool) -> None:
                 "kivuli prozat viszont teljesen (_*[]()~`>#+-=|{}.!).\n"
             )
             sys.exit(2)
-        problems = audit(text)
+        problems = audit(text) + internal_leak_problems(raw)
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 -- deliberate blanket: fail-open path

@@ -135,7 +135,11 @@ def main():
 
     for nev, szoveg in ESETEK.items():
         kod, ki = run(HOOK, szoveg)
-        check("%s azonositoban a szotar szava nem riaszt (0)" % nev, atment(kod, ki), ki)
+        # The accent rule must not fire on the identifier. Since CHANLEAK1013 a file
+        # name in a CHANNEL reply is blocked by the leak rule on purpose (no paths or
+        # file names to Telegram); that block is not the accent rule and is accepted.
+        csak_szivargas = kod == 2 and "HIANYZO EKEZETEK" not in ki and "fajlutvonal/fajlnev" in ki
+        check("%s azonositoban a szotar szava nem riaszt (0)" % nev, atment(kod, ki) or csak_szivargas, ki)
 
     kod, ki = run(HOOK, ELEJE + "a reszletek lent vannak" + VEGE)
     check("P1 ugyanaz a szo folyoszovegben: az ekezet-szabaly tiltja, es megnevezi", tiltva(kod, ki, "reszletek"), ki)
