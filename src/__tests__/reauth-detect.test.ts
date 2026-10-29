@@ -183,3 +183,52 @@ describe('detectReauthNeeded: browser sign-in screen', () => {
     expect(detectReauthNeeded(pane).needsReauth).toBe(false)
   })
 })
+
+// 2026-10-29: Cody's pane after his token died. Newer Claude Code puts a turn
+// summary ("✻ Cooked for 0s · done ...") between the failing turn's last line
+// and the input box, so the old one-line-above-the-box region missed it and the
+// healer stayed silent for ~18 minutes.
+describe('detectReauthNeeded: failure line above the turn summary', () => {
+  const box = [
+    '───────────────────────────────────────────────────────────── Cody a kódmester ─',
+    '❯ ',
+    '────────────────────────────────────────────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ]
+
+  it('fires when the last turn ended in "Login expired · Please run /login"', () => {
+    const pane = [
+      '  </trusted-peer>',
+      '  ⎿  6 skills available',
+      '● Login expired · Please run /login',
+      '✻ Cooked for 0s · done 5:13 PM',
+      ...box,
+    ].join('\n')
+    expect(detectReauthNeeded(pane)).toEqual({ needsReauth: true, reason: 'Please run /login' })
+  })
+
+  it('does NOT fire once a later turn has answered after the old failure', () => {
+    const pane = [
+      '● Login expired · Please run /login',
+      '✻ Cooked for 0s · done 5:13 PM',
+      '> Elemezd ezt a videót',
+      '● Kész, elküldtem az elemzést.',
+      '✻ Worked for 2m · done 5:30 PM',
+      ...box,
+    ].join('\n')
+    expect(detectReauthNeeded(pane).needsReauth).toBe(false)
+  })
+
+  it('does NOT reach past a few lines for an old bullet', () => {
+    const pane = [
+      '● Login expired · Please run /login',
+      'line 1',
+      'line 2',
+      'line 3',
+      'line 4',
+      '✻ Cooked for 0s · done 5:13 PM',
+      ...box,
+    ].join('\n')
+    expect(detectReauthNeeded(pane).needsReauth).toBe(false)
+  })
+})

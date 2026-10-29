@@ -76,6 +76,10 @@ function tailOf(pane: string, n: number): string {
 // live region and ignore the transcript above it. Panes without the box (print
 // mode, plain captures, unit fixtures) keep the tail heuristic.
 const BOX_BORDER_RX = /─{10,}/
+// The last transcript line of a turn starts with Claude Code's bullet.
+const LAST_TURN_RX = /^\s*●\s/
+// How far above the status line the last turn's bullet may sit.
+const LAST_TURN_REACH = 3
 
 /**
  * The live status region: the status line + the input box + the hint lines
@@ -89,7 +93,19 @@ function liveStatusRegion(pane: string): string | null {
   }
   if (borders.length < 2) return null
   const top = Math.min(borders[0], borders[1])
-  return lines.slice(Math.max(0, top - 1)).join('\n')
+  // Newer Claude Code prints the auth failure as the turn's last transcript
+  // line ("● Login expired · Please run /login") and then a turn summary
+  // ("✻ Cooked for 0s · done 5:13 PM") between it and the box, so the single
+  // line above the box no longer carries the auth state (2026-10-29: Cody sat
+  // dead for ~18 min, every probe read the summary line and stayed silent).
+  // Reach back to the LAST "●" line only, and only across a few lines: once a
+  // later turn answers (or "Login successful" prints), that newer "●" line is
+  // the one picked, so a healed agent's stale error is still never re-read.
+  let start = top - 1
+  for (let i = top - 1; i >= Math.max(0, top - 1 - LAST_TURN_REACH); i--) {
+    if (LAST_TURN_RX.test(lines[i])) { start = i; break }
+  }
+  return lines.slice(Math.max(0, start)).join('\n')
 }
 
 /**
