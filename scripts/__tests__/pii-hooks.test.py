@@ -76,4 +76,16 @@ with tempfile.TemporaryDirectory() as tmp:
     # Unknown session -> no mapping -> no output
     check(run({"session_id": "other", "tool_input": {"text": "SZEMELY_1"}}) == "", "foreign session leaked a mapping")
 
+    # The install-wide coordinator mapping is never used to resolve a reply:
+    # its markers are numbered per call, so SZEMELY_1 there can be someone from
+    # another chat (Szotasz review on #1934, item 1).
+    os.makedirs(os.path.join(home, ".pii-mapper", "coordinator"))
+    with open(os.path.join(home, ".pii-mapper", "coordinator", "mapping.json"), "w") as f:
+        json.dump({"SZEMELY_1": "Másik Ember"}, f, ensure_ascii=False)
+    check(run({"session_id": "other", "tool_input": {"text": "Kedves SZEMELY_1"}}) == "",
+          "a reply was resolved from the coordinator mapping")
+    out = run({"session_id": "sess-1", "tool_input": {"text": "Kedves SZEMELY_1"}})
+    check(json.loads(out)["hookSpecificOutput"]["updatedInput"]["text"] == "Kedves Név1",
+          "the session mapping must win, the coordinator one must not be read")
+
 print("pii-hooks: all pass")

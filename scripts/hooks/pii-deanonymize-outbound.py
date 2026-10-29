@@ -38,14 +38,11 @@ def mapping_file(session_id: str) -> str:
 
 def load_mapping(session_id: str) -> dict:
     merged: dict = {}
-    # Load coordinator mapping (from channel-coordinator PII pass)
-    if os.path.exists(COORDINATOR_MAPPING_FILE):
-        try:
-            with open(COORDINATOR_MAPPING_FILE) as f:
-                merged.update(json.load(f))
-        except Exception:
-            pass
-    # Load session mapping (from inbound hook PII pass) -- session wins on conflict
+    # Only the mapping of THIS session. The coordinator's install-wide mapping
+    # (COORDINATOR_MAPPING_FILE) numbers markers per call, so SZEMELY_1 can mean
+    # two people from two chats there, and resolving a reply from it could put
+    # one person's name into a message to another (Szotasz review on #1934,
+    # item 1, 2026-10-16). It is deliberately never read here.
     path = mapping_file(session_id)
     if os.path.exists(path):
         try:
