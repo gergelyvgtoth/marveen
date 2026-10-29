@@ -12,6 +12,7 @@ import { quarantineFleetTokenIfDead } from './claude-credentials-guard.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { detectReauthNeeded } from './reauth-detect.js'
+import { redeliverMissedInbound } from './missed-inbound.js'
 import { loginSequence, literalKeyArgs, specialKeyArgs } from './tmux-keys.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { exactTmuxTarget } from '../tmux-target.js'
@@ -493,7 +494,7 @@ export function checkSession(label: string, session: string, isMain: boolean, qu
     logger.warn({ label, session, reason: reauth.reason }, isFirstRunGate
       ? 'reauth-healer: first-run gate on live sub-agent -- restarting it (re-seeds hasCompletedOnboarding)'
       : 'reauth-healer: dead token on live fleet-token sub-agent -- restarting it (a fresh process re-reads the fleet token)')
-    void restartFirstRunGatedAgent(label, session)
+    void restartFirstRunGatedAgent(label, session, !isFirstRunGate)
   }
   if (decision.escalate) {
     logger.error({ label, session, reason: reauth.reason, quiet }, 'reauth-healer: dead OAuth token on live session -- escalating to owner')
@@ -541,7 +542,10 @@ export function checkSession(label: string, session: string, isMain: boolean, qu
 // in-flight -- the TUI is blocked pre-boot on the picker) and relaunch it;
 // startAgentProcess runs ensureSharedClaudeOnboarded before the fresh claude
 // starts, so the relaunch comes up past the gate.
-async function restartFirstRunGatedAgent(name: string, session: string): Promise<void> {
+// How far back a dead-token restart looks for swallowed channel messages.
+const REDELIVERY_WINDOW_MS = 6 * 60 * 60 * 1000
+
+async function restartFirstRunGatedAgent(name: string, session: string, redeliver = false): Promise<void> {
   // A managed restart already owns this agent; killing its session from here
   // would tear down the replacement mid-boot (see restart-lock.ts).
   if (isRestartInFlight(name)) {
@@ -555,6 +559,10 @@ async function restartFirstRunGatedAgent(name: string, session: string): Promise
   try {
     const r = await startAgentProcess(name)
     if (!r.ok) logger.warn({ name, error: r.error }, 'reauth-healer: first-run-gate relaunch failed')
+    // A dead-token restart: hand the fresh session the channel messages the dead
+    // one answered with an auth error (missed-inbound.ts). The message queue
+    // waits for the new session to be ready, so enqueueing now is safe.
+    else if (redeliver) redeliverMissedInbound(name, Date.now() - REDELIVERY_WINDOW_MS)
   } catch (err) {
     logger.warn({ err, name }, 'reauth-healer: first-run-gate relaunch threw')
   }
